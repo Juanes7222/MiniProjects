@@ -76,11 +76,11 @@ def get_all_files(files: list[str], ext):
 def check_params():
     parser = argparse.ArgumentParser(description='Revisar parámetros de línea de comandos')
     
-    parser.add_argument("--path", type=str, required=True, help="Determine the epub books path")
-    parser.add_argument("--destiny", type=str, required=True, help="Determine the path where the images will be saved")
-    parser.add_argument("--isFile", type=bool, default=False, help="Determine if the path is a file or directory")
-    parser.add_argument("--start", type=int, required=False, default=1, help="Determine the number start of the enumerate")
-    parser.add_argument("--ext", type=str, required=False, default=".epub", help="Determine the file extension")
+    parser.add_argument("-p", "--path", type=str, required=True, help="Determine the epub books path")
+    parser.add_argument("-d", "--destiny", type=str, required=True, help="Determine the path where the images will be saved")
+    parser.add_argument("-f", "--isFile", type=bool, default=False, help="Determine if the path is a file or directory")
+    parser.add_argument("-s", "--start", type=int, required=False, default=1, help="Determine the number start of the enumerate")
+    parser.add_argument("-e", "--ext", type=str, required=False, default=".epub", help="Determine the file extension")
     
     args = parser.parse_args()
     manager(**vars(args))

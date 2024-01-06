@@ -4,10 +4,11 @@ from argparse import ArgumentParser
 import cv2
 import numpy as np
 
-def manager(path, remove, show_images):
+def manager(path, remove=True, show_images=False):
     path = os.path.abspath(path)
     image_paths = os.listdir(path)
     image_paths = map(lambda x: os.path.join(path, x), image_paths)
+    image_paths = map(lambda x: fr"{x}", image_paths)
     hashes = get_hashes(image_paths)
     remove_images(hashes, remove, show_images)
     
@@ -52,6 +53,7 @@ def get_hashes(images):
     hashes = {}
     for image_path in images:
         image = cv2.imread(image_path)
+        if image is None: continue
         hash = dhash(image)
         
         p = hashes.get(hash, [])
@@ -84,4 +86,5 @@ def def_args():
     manager(**arguments)
     
 if "__main__" == __name__:
-    def_args()
+    manager(r'C:\Users\juanb\OneDrive\Imágenes\NGNL', show_images=True)
+    # def_args()
