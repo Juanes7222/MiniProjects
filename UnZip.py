@@ -47,7 +47,7 @@ def validate_path(path, name, __case=1):
          raise ValueError("No such file or directory")
    if __case == 1:
       if os.path.isfile(path):
-         raise ValueError(f"The {name} most by a directory, not file")
+         raise ValueError(f"The {name} most be a directory, not file")
    return True
     
 def get_all_files(files: list[str], ext):
@@ -83,5 +83,5 @@ def check_params():
    manager(**vars(args))
     
 if "__main__" == __name__:
-   manager(r'C:\Users\juanb\OneDrive\Imágenes', r'C:\Users\juanb\OneDrive\Imágenes\Ultimatia')
-   #  check_params()
+   # manager(r'C:\Users\juanb\OneDrive\Imágenes', r'C:\Users\juanb\OneDrive\Imágenes\Ultimatia')
+    check_params()

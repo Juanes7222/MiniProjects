@@ -58,7 +58,7 @@ def validate_path(path, name, __case=1):
             raise ValueError("No such file or directory")
     if __case == 1:
         if os.path.isfile(path):
-            raise ValueError(f"The {name} most by a directory, not file")
+            raise ValueError(f"The {name} most be a directory, not file")
     return True
     
 def get_all_files(files: list[str], ext):
