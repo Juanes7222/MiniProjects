@@ -6,7 +6,7 @@ import ebooklib
 import argparse
 import fitz # PyMuPDF
 
-def manager(path, destiny, isFile=False, start=1, ext=".epub"):
+def manager(path, destiny, isFile=False, start=1):
     path = os.path.abspath(path)
     if isFile:
         validate_path(path, "path", 2)
@@ -17,12 +17,19 @@ def manager(path, destiny, isFile=False, start=1, ext=".epub"):
     
     files = map(lambda x: os.path.join(path, x), os.listdir(path))
     
-    extract_files = get_all_files(files, ext)
+    extract_files = get_all_files(files)
     
-    type_file = ext[1:]
     for book in extract_files:
+        type_file = os.path.splitext(book)[1][1:]
         images = eval(f"{type_file}_extract_images(book)")
         start = save_images(images, destiny, start)
+        
+def save_images(images, destiny, start=1):
+    for i, image in enumerate(images, start=start):
+        path = os.path.join(destiny, f"{i}.{image.format.lower()}")
+        image.save(path)
+        del image
+    return i+1
         
 def pdf_extract_images(pdf):
     images = []
@@ -32,23 +39,33 @@ def pdf_extract_images(pdf):
         for img in image_list:
             img_base = doc.extract_image(img[0])
             img_bytes = img_base["image"]
-            images.append(Image.open((BytesIO(img_bytes))))
+            img_bytes_object = BytesIO(img_bytes)
+            if validate_bytes(img_bytes_object.tell()):
+                object_image = Image.open((img_bytes_object))
+                if validate_size(object_image.size):
+                    images.append(object_image)
     return images
-        
-
-def save_images(images, destiny, start=1):
-    for i, image in enumerate(images, start=start):
-        path = os.path.join(destiny, f"{i}.{image.format.lower()}")
-        image.save(path)
-    return i+1
 
 def epub_extract_images(epub_path: str):
     images = []
     book = epub.read_epub(epub_path)
     for image in book.get_items_of_type(ebooklib.ITEM_IMAGE):
-        images.append(Image.open((BytesIO(image.get_content()))))
+        image_bytes_object = BytesIO(image.get_content())
+        if validate_bytes(image_bytes_object):
+            object_image = Image.open((image_bytes_object))
+            if validate_size(object_image.size):
+                images.append(object_image)
     return images
-    
+
+def validate_bytes(size):
+    if size <= 100000:
+        return False
+    return True
+
+def validate_size(size: tuple):
+    if size[1] <= 300:
+        return False
+    return True
     
 def validate_path(path, name, __case=1):
     if not os.path.exists(path):
@@ -61,14 +78,14 @@ def validate_path(path, name, __case=1):
             raise ValueError(f"The {name} most be a directory, not file")
     return True
     
-def get_all_files(files: list[str], ext):
+def get_all_files(files: list[str]):
     all_files = []
     for file in files:
         if os.path.isdir(file):
             inner_files = map(lambda x: os.path.join(file, x), os.listdir(file))
-            all_files += get_all_files(inner_files, ext)
+            all_files += get_all_files(inner_files)
             
-        if ext in file:
+        if ".pdf" in file or ".epub" in file:
             all_files.append(file)
         
     return all_files
@@ -80,7 +97,6 @@ def check_params():
     parser.add_argument("-d", "--destiny", type=str, required=True, help="Determine the path where the images will be saved")
     parser.add_argument("-f", "--isFile", type=bool, default=False, help="Determine if the path is a file or directory")
     parser.add_argument("-s", "--start", type=int, required=False, default=1, help="Determine the number start of the enumerate")
-    parser.add_argument("-e", "--ext", type=str, required=False, default=".epub", help="Determine the file extension")
     
     args = parser.parse_args()
     manager(**vars(args))
