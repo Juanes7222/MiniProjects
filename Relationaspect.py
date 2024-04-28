@@ -73,12 +73,12 @@ def select_box(persons):
     for j in range(4):
         value = 0
         if name_index[j] == "min":
-            for i in range(4):
+            for i in range(len(persons[0])):
                 person_value = persons[i][j]
                 if value > person_value:
                     value = person_value
         else:
-            for i in range(4):
+            for i in range(len(persons[0])):
                 person_value = persons[i][j]
                 if value < person_value:
                     value = person_value
@@ -153,7 +153,8 @@ def main(path):
     for i, original_image in enumerate(list_dir):
         opened_image = cv2.imread(original_image)
         box = select_box(persons_selected[i])
-        new_image = cut_with_aspect(opened_image, box)
+        relation = select_relation(opened_image)
+        new_image = cut_with_aspect(opened_image, relation, box)
         path = Path(original_image)
         name_image = create_name(path)
         save_image(new_image, name_image.as_posix())
