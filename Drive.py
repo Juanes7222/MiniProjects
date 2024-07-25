@@ -1,6 +1,7 @@
-import logging
+import argparse
 import os
 import os.path
+from tqdm import tqdm
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -9,6 +10,16 @@ from googleapiclient.errors import HttpError
 
 SCOPES = [
           'https://www.googleapis.com/auth/drive', "https://www.googleapis.com/auth/drive.file"]
+
+service = None
+types = {
+   "all": None,
+   "images": "'image/'",
+   "videos": "'video/'",
+   "pdf": "'application/pdf'",
+   "audio": "'audio/'",
+   "document": "application/"
+}
 
 def get_credentials():
    creds = None
@@ -26,24 +37,18 @@ def get_credentials():
       with open("sources/token.json", "w") as token:
          token.write(creds.to_json())
    return creds
-
-try:
-   creds = get_credentials()
-   service = build("drive", "v3", credentials=creds)
-except HttpError as error:
-   logging.error(f"An error occurred: {error}")
-   service = None
    
-def search_file(q=None, folder=None, mimeTypes="mimeType contains 'image/'"):
+def search_file(q=None, folder=None, mimeType="mimeType contains 'image/'", **kwargs):
 
   try:
     files = []
     page_token = None
+    qwery = f"{mimeType if mimeType != None else ""} {f'and "{folder}" in parents' if folder != None else ""} {f'and {q}' if q != None else ""}"
     while True:
         response = (
             service.files()
             .list(
-                q=f"{mimeTypes} {f'and {folder} in parents' if folder != None else ""} {f'and {q}' if q != None else ""}",
+                q=qwery,
                 spaces="drive",
                 fields="nextPageToken, files(id, name, parents)",
                 pageToken=page_token,
@@ -58,14 +63,10 @@ def search_file(q=None, folder=None, mimeTypes="mimeType contains 'image/'"):
             break
 
   except HttpError as error:
-    logging.error(f"An error occurred: {error}")
+    print(f"An error occurred: {error}")
     files = None
 
   return files
-
-# files = search_file("not '18EIhV757gPud087Ab34kGgK6eHy7iXQp' in parents and not '16PtMFo_-Hz7IBOfeweMxCv5ouiQ7jWTb' in parents and not '1pLtmpCfX0i7apS8TbrFCyiYdvvr0L3Uj' in parents and not '1DB9lPLyPHN8uNijL70vL4zeENCEZk6HT' in parents and not '11GQoCymdmYmLb2VW-V5Hvpe1p4t9k7f1'  in parents and 'juanblandon975@gmail.com' in owners", None)
-files = search_file("'0ADoAQ_oLjlm-Uk9PVA' in parents")
-print(files)
     
 def move_to(file, folder):
     try:
@@ -75,10 +76,42 @@ def move_to(file, folder):
         .update(fileId=file_id, addParents=folder, removeParents=old_folder)
         .execute()
         )
+        return response
     except HttpError as error:
         print(f"An error occurred: {error}")
-        
-        
-for file in files:
-    move_to(file, "1NtnlrX5qkYWDe2O5ytoA6WpDVEqHtbQe")
-# move_to("1NyKJlWY4R97hXosRBwMqhSAKPdRmZKVM")
+
+def move_to_all(files, destiny):
+   for file in tqdm(files):
+      move_to(file, destiny)
+
+def create_service():
+   try:
+      global service
+      creds = get_credentials()
+      service = build("drive", "v3", credentials=creds)
+   except HttpError as error:
+      print(f"An error occurred: {error}")
+      service = None
+      
+def manager(**params):
+   file_type = types.get(params.get("mimeType"))
+   if not file_type:
+      raise TypeError("File type is not avalaible")
+   params["mimeType"] = f"mimeType contains {file_type}"
+   create_service()
+   files = search_file(**params)
+   move_to_all(files, params["new_folder"])
+      
+def check_params():
+    parser = argparse.ArgumentParser(description='Revisar parámetros de línea de comandos')
+    
+    parser.add_argument("--folder", "-F", type=str, required=False, default=None, help="Determine the folder that contain the files")
+    parser.add_argument("--new_folder", "-N", type=str, required=True, help="Determine the new folder for the files")
+    parser.add_argument("--mimeType", "-T", type=str, default="images", required=False, help="Determine the mimetype of files (write ''all' if you want to move all type of files)")
+    parser.add_argument("--qwery", "-Q", type=str, required=False, default=None, help="Specific qwery")
+    
+    args = parser.parse_args()
+    manager(**vars(args))
+    
+check_params()
+   
