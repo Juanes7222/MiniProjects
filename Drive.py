@@ -1,6 +1,8 @@
 import argparse
 import os
 import os.path
+import Crypto
+import json
 from tqdm import tqdm
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -21,21 +23,29 @@ types = {
    "document": "application/"
 }
 
+def bytes_to_json(binfo):
+   str_info = binfo.decode()
+   info = json.loads(str_info)
+   return info
+
 def get_credentials():
    creds = None
-   token = "sources/token.json"
+   token = "sources/token.json.enc"
    if os.path.exists(token):
-      creds = Credentials.from_authorized_user_file(token, SCOPES)
+      info = bytes_to_json(Crypto.decrypt_file(token))
+      creds = Credentials.from_authorized_user_info(info, SCOPES)
    if not creds or not creds.valid:
       if creds and creds.expired and creds.refresh_token:
          creds.refresh(Request())
       else:
-         flow = InstalledAppFlow.from_client_secrets_file(
-            "sources/client_secret.json", SCOPES
+         info = bytes_to_json(Crypto.decrypt_file("sources/client_secret.json.enc"))
+         flow = InstalledAppFlow.from_client_config(
+            info, SCOPES
          )
          creds = flow.run_local_server(port=8000)
-      with open("sources/token.json", "w") as token:
-         token.write(creds.to_json())
+      crypt_creds = Crypto.crypt_data(creds.to_json().encode())
+      Crypto.save_crypt(crypt_creds, "sources/token.json")
+      
    return creds
    
 def search_file(q=None, folder=None, mimeType="mimeType contains 'image/'", **kwargs):
