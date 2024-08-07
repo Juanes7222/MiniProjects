@@ -1,4 +1,4 @@
-from requests import request
+# from requests import request
 import os
 
 class WP:
@@ -7,7 +7,7 @@ class WP:
         self.id = os.getenv("WP_ID")
 
     def send_message(self, number):
-        url = 'https://graph.facebook.com/v19.0/324109830776301/messages'
+        url = 'https://graph.facebook.com/v20.0/362989490238687/messages'
         message = {
             "messaging_product": "whatsapp",
             "preview_url": False,
@@ -27,3 +27,4 @@ class WP:
           "Conttent-Type": "aplication/json"
         }
         return self.__post(url=url, json=message, headers=headers)
+    
