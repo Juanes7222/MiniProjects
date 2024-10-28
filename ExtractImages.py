@@ -25,6 +25,7 @@ def manager(path, destiny, isFile=False, start=1):
         start = save_images(images, destiny, start)
         
 def save_images(images, destiny, start=1):
+    i = 0
     for i, image in enumerate(images, start=start):
         path = os.path.join(destiny, f"{i}.{image.format.lower()}")
         image.save(path)
@@ -37,13 +38,14 @@ def pdf_extract_images(pdf):
     for page in doc:  # iterate through the pages
         image_list = page.get_images(full=True)
         for img in image_list:
-            img_base = doc.extract_image(img[0])
-            img_bytes = img_base["image"]
-            img_bytes_object = BytesIO(img_bytes)
-            if validate_bytes(img_bytes_object.tell()):
+            if img:
+                img_base = doc.extract_image(img[0])
+                img_bytes = img_base["image"]
+                img_bytes_object = BytesIO(img_bytes)
+                # if validate_bytes(img_bytes_object.tell()):
                 object_image = Image.open((img_bytes_object))
-                if validate_size(object_image.size):
-                    images.append(object_image)
+                    # if validate_size(object_image.size):
+                images.append(object_image)
     return images
 
 def epub_extract_images(epub_path: str):
@@ -58,7 +60,7 @@ def epub_extract_images(epub_path: str):
     return images
 
 def validate_bytes(size):
-    if size <= 100000:
+    if size <= 10000:
         return False
     return True
 
