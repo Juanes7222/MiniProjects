@@ -16,7 +16,7 @@ def descargar_audio_mp3_2(url, output_path="descargas"):
 
 
 
-videos = ["https://youtu.be/K3z836Qv8ek"]
+videos = ["https://youtu.be/CSd-I2LUGv0", ]
 
 for video in videos:
     descargar_audio_mp3_2(video, r"C:\Users\juanb\Downloads\Musica")
