@@ -1,0 +1,9 @@
+et_xmlfile==2.0.0
+markdown-it-py==4.0.0
+mdurl==0.1.2
+openpyxl==3.1.5
+pdf2image==1.17.0
+pillow==12.0.0
+Pygments==2.19.2
+pywin32==311
+rich==14.2.0
