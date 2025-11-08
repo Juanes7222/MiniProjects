@@ -259,6 +259,25 @@ def ajustar_por_merged(ws, fila_ini, fila_fin, col_ini, col_fin, progress=None, 
 
 def mejorar_calidad_imagen(img, progress=None, task=None):
     """Post-procesamiento para mejorar nitidez y contraste"""
+    # Convert to RGB if necessary (handle RGBA, P, LA, etc.)
+    if img.mode not in ('RGB', 'L'):
+        if img.mode == 'RGBA':
+            # Create white background for transparent images
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            background.paste(img, mask=img.split()[3])  # Use alpha channel as mask
+            img = background
+        elif img.mode == 'P':
+            # Handle palette images with transparency
+            if 'transparency' in img.info:
+                img = img.convert('RGBA')
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                background.paste(img, mask=img.split()[3])
+                img = background
+            else:
+                img = img.convert('RGB')
+        else:
+            img = img.convert('RGB')
+    
     if progress and task:
         progress.update(task, completed=0, description="[cyan]Aplicando nitidez...")
     
