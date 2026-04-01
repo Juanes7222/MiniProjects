@@ -46,7 +46,7 @@ if _MISSING:
                 + "\n".join(f"  • {p}" for p in _MISSING)
                 + "\n\n[yellow]Fix with:[/yellow]\n"
                 "  [bold]pip install yt-dlp rich mutagen requests musicbrainzngs rapidfuzz[/bold]",
-                title="[bold red]⚠ Missing Dependencies[/bold red]",
+                title="[bold red] Missing Dependencies[/bold red]",
                 border_style="red",
             )
         )
@@ -249,6 +249,9 @@ def process_song(
     console_lock: threading.Lock,
     progress: Progress,
     stop_event: threading.Event,
+    printed_artists: set,
+    printed_artists_lock: threading.Lock,
+    pairs: list[tuple[str, str]],
     interactive_lock: Optional[threading.Lock] = None,
 ) -> dict:
     """
@@ -267,6 +270,14 @@ def process_song(
     Returns:
         A result record dict suitable for report export.
     """
+    with printed_artists_lock:
+        if artist not in printed_artists:
+            printed_artists.add(artist)
+            count = sum(1 for a, _ in pairs if a == artist)
+            with console_lock:
+                console.print(Rule(
+                    f"[bold cyan]{artist}[/bold cyan] [dim]({count} songs)[/dim]"
+                ))
     key = f"{artist}::{song}"
     result: dict[str, Any] = {
         "artist": artist,
@@ -390,7 +401,7 @@ def process_song(
                     f"Duration: [{format_duration(args.min_duration)}–"
                     f"{format_duration(args.max_duration)}] | "
                     f"Fuzzy threshold: {args.fuzzy_threshold}",
-                    title="[bold red]⚠ Search Failed[/bold red]",
+                    title="[bold red] Search Failed[/bold red]",
                     border_style="red",
                 )
             )
@@ -491,7 +502,7 @@ def process_song(
                         Panel(
                             "[bold red]Disk full![/bold red]\n"
                             "Free space and restart with [bold]--skip-existing[/bold].",
-                            title="[bold red]⚠ Disk Full[/bold red]",
+                            title="[bold red] Disk Full[/bold red]",
                             border_style="red",
                         )
                     )
@@ -569,7 +580,7 @@ def process_song(
                 Panel(
                     f"[red]Integrity check failed for [bold]{downloaded_file.name}[/bold].\n"
                     "File deleted — marked as failed.",
-                    title="[bold red]⚠ Metadata Error[/bold red]",
+                    title="[bold red] Metadata Error[/bold red]",
                     border_style="red",
                 )
             )
@@ -795,7 +806,7 @@ def main() -> None:
         console.print(
             Panel(
                 f"[red]Could not load input: {exc}[/red]",
-                title="[bold red]⚠ Input Error[/bold red]",
+                title="[bold red] Input Error[/bold red]",
                 border_style="red",
             )
         )
@@ -806,7 +817,7 @@ def main() -> None:
             Panel(
                 '[red]Invalid JSON structure.[/red]\n'
                 'Expected: [bold]{ "Artist": ["song1", "song2"] }[/bold]',
-                title="[bold red]⚠ Validation Error[/bold red]",
+                title="[bold red] Validation Error[/bold red]",
                 border_style="red",
             )
         )
@@ -814,7 +825,7 @@ def main() -> None:
 
     for artist, lst in songs.items():
         if not lst:
-            console.print(f"[yellow]⚠ Skipping '{artist}': empty song list[/yellow]")
+            console.print(f"[yellow] Skipping '{artist}': empty song list[/yellow]")
 
     pairs: list[tuple[str, str]] = [
         (artist, song)
@@ -832,6 +843,8 @@ def main() -> None:
     interactive_lock: Optional[threading.Lock] = (
         threading.Lock() if args.interactive else None
     )
+    printed_artists: set[str] = set()
+    printed_artists_lock = threading.Lock()
 
     _print_startup_banner(console, args, total)
 
@@ -886,6 +899,9 @@ def main() -> None:
                         state, state_lock,
                         console, console_lock,
                         progress, stop_event,
+                        printed_artists,        
+                        printed_artists_lock,   
+                        pairs,      
                         interactive_lock,
                     )
                     futures[fut] = (artist, song)
@@ -917,7 +933,7 @@ def main() -> None:
             Panel(
                 f"[yellow]  Interrupted by user after {elapsed:.1f}s\n"
                 f"Completed: {len(all_results)}/{total} songs[/yellow]",
-                title="[bold yellow]⚠ Interrupted[/bold yellow]",
+                title="[bold yellow] Interrupted[/bold yellow]",
                 border_style="yellow",
             )
         )
@@ -938,7 +954,7 @@ def main() -> None:
 
     if args.update_json and args.file:
         console.print(
-            f"[bold yellow]⚠ About to overwrite input file: {args.file}[/bold yellow]"
+            f"[bold yellow] About to overwrite input file: {args.file}[/bold yellow]"
         )
         update_json_file(args.file, all_results)
         console.print(f"[green] Input JSON updated: {args.file}[/green]")

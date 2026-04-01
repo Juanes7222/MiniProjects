@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import List
+import os
 
 
 @dataclass
@@ -18,7 +19,7 @@ class Config:
     DEFAULT_OUTPUT_DIR: str = "./downloads"
     DEFAULT_MAX_RESULTS: int = 5
     DEFAULT_WORKERS: int = 2
-    MAX_WORKERS: int = 4
+    MAX_WORKERS: int = os.cpu_count() or 4
     DEFAULT_DELAY_MIN: float = 2.0
     DEFAULT_DELAY_MAX: float = 5.0
     DEFAULT_FUZZY_THRESHOLD: int = 65

@@ -105,8 +105,7 @@ def filter_results(
             candidates.append(entry)
             continue
 
-        # --- Fuzzy match ---
-        score = fuzz.token_sort_ratio(ref.lower(), title.lower())
+        score = int(fuzz.token_sort_ratio(ref.lower(), title.lower()))
         if score >= fuzzy_threshold:
             entry.update(
                 _fuzzy_score=score,
