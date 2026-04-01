@@ -1,0 +1,13 @@
+certifi==2026.2.25
+charset-normalizer==3.4.6
+idna==3.11
+markdown-it-py==4.0.0
+mdurl==0.1.2
+musicbrainzngs==0.7.1
+mutagen==1.47.0
+Pygments==2.20.0
+RapidFuzz==3.14.3
+requests==2.33.1
+rich==14.3.3
+urllib3==2.6.3
+yt-dlp==2026.3.17
