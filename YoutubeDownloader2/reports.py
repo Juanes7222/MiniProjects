@@ -51,6 +51,8 @@ _CSV_FIELDS = [
     "artist", "song", "status", "source", "url", "matched_title",
     "fuzzy_score", "duration_seconds", "file_path", "file_size_bytes",
     "md5", "musicbrainz_enriched", "album", "year", "genre",
+    "composite_score", "fingerprint_verified", "fingerprint_confidence",
+    "fingerprint_matched_title", "silence_ratio", "duration_verified",
 ]
 
 
@@ -59,10 +61,22 @@ def _write_json(results: List[dict], output_dir: Path, ts: str) -> None:
     fail = sum(1 for r in results if r.get("status") == "failed")
     skip = sum(1 for r in results if r.get("status") == "skipped")
 
+    clean_results = []
+    for r in results:
+        row = dict(r)
+        if not isinstance(row.get("score_breakdown"), dict):
+            row["score_breakdown"] = {}
+        clean_results.append(row)
+
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "summary": {"total": len(results), "downloaded": dl, "failed": fail, "skipped": skip},
-        "tracks": results,
+        "summary": {
+            "total": len(results),
+            "downloaded": dl,
+            "failed": fail,
+            "skipped": skip,
+        },
+        "tracks": clean_results,
     }
     dest = output_dir / f"download_report_{ts}.json"
     with dest.open("w", encoding="utf-8") as fh:
@@ -93,7 +107,7 @@ def _write_m3u(results: List[dict], output_dir: Path, ts: str) -> None:
                 rel_str = "./" + str(rel).replace("\\", "/")
             except ValueError:
                 rel_str = fp
-            fh.write(f'#EXTINF:{duration},{r.get("artist","")} - {r.get("song","")}\n')
+            fh.write(f'#EXTINF:{duration},{r.get("artist", "")} - {r.get("song", "")}\n')
             fh.write(f"{rel_str}\n")
 
 
