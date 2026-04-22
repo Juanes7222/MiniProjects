@@ -8,14 +8,15 @@ import fitz # PyMuPDF
 
 def manager(path, destiny, isFile=False, start=1):
     path = os.path.abspath(path)
+    validate_path(destiny, "destiny")
     if isFile:
         validate_path(path, "path", 2)
+        files = [path]
     else:
         validate_path(path, "path")
+        files = map(lambda x: os.path.join(path, x), os.listdir(path))
         
-    validate_path(destiny, "destiny")
     
-    files = map(lambda x: os.path.join(path, x), os.listdir(path))
     
     extract_files = get_all_files(files)
     
