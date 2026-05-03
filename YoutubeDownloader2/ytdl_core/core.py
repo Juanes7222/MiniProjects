@@ -184,6 +184,171 @@ class MusicDownloader:
 
         return all_results
 
+    def download_url(
+        self,
+        url: str,
+        output_dir: Path,
+        fmt: str = "mp3",
+        quality: str = "192",
+        max_downloads: Optional[int] = None,
+    ) -> None:
+        """Download directly from an arbitrary URL (e.g. playlist, channel, shorts)."""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        def _progress_hook(d: dict) -> None:
+            if d.get("status") == "downloading":
+                total_b = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                downloaded_b = d.get("downloaded_bytes") or 0
+                pct = (downloaded_b / total_b * 100.0) if total_b else 0.0
+                self.events.on_download_progress(
+                    "URL", url[:30], pct, d.get("speed") or 0.0, downloaded_b, total_b
+                )
+
+        ydl_opts: Any = {
+            "format": "bestaudio/best",
+            "outtmpl": str(output_dir / "%(playlist)s" / "%(title)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "progress_hooks": [_progress_hook],
+            "writethumbnail": True,
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": fmt, "preferredquality": quality},
+                {"key": "FFmpegMetadata"},
+                {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+            ],
+            "extract_flat": False,
+        }
+
+        if max_downloads is not None:
+            ydl_opts["playlistend"] = max_downloads
+
+        if self.cookies_browser:
+            ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
+        if self.proxy:
+            ydl_opts["proxy"] = self.proxy
+
+        self.events.on_download_start("URL", url, url)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except Exception as exc:
+            self.events.on_download_failed("URL", url, str(exc))
+
+    def verify_library(
+        self,
+        songs: dict[str, list[str]],
+        output_dir: Path,
+        fmt: str = "mp3",
+    ) -> list[DownloadResult]:
+        output_dir = Path(output_dir)
+        pairs = [(artist, song) for artist, lst in songs.items() for song in lst if lst]
+        total = len(pairs)
+        self.events.on_session_start(total, is_verify=True)
+
+        all_results: list[DownloadResult] = []
+        results_lock = threading.Lock()
+        stop_event = threading.Event()
+        start = time.monotonic()
+
+        seen_artists: set[str] = set()
+        seen_artists_lock = threading.Lock()
+
+        def _verify_single(artist: str, song: str) -> DownloadResult:
+            with seen_artists_lock:
+                if artist not in seen_artists:
+                    seen_artists.add(artist)
+                    count = sum(1 for a, _ in pairs if a == artist)
+                    self.events.on_artist_start(artist, count)
+            
+            result = DownloadResult(artist=artist, song=song)
+            
+            if stop_event.is_set():
+                result.status = "skipped"
+                result.reason = "Interrupted"
+                return result
+                
+            safe_artist = sanitize_filename(artist)
+            safe_song = sanitize_filename(song)
+            expected_file = output_dir / safe_artist / f"{safe_song}.{fmt}"
+
+            if not expected_file.exists():
+                result.status = "failed"
+                result.reason = "File does not exist"
+                return result
+            
+            try:
+                size = expected_file.stat().st_size
+                if size < 1024 * 50:  # < 50KB usually indicates an error
+                    result.status = "failed"
+                    result.reason = "File is extremely small (<50KB)"
+                    result.file_path = expected_file
+                    return result
+                result.file_size_bytes = size
+            except Exception:
+                result.status = "failed"
+                result.reason = "Could not read file size"
+                return result
+
+            duration_ok, actual_duration = self._verify_duration(expected_file, 0)
+            if not duration_ok and actual_duration == 0:
+                result.status = "failed"
+                result.reason = "Corrupted file or missing metadata"
+                result.file_path = expected_file
+                return result
+                
+            result.duration_seconds = actual_duration
+
+            if self.acoustid_key:
+                apply_delay(0.2, 0.5)  # Prevent blasting APIs and triggering rate-limits
+                if getattr(self, "musicbrainz", False):
+                    try:
+                        mb_data = fetch_musicbrainz(artist, song)
+                        if mb_data:
+                            result.musicbrainz_enriched = True
+                            if "duration_seconds" in mb_data:
+                                result.duration_seconds = mb_data["duration_seconds"]
+                    except Exception:
+                        pass
+                
+                fp_ok, fp_conf, fp_title = self._verify_fingerprint(expected_file, artist, song)
+                result.fingerprint_verified = fp_ok
+                result.fingerprint_confidence = fp_conf
+                result.fingerprint_matched_title = fp_title
+                
+                if not fp_ok and fp_conf > 0:
+                    result.status = "failed"
+                    result.reason = f"Fingerprint mismatch: Found '{fp_title}' ({fp_conf*100:.1f}%)"
+                    result.file_path = expected_file
+                    return result
+
+            result.status = "verified"
+            result.file_path = expected_file
+            return result
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+                futures = {
+                    executor.submit(_verify_single, artist, song): (artist, song)
+                    for artist, song in pairs
+                }
+                for fut in concurrent.futures.as_completed(futures):
+                    artist, song = futures[fut]
+                    try:
+                        res = fut.result()
+                    except Exception as e:
+                        res = DownloadResult(artist=artist, song=song, status="failed", reason=f"Exception: {str(e)}")
+                    with results_lock:
+                        all_results.append(res)
+                    self.events.on_result(res)
+        except KeyboardInterrupt:
+            stop_event.set()
+        
+        elapsed = time.monotonic() - start
+        self.events.on_session_complete(all_results, elapsed)
+        
+        return all_results
+
     def _process_song(
         self,
         artist: str,

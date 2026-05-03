@@ -29,7 +29,7 @@ class DownloaderEvents:
     Subclass and override whichever hooks you need.
     """
 
-    def on_session_start(self, total: int) -> None:
+    def on_session_start(self, total: int, is_verify: bool = False) -> None:
         """Fired once before any downloads begin."""
 
     def on_session_complete(self, results: list["DownloadResult"], elapsed: float) -> None:

@@ -71,17 +71,22 @@ class RichEvents(DownloaderEvents):
         with self._lock:
             self.console.print(*args, **kwargs)
 
-    def on_session_start(self, total: int) -> None:
-        self._progress = Progress(
+    def on_session_start(self, total: int, is_verify: bool = False) -> None:
+        columns = [
             SpinnerColumn(),
             TextColumn("[bold blue]{task.description}"),
             BarColumn(),
             TaskProgressColumn(),
             TimeElapsedColumn(),
-            DownloadColumn(),
-            TransferSpeedColumn(),
-            console=self.console,
-            transient=False,
+        ]
+        if not is_verify:
+            columns.extend([DownloadColumn(), TransferSpeedColumn()])
+
+        self._progress = Progress(*columns, console=self.console, transient=False)
+        self._overall_task = self._progress.add_task(
+            "[cyan]Verifying Library...[/cyan]" if is_verify else "[cyan]Processing Batch...[/cyan]",
+            total=total,
+            visible=True
         )
         self._progress.start()
 
@@ -103,10 +108,12 @@ class RichEvents(DownloaderEvents):
         )
 
     def on_artist_start(self, artist: str, song_count: int) -> None:
-        self._print(Rule(f"[bold cyan]{artist}[/bold cyan] [dim]({song_count} songs)[/dim]"))
+        from rich.markup import escape
+        self._print(Rule(f"[bold cyan]{escape(str(artist))}[/bold cyan] [dim]({song_count} songs)[/dim]"))
 
     def on_search_start(self, artist: str, song: str, source: str) -> None:
-        self._print(f"[dim]  [{source}] {song} -- {artist}[/dim]")
+        from rich.markup import escape
+        self._print(f"[dim]  [{escape(str(source))}] {escape(str(song))} -- {escape(str(artist))}[/dim]")
 
     def on_no_results(self, artist: str, song: str, source: str) -> None:
         self._print(f"[dim]  no results from {source}[/dim]")
@@ -369,17 +376,31 @@ class RichEvents(DownloaderEvents):
 
     def on_result(self, result: DownloadResult) -> None:
         self._remove_task(result.artist, result.song)
+        if self._progress and getattr(self, "_overall_task", None) is not None:
+            self._progress.advance(self._overall_task)
+            
+        from rich.markup import escape
+        safe_artist = escape(str(result.artist))
+        safe_song = escape(str(result.song))
+        safe_reason = escape(str(result.reason))
+
         if result.status == "downloaded":
             self._print(
-                f"[green]  Downloaded: {result.artist} -- {result.song} "
-                f"({format_duration(result.duration_seconds)}, "
-                f"{format_size(result.file_size_bytes)})[/green]"
+                f"[green]  Downloaded: {safe_artist} -- {safe_song} "
+                f"({format_duration(result.duration_seconds or 0)}, "
+                f"{format_size(result.file_size_bytes or 0)})[/green]"
+            )
+        elif result.status == "verified":
+            self._print(
+                f"[green]  Verified: {safe_artist} -- {safe_song} "
+                f"({format_duration(result.duration_seconds or 0)}, "
+                f"{format_size(result.file_size_bytes or 0)})[/green]"
             )
         elif result.status == "failed":
-            self._print(f"[red]  Failed: {result.artist} -- {result.song} | {result.reason}[/red]")
+            self._print(f"[red]  Failed: {safe_artist} -- {safe_song} | {safe_reason}[/red]")
         elif result.status == "skipped":
             if "exists" not in str(result.reason).lower():
-                self._print(f"[yellow]  Skipped: {result.artist} -- {result.song} | {result.reason}[/yellow]")
+                self._print(f"[yellow]  Skipped: {safe_artist} -- {safe_song} | {safe_reason}[/yellow]")
 
     def _remove_task(self, artist: str, song: str) -> None:
         if not self._progress:
@@ -393,17 +414,17 @@ class RichEvents(DownloaderEvents):
                 pass
 
     def _print_summary(self, results: list[DownloadResult], elapsed: float) -> None:
-        downloaded = [r for r in results if r.status == "downloaded"]
+        downloaded = [r for r in results if r.status in ("downloaded", "verified")]
         skipped = [r for r in results if r.status == "skipped"]
         failed = [r for r in results if r.status == "failed"]
         total_bytes = sum(r.file_size_bytes for r in downloaded)
 
         tbl = Table(
-            title="[bold] Download Summary[/bold]",
+            title="[bold] Summary[/bold]",
             box=box.ROUNDED,
             show_lines=True,
             caption=(
-                f" {len(downloaded)} downloaded "
+                f" {len(downloaded)} success "
                 f" {len(skipped)} skipped "
                 f" {len(failed)} failed | "
                 f" {elapsed:.1f}s | {format_size(total_bytes)}"
@@ -425,6 +446,8 @@ class RichEvents(DownloaderEvents):
         for i, r in enumerate(results, 1):
             if r.status == "downloaded":
                 status_cell = "[green] downloaded[/green]"
+            elif r.status == "verified":
+                status_cell = "[green] verified[/green]"
             elif r.status == "skipped":
                 status_cell = "[yellow] skipped[/yellow]"
             else:
@@ -460,10 +483,11 @@ class RichEvents(DownloaderEvents):
             detail = (str(r.file_path) if r.file_path else (r.reason or "--"))[:55]
             dur = r.duration_seconds or 0
 
+            from rich.markup import escape
             tbl.add_row(
                 str(i),
-                r.artist,
-                r.song,
+                escape(str(r.artist)),
+                escape(str(r.song)),
                 status_cell,
                 format_duration(int(dur)) if dur else "--",
                 str(r.fuzzy_score),
@@ -472,7 +496,7 @@ class RichEvents(DownloaderEvents):
                 sil_cell,
                 mb,
                 sz,
-                detail,
+                escape(str(detail)),
             )
 
         self.console.print(tbl)
@@ -639,6 +663,7 @@ def parse_args() -> argparse.Namespace:
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--file", metavar="PATH", type=Path)
     src.add_argument("--data", metavar="JSON_STR")
+    src.add_argument("--url", metavar="URL", type=str, help="Download a playlist, channel, or video directly by URL")
 
     p.add_argument("--output", metavar="DIR", type=Path, default=Path(_CONFIG.DEFAULT_OUTPUT_DIR))
     p.add_argument(
@@ -653,6 +678,7 @@ def parse_args() -> argparse.Namespace:
         choices=["128", "192", "320"],
         default=_CONFIG.DEFAULT_QUALITY,
     )
+    p.add_argument("--limit", metavar="INT", type=int, help="Limit number of downloads from a URL (e.g. for playlists)")
     p.add_argument("--max-results", metavar="INT", type=int, default=_CONFIG.DEFAULT_MAX_RESULTS)
     p.add_argument("--max-duration", metavar="INT", type=int, default=_CONFIG.MAX_DURATION_SECONDS)
     p.add_argument("--min-duration", metavar="INT", type=int, default=_CONFIG.MIN_DURATION_SECONDS)
@@ -693,8 +719,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--interactive", action="store_true")
-    p.add_argument("--log-file", metavar="PATH", type=Path)
-
+    p.add_argument("--log-file", metavar="FILE", type=Path)
+    p.add_argument("--verify", action="store_true", help="Verify the local library instead of downloading.")
+    p.add_argument("--repair", action="store_true", help="Verify the local library and automatically re-download missing or corrupted files.")
     args = p.parse_args()
     args.workers = max(1, min(args.workers, _CONFIG.MAX_WORKERS))
     args.sources = [s.strip().lower() for s in args.sources.split(",") if s.strip()]
@@ -732,11 +759,20 @@ def main() -> None:
         )
 
     try:
-        if args.file:
+        if args.url:
+            songs = {} # No songs dictionary for direct URL download
+            pairs = []
+        elif args.file:
             with args.file.open("r", encoding="utf-8") as fh:
                 songs: dict = json.load(fh)
+            pairs = [
+                (artist, song) for artist, lst in songs.items() for song in (lst or [])
+            ]
         else:
             songs = json.loads(args.data)
+            pairs = [
+                (artist, song) for artist, lst in songs.items() for song in (lst or [])
+            ]
     except (json.JSONDecodeError, OSError) as exc:
         console.print(
             Panel(
@@ -745,9 +781,6 @@ def main() -> None:
         )
         sys.exit(1)
 
-    pairs: list[tuple[str, str]] = [
-        (artist, song) for artist, lst in songs.items() for song in (lst or [])
-    ]
     total = len(pairs)
 
     acoustid_status = (
@@ -820,17 +853,80 @@ def main() -> None:
         proxy=args.proxy,
     )
 
-    dl.download_batch(
-        songs=songs,
-        output_dir=args.output,
-        fmt=args.format,
-        quality=args.quality,
-        skip_existing=args.skip_existing,
-        report_formats=args.report or None,
-        update_json_path=args.file if args.update_json else None,
-    )
+    if getattr(args, "verify", False) or getattr(args, "repair", False):
+        if getattr(args, "repair", False):
+            console.print("[dim italic]Entering Repair Mode: Auditing library before re-download...[/dim italic]")
+        
+        all_results = dl.verify_library(
+            songs=songs,
+            output_dir=args.output,
+            fmt=args.format,
+        )
+        if args.report:
+            from .reports import export_report
+            export_report([r.to_dict() for r in all_results], args.output, args.report)
+            console.print(f"[green]  Verification reports saved to: {args.output.resolve()}[/green]")
+        
+        missing_songs = {}
+        for r in all_results:
+            if getattr(r, "status", "") not in ("downloaded", "verified"):
+                missing_songs.setdefault(r.artist, []).append(r.song)
+                # Ensure the bad file is deleted if attempting to repair
+                if getattr(args, "repair", False) and getattr(r, "file_path", None):
+                    try:
+                        p = Path(r.file_path)
+                        if p.exists():
+                            p.unlink()
+                    except Exception:
+                        pass
 
-    if args.report:
+        if missing_songs:
+            import json
+            out_missing = args.output / "missing_songs.json"
+            with out_missing.open("w", encoding="utf-8") as f:
+                json.dump(missing_songs, f, indent=2, ensure_ascii=False)
+            console.print(f"[yellow]  Generated missing/failed songs to: {out_missing}[/yellow]")
+            
+            if getattr(args, "repair", False):
+                total_missing = sum(len(lst) for lst in missing_songs.values())
+                console.print(f"\n[cyan]Starting repair cycle for {total_missing} missing/corrupted files...[/cyan]")
+                
+                # Force re-download by bypassing 'skip_existing'
+                dl.download_batch(
+                    songs=missing_songs,
+                    output_dir=args.output,
+                    fmt=args.format,
+                    quality=args.quality,
+                    skip_existing=False,
+                    report_formats=args.report or None,
+                    update_json_path=args.file if args.update_json else None,
+                )
+        else:
+            console.print(f"[green]  All songs verified successfully![/green]")
+
+    elif getattr(args, "url", None):
+        console.print(f"[cyan]Downloading from URL: {args.url}[/cyan]")
+        
+        limit_val = getattr(args, "limit", None)
+        dl.download_url(
+            url=args.url,
+            output_dir=args.output,
+            fmt=args.format,
+            quality=args.quality,
+            max_downloads=limit_val
+        )
+    else:
+        dl.download_batch(
+            songs=songs,
+            output_dir=args.output,
+            fmt=args.format,
+            quality=args.quality,
+            skip_existing=args.skip_existing,
+            report_formats=args.report or None,
+            update_json_path=args.file if args.update_json else None,
+        )
+
+    if not (getattr(args, "verify", False) or getattr(args, "repair", False)) and args.report:
         console.print(f"[green]  Reports saved to: {args.output.resolve()}[/green]")
 
     if log_fh:

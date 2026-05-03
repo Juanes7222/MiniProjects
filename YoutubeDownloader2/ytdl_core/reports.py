@@ -30,7 +30,7 @@ def update_json_file(path: Path, results: List[dict]) -> None:
         artist, song = r.get("artist", ""), r.get("song", "")
         annotated.setdefault(artist, {})
         entry = {"status": r.get("status", "unknown")}
-        if r.get("status") == "downloaded":
+        if r.get("status") in ("downloaded", "verified"):
             entry["file"] = r.get("file_path", "")
         elif r.get("status") == "failed":
             entry["reason"] = r.get("reason", "Unknown error")
@@ -64,7 +64,7 @@ _CSV_FIELDS = [
 
 
 def _write_json(results, output_dir, ts):
-    dl = sum(1 for r in results if r.get("status") == "downloaded")
+    dl = sum(1 for r in results if r.get("status") in ("downloaded", "verified"))
     fail = sum(1 for r in results if r.get("status") == "failed")
     skip = sum(1 for r in results if r.get("status") == "skipped")
     report = {
@@ -90,7 +90,7 @@ def _write_m3u(results, output_dir, ts):
     with dest.open("w", encoding="utf-8") as fh:
         fh.write("#EXTM3U\n")
         for r in results:
-            if r.get("status") != "downloaded" or not r.get("file_path"):
+            if r.get("status") not in ("downloaded", "verified") or not r.get("file_path"):
                 continue
             fp = r["file_path"]
             duration = r.get("duration_seconds", -1)

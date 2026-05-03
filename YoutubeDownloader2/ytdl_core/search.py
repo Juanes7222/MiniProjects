@@ -246,6 +246,15 @@ def score_youtube_result(
     entry["_score_breakdown"] = breakdown
     return total, breakdown
 
+def _identity_score(breakdown: dict) -> int:
+    identity_keys = {
+        "topic_channel", "vevo_channel", "artist_in_channel",
+        "official_audio", "official_video",
+        "high_fuzzy", "combined_high", "combined_medium",
+        "medium_fuzzy", "song_in_title", "song_title_match", "artist_in_title",
+        "song_absent_penalty", "song_weak_match_penalty", "artist_absent_penalty",
+    }
+    return sum(v for k, v in breakdown.items() if k in identity_keys)
 
 def rank_results(
     results: list[dict],
@@ -268,6 +277,7 @@ def rank_results(
         entry = dict(raw)
         score, breakdown = score_youtube_result(entry, artist, song, mb_duration_seconds, config)
         entry["_composite_score"] = score
+        entry["_identity_score"] = _identity_score(breakdown)
         entry["_score_breakdown"] = breakdown
         scored.append((entry, score, breakdown))
 
@@ -342,7 +352,17 @@ def select_best_result(
         else:
             print_candidates_table(scored, artist, song, console, reject_threshold)
 
-    if not scored or scored[0][1] < reject_threshold:
+    if not scored:
         return None, scored
 
-    return scored[0][0], scored
+    top_entry, top_score, top_breakdown = scored[0]
+    identity = _identity_score(top_breakdown)
+    passed = (
+        top_score >= reject_threshold
+        or identity >= config.IDENTITY_OVERRIDE_THRESHOLD
+    )
+
+    if not passed:
+        return None, scored
+
+    return top_entry, scored
