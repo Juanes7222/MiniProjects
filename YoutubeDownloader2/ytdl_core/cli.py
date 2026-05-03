@@ -16,7 +16,6 @@ import argparse
 import shutil
 import sys
 import threading
-import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -37,12 +36,12 @@ from rich.progress import (
 from rich.rule import Rule
 from rich.table import Table
 
-from config import Config
-from core import MusicDownloader
-from events import DownloaderEvents
-from result import DownloadResult
-from search import build_search_query, search_source, select_best_result
-from utils import check_ffmpeg, format_duration, format_size, sanitize_filename
+from .config import Config
+from .core import MusicDownloader
+from .events import DownloaderEvents
+from .result import DownloadResult
+from .search import build_search_query, search_source, select_best_result
+from .utils import check_ffmpeg, format_duration, format_size
 
 _CONFIG = Config()
 
@@ -62,9 +61,8 @@ class RichEvents(DownloaderEvents):
         self._lock = threading.Lock()
 
         self._progress: Optional[Progress] = None
-        self._tasks: dict[str, TaskID] = {} 
+        self._tasks: dict[str, TaskID] = {}
         self._tasks_lock = threading.Lock()
-
 
     def _k(self, artist: str, song: str) -> str:
         return f"{artist}::{song}"
@@ -72,7 +70,6 @@ class RichEvents(DownloaderEvents):
     def _print(self, *args, **kwargs) -> None:
         with self._lock:
             self.console.print(*args, **kwargs)
-
 
     def on_session_start(self, total: int) -> None:
         self._progress = Progress(
@@ -88,16 +85,12 @@ class RichEvents(DownloaderEvents):
         )
         self._progress.start()
 
-    def on_session_complete(
-        self, results: list[DownloadResult], elapsed: float
-    ) -> None:
+    def on_session_complete(self, results: list[DownloadResult], elapsed: float) -> None:
         if self._progress:
             self._progress.stop()
         self._print_summary(results, elapsed)
 
-    def on_interrupted(
-        self, completed: int, total: int, elapsed: float
-    ) -> None:
+    def on_interrupted(self, completed: int, total: int, elapsed: float) -> None:
         if self._progress:
             self._progress.stop()
         self._print(
@@ -109,14 +102,8 @@ class RichEvents(DownloaderEvents):
             )
         )
 
-
     def on_artist_start(self, artist: str, song_count: int) -> None:
-        self._print(
-            Rule(
-                f"[bold cyan]{artist}[/bold cyan] [dim]({song_count} songs)[/dim]"
-            )
-        )
-
+        self._print(Rule(f"[bold cyan]{artist}[/bold cyan] [dim]({song_count} songs)[/dim]"))
 
     def on_search_start(self, artist: str, song: str, source: str) -> None:
         self._print(f"[dim]  [{source}] {song} -- {artist}[/dim]")
@@ -146,20 +133,14 @@ class RichEvents(DownloaderEvents):
         tbl.add_column("Score", width=7)
         tbl.add_column("Top signals", min_width=30, style="dim")
 
-        best_idx = (
-            0 if ranked and ranked[0][1] >= self.score_threshold else None
-        )
+        best_idx = 0 if ranked and ranked[0][1] >= self.score_threshold else None
 
         for i, (entry, sc, bd) in enumerate(ranked):
             dur = int(entry.get("duration") or 0)
             title_str = (entry.get("title") or "")[:55]
-            channel_str = (
-                entry.get("channel") or entry.get("uploader") or ""
-            )[:30]
+            channel_str = (entry.get("channel") or entry.get("uploader") or "")[:30]
             top = sorted(bd.items(), key=lambda kv: abs(kv[1]), reverse=True)[:3]
-            signals = ", ".join(
-                f"{'+' if v >= 0 else ''}{v} {k}" for k, v in top
-            )
+            signals = ", ".join(f"{'+' if v >= 0 else ''}{v} {k}" for k, v in top)
             if sc >= 70:
                 score_cell = f"[green]{sc}[/green]"
             elif sc >= 30:
@@ -179,9 +160,7 @@ class RichEvents(DownloaderEvents):
 
         self._print(tbl)
 
-    def on_search_failed(
-        self, artist: str, song: str, sources_tried: list[str]
-    ) -> None:
+    def on_search_failed(self, artist: str, song: str, sources_tried: list[str]) -> None:
         self._print(
             Panel(
                 f"[red]No valid result for: [bold]{artist} -- {song}[/bold][/red]\n"
@@ -191,7 +170,6 @@ class RichEvents(DownloaderEvents):
                 border_style="red",
             )
         )
-
 
     def on_verification_status(
         self,
@@ -212,21 +190,11 @@ class RichEvents(DownloaderEvents):
             f"[FINGERPRINT: {fp_label}]"
         )
 
+    def on_fingerprint_start(self, artist: str, song: str, seconds: int) -> None:
+        self._print(f"[dim]  Verifying audio fingerprint (downloading {seconds}s)...[/dim]")
 
-    def on_fingerprint_start(
-        self, artist: str, song: str, seconds: int
-    ) -> None:
-        self._print(
-            f"[dim]  Verifying audio fingerprint (downloading {seconds}s)...[/dim]"
-        )
-
-    def on_fingerprint_partial_failed(
-        self, artist: str, song: str
-    ) -> None:
-        self._print(
-            "[yellow]  Fingerprint: partial download failed, "
-            "proceeding anyway[/yellow]"
-        )
+    def on_fingerprint_partial_failed(self, artist: str, song: str) -> None:
+        self._print("[yellow]  Fingerprint: partial download failed, proceeding anyway[/yellow]")
 
     def on_fingerprint_result(
         self,
@@ -237,14 +205,9 @@ class RichEvents(DownloaderEvents):
         matched_title: str,
     ) -> None:
         if verified:
-            self._print(
-                f"[green]  Fingerprint: verified "
-                f"({confidence:.0%} confidence)[/green]"
-            )
+            self._print(f"[green]  Fingerprint: verified ({confidence:.0%} confidence)[/green]")
 
-    def on_fingerprint_low_confidence(
-        self, artist: str, song: str, matched_title: str
-    ) -> None:
+    def on_fingerprint_low_confidence(self, artist: str, song: str, matched_title: str) -> None:
         self._print(
             f"[yellow]  Fingerprint: low confidence match "
             f"({matched_title}), trying next result[/yellow]"
@@ -256,33 +219,19 @@ class RichEvents(DownloaderEvents):
             "proceeding with score-based selection[/yellow]"
         )
 
-    def on_fingerprint_error(
-        self, artist: str, song: str, error: str
-    ) -> None:
-        self._print(
-            f"[yellow]  Fingerprint error ({error}), "
-            "proceeding anyway[/yellow]"
-        )
+    def on_fingerprint_error(self, artist: str, song: str, error: str) -> None:
+        self._print(f"[yellow]  Fingerprint error ({error}), proceeding anyway[/yellow]")
 
-
-    def on_skip_existing(
-        self, artist: str, song: str, file_path: Path, md5_ok: bool
-    ) -> None:
+    def on_skip_existing(self, artist: str, song: str, file_path: Path, md5_ok: bool) -> None:
         label = "exists" if md5_ok else "exists, no MD5"
-        self._print(
-            f"[yellow]  Skipped ({label}): {artist} -- {song}[/yellow]"
-        )
+        self._print(f"[yellow]  Skipped ({label}): {artist} -- {song}[/yellow]")
 
     def on_md5_mismatch(self, artist: str, song: str) -> None:
-        self._print(
-            f"[blue]  MD5 mismatch for '{song}' -- re-downloading...[/blue]"
-        )
+        self._print(f"[blue]  MD5 mismatch for '{song}' -- re-downloading...[/blue]")
 
     def on_download_start(self, artist: str, song: str, url: str) -> None:
         if self._progress:
-            task_id = self._progress.add_task(
-                f"[cyan]{song[:45]}[/cyan]", total=100, visible=True
-            )
+            task_id = self._progress.add_task(f"[cyan]{song[:45]}[/cyan]", total=100, visible=True)
             with self._tasks_lock:
                 self._tasks[self._k(artist, song)] = task_id
 
@@ -335,7 +284,6 @@ class RichEvents(DownloaderEvents):
             )
         )
 
-
     def on_duration_check(
         self,
         artist: str,
@@ -359,13 +307,9 @@ class RichEvents(DownloaderEvents):
         excessive: bool,
     ) -> None:
         if not excessive and silence_ratio > 0.15:
-            self._print(
-                f"[yellow]  Warning: {silence_ratio:.1%} silence in audio[/yellow]"
-            )
+            self._print(f"[yellow]  Warning: {silence_ratio:.1%} silence in audio[/yellow]")
 
-    def on_silence_rejected(
-        self, artist: str, song: str, silence_ratio: float
-    ) -> None:
+    def on_silence_rejected(self, artist: str, song: str, silence_ratio: float) -> None:
         self._print(
             Panel(
                 f"[red]Rejected: {silence_ratio:.1%} silence detected "
@@ -399,10 +343,7 @@ class RichEvents(DownloaderEvents):
 
         self._print(f"  Post-check: [{dur_label}] [{sil_label}]")
 
-
-    def on_musicbrainz_result(
-        self, artist: str, song: str, enriched: bool, data: dict
-    ) -> None:
+    def on_musicbrainz_result(self, artist: str, song: str, enriched: bool, data: dict) -> None:
         if enriched:
             self._print(
                 f"[green]  MusicBrainz: ENRICHED -- "
@@ -411,13 +352,9 @@ class RichEvents(DownloaderEvents):
                 f"genre={data.get('genre') or 'N/A'}[/green]"
             )
         else:
-            self._print(
-                "[yellow]  MusicBrainz: FALLBACK -- no match found[/yellow]"
-            )
+            self._print("[yellow]  MusicBrainz: FALLBACK -- no match found[/yellow]")
 
-    def on_metadata_error(
-        self, artist: str, song: str, file_name: str
-    ) -> None:
+    def on_metadata_error(self, artist: str, song: str, file_name: str) -> None:
         self._print(
             Panel(
                 f"[red]Integrity check failed for [bold]{file_name}[/bold].\n"
@@ -430,7 +367,6 @@ class RichEvents(DownloaderEvents):
     def on_warn(self, message: str) -> None:
         self._print(message)
 
-
     def on_result(self, result: DownloadResult) -> None:
         self._remove_task(result.artist, result.song)
         if result.status == "downloaded":
@@ -439,7 +375,11 @@ class RichEvents(DownloaderEvents):
                 f"({format_duration(result.duration_seconds)}, "
                 f"{format_size(result.file_size_bytes)})[/green]"
             )
-
+        elif result.status == "failed":
+            self._print(f"[red]  Failed: {result.artist} -- {result.song} | {result.reason}[/red]")
+        elif result.status == "skipped":
+            if "exists" not in str(result.reason).lower():
+                self._print(f"[yellow]  Skipped: {result.artist} -- {result.song} | {result.reason}[/yellow]")
 
     def _remove_task(self, artist: str, song: str) -> None:
         if not self._progress:
@@ -452,12 +392,10 @@ class RichEvents(DownloaderEvents):
             except Exception:
                 pass
 
-    def _print_summary(
-        self, results: list[DownloadResult], elapsed: float
-    ) -> None:
+    def _print_summary(self, results: list[DownloadResult], elapsed: float) -> None:
         downloaded = [r for r in results if r.status == "downloaded"]
-        skipped    = [r for r in results if r.status == "skipped"]
-        failed     = [r for r in results if r.status == "failed"]
+        skipped = [r for r in results if r.status == "skipped"]
+        failed = [r for r in results if r.status == "failed"]
         total_bytes = sum(r.file_size_bytes for r in downloaded)
 
         tbl = Table(
@@ -471,18 +409,18 @@ class RichEvents(DownloaderEvents):
                 f" {elapsed:.1f}s | {format_size(total_bytes)}"
             ),
         )
-        tbl.add_column("#",            style="dim",     width=4)
-        tbl.add_column("Artist",       style="cyan",    min_width=14)
-        tbl.add_column("Song",         style="white",   min_width=18)
-        tbl.add_column("Status",                        min_width=14)
-        tbl.add_column("Duration",     style="yellow",  width=10)
-        tbl.add_column("Fuzzy",        style="magenta", width=6)
-        tbl.add_column("Score",                         width=7)
-        tbl.add_column("Fingerprint",                   width=16)
-        tbl.add_column("Silence",                       width=10)
-        tbl.add_column("MusicBrainz",  style="blue",    width=12)
-        tbl.add_column("Size",         style="green",   width=9)
-        tbl.add_column("File / Reason",style="dim",     min_width=28)
+        tbl.add_column("#", style="dim", width=4)
+        tbl.add_column("Artist", style="cyan", min_width=14)
+        tbl.add_column("Song", style="white", min_width=18)
+        tbl.add_column("Status", min_width=14)
+        tbl.add_column("Duration", style="yellow", width=10)
+        tbl.add_column("Fuzzy", style="magenta", width=6)
+        tbl.add_column("Score", width=7)
+        tbl.add_column("Fingerprint", width=16)
+        tbl.add_column("Silence", width=10)
+        tbl.add_column("MusicBrainz", style="blue", width=12)
+        tbl.add_column("Size", style="green", width=9)
+        tbl.add_column("File / Reason", style="dim", min_width=28)
 
         for i, r in enumerate(results, 1):
             if r.status == "downloaded":
@@ -517,20 +455,27 @@ class RichEvents(DownloaderEvents):
             else:
                 sil_cell = f"[red]{sil:.1%}[/red]"
 
-            mb     = "yes" if r.musicbrainz_enriched else "--"
-            sz     = format_size(r.file_size_bytes) if r.file_size_bytes else "--"
+            mb = "yes" if r.musicbrainz_enriched else "--"
+            sz = format_size(r.file_size_bytes) if r.file_size_bytes else "--"
             detail = (str(r.file_path) if r.file_path else (r.reason or "--"))[:55]
-            dur    = r.duration_seconds or 0
+            dur = r.duration_seconds or 0
 
             tbl.add_row(
-                str(i), r.artist, r.song, status_cell,
+                str(i),
+                r.artist,
+                r.song,
+                status_cell,
                 format_duration(int(dur)) if dur else "--",
-                str(r.fuzzy_score), score_cell, fp_cell,
-                sil_cell, mb, sz, detail,
+                str(r.fuzzy_score),
+                score_cell,
+                fp_cell,
+                sil_cell,
+                mb,
+                sz,
+                detail,
             )
 
         self.console.print(tbl)
-
 
 
 def _dry_run_table(
@@ -552,20 +497,20 @@ def _dry_run_table(
         box=box.ROUNDED,
         show_lines=True,
     )
-    tbl.add_column("Artist",        style="cyan",  min_width=14)
-    tbl.add_column("Song",          style="white", min_width=18)
-    tbl.add_column("Source",        style="dim",   width=12)
+    tbl.add_column("Artist", style="cyan", min_width=14)
+    tbl.add_column("Song", style="white", min_width=18)
+    tbl.add_column("Source", style="dim", width=12)
     tbl.add_column("Matched Title", style="green", min_width=30)
-    tbl.add_column("Channel",       style="dim",   min_width=18)
-    tbl.add_column("Duration",      style="yellow",width=10)
-    tbl.add_column("Score",                        width=7)
-    tbl.add_column("Top 3 signals", min_width=35,  style="dim")
-    tbl.add_column("Fingerprint",                  width=14)
+    tbl.add_column("Channel", style="dim", min_width=18)
+    tbl.add_column("Duration", style="yellow", width=10)
+    tbl.add_column("Score", width=7)
+    tbl.add_column("Top 3 signals", min_width=35, style="dim")
+    tbl.add_column("Fingerprint", width=14)
 
     opts: dict[str, Any] = {
-        "max_results":     args.max_results,
+        "max_results": args.max_results,
         "cookies_browser": args.cookies_browser,
-        "proxy":           args.proxy,
+        "proxy": args.proxy,
     }
     threshold = getattr(args, "score_threshold", config.SCORE_THRESHOLD_REJECT)
 
@@ -574,14 +519,16 @@ def _dry_run_table(
         src_used: Optional[str] = None
 
         for source in args.sources:
-            raw = search_source(
-                build_search_query(artist, song, source), source, opts
-            )
+            raw = search_source(build_search_query(artist, song, source), source, opts)
             if raw:
                 found, _ = select_best_result(
-                    results=raw, artist=artist, song=song,
-                    mb_duration_seconds=None, config=config,
-                    console=None, console_lock=None,
+                    results=raw,
+                    artist=artist,
+                    song=song,
+                    mb_duration_seconds=None,
+                    config=config,
+                    console=None,
+                    console_lock=None,
                     min_duration=args.min_duration,
                     max_duration=args.max_duration,
                     score_threshold=threshold,
@@ -592,30 +539,42 @@ def _dry_run_table(
 
         if found:
             dur = int(found.get("duration") or 0)
-            sc  = found.get("_composite_score", 0)
-            bd  = found.get("_score_breakdown", {})
+            sc = found.get("_composite_score", 0)
+            bd = found.get("_score_breakdown", {})
             top = sorted(bd.items(), key=lambda kv: abs(kv[1]), reverse=True)[:3]
             signals = ", ".join(f"{'+' if v >= 0 else ''}{v} {k}" for k, v in top)
             score_cell = (
-                f"[green]{sc}[/green]" if sc >= 70
-                else f"[yellow]{sc}[/yellow]" if sc >= 30
+                f"[green]{sc}[/green]"
+                if sc >= 70
+                else f"[yellow]{sc}[/yellow]"
+                if sc >= 30
                 else f"[red]{sc}[/red]"
             )
             tbl.add_row(
-                artist, song, src_used or "--",
+                artist,
+                song,
+                src_used or "--",
                 (found.get("title") or "")[:48],
                 (found.get("channel") or found.get("uploader") or "")[:26],
-                format_duration(dur), score_cell, signals, fp_label,
+                format_duration(dur),
+                score_cell,
+                signals,
+                fp_label,
             )
         else:
             tbl.add_row(
-                artist, song, "--",
+                artist,
+                song,
+                "--",
                 "[red]No match found[/red]",
-                "--", "--", "--", "--", fp_label,
+                "--",
+                "--",
+                "--",
+                "--",
+                fp_label,
             )
 
     console.print(tbl)
-
 
 
 def _make_interactive_confirm(
@@ -625,7 +584,8 @@ def _make_interactive_confirm(
     stop_event: threading.Event,
 ) -> Any:
     def confirm_fn(artist: str, song: str, best_result: dict) -> bool:
-        from utils import format_duration as _fd
+        from .utils import format_duration as _fd
+
         dur = int(best_result.get("duration") or 0)
         with interactive_lock:
             with console_lock:
@@ -672,7 +632,7 @@ def parse_args() -> argparse.Namespace:
             "--workers 3 --musicbrainz --report json\n"
             "  ytdl --file songs.json --acoustid-key KEY --quality 320\n"
             "  ytdl --file songs.json --skip-fingerprint --no-silence-check\n"
-            "  ytdl --data '{\"Radiohead\": [\"Creep\"]}' --dry-run"
+            '  ytdl --data \'{"Radiohead": ["Creep"]}\' --dry-run'
         ),
     )
 
@@ -680,46 +640,60 @@ def parse_args() -> argparse.Namespace:
     src.add_argument("--file", metavar="PATH", type=Path)
     src.add_argument("--data", metavar="JSON_STR")
 
-    p.add_argument("--output",           metavar="DIR",     type=Path,
-                   default=Path(_CONFIG.DEFAULT_OUTPUT_DIR))
-    p.add_argument("--format",           metavar="FORMAT",
-                   choices=_CONFIG.SUPPORTED_FORMATS,
-                   default=_CONFIG.DEFAULT_FORMAT)
-    p.add_argument("--quality",          metavar="QUALITY",
-                   choices=["128", "192", "320"],
-                   default=_CONFIG.DEFAULT_QUALITY)
-    p.add_argument("--max-results",      metavar="INT",     type=int,
-                   default=_CONFIG.DEFAULT_MAX_RESULTS)
-    p.add_argument("--max-duration",     metavar="INT",     type=int,
-                   default=_CONFIG.MAX_DURATION_SECONDS)
-    p.add_argument("--min-duration",     metavar="INT",     type=int,
-                   default=_CONFIG.MIN_DURATION_SECONDS)
-    p.add_argument("--fuzzy-threshold",  metavar="INT",     type=int,
-                   default=_CONFIG.DEFAULT_FUZZY_THRESHOLD)
-    p.add_argument("--workers",          metavar="INT",     type=int,
-                   default=_CONFIG.DEFAULT_WORKERS)
-    p.add_argument("--delay",            metavar="FLOAT",   type=float, nargs=2,
-                   default=[_CONFIG.DEFAULT_DELAY_MIN, _CONFIG.DEFAULT_DELAY_MAX])
-    p.add_argument("--sources",          metavar="LIST",
-                   default=",".join(_CONFIG.DEFAULT_SOURCES))
-    p.add_argument("--cookies-browser",  metavar="BROWSER",
-                   choices=["chrome", "firefox", "edge", "safari"])
-    p.add_argument("--proxy",            metavar="URL")
-    p.add_argument("--musicbrainz",      action="store_true")
+    p.add_argument("--output", metavar="DIR", type=Path, default=Path(_CONFIG.DEFAULT_OUTPUT_DIR))
+    p.add_argument(
+        "--format",
+        metavar="FORMAT",
+        choices=_CONFIG.SUPPORTED_FORMATS,
+        default=_CONFIG.DEFAULT_FORMAT,
+    )
+    p.add_argument(
+        "--quality",
+        metavar="QUALITY",
+        choices=["128", "192", "320"],
+        default=_CONFIG.DEFAULT_QUALITY,
+    )
+    p.add_argument("--max-results", metavar="INT", type=int, default=_CONFIG.DEFAULT_MAX_RESULTS)
+    p.add_argument("--max-duration", metavar="INT", type=int, default=_CONFIG.MAX_DURATION_SECONDS)
+    p.add_argument("--min-duration", metavar="INT", type=int, default=_CONFIG.MIN_DURATION_SECONDS)
+    p.add_argument(
+        "--fuzzy-threshold", metavar="INT", type=int, default=_CONFIG.DEFAULT_FUZZY_THRESHOLD
+    )
+    p.add_argument("--workers", metavar="INT", type=int, default=_CONFIG.DEFAULT_WORKERS)
+    p.add_argument(
+        "--delay",
+        metavar="FLOAT",
+        type=float,
+        nargs=2,
+        default=[_CONFIG.DEFAULT_DELAY_MIN, _CONFIG.DEFAULT_DELAY_MAX],
+    )
+    p.add_argument("--sources", metavar="LIST", default=",".join(_CONFIG.DEFAULT_SOURCES))
+    p.add_argument(
+        "--cookies-browser", metavar="BROWSER", choices=["chrome", "firefox", "edge", "safari"]
+    )
+    p.add_argument("--proxy", metavar="URL")
+    p.add_argument("--musicbrainz", action="store_true")
 
-    p.add_argument("--acoustid-key",     metavar="KEY",     dest="acoustid_key")
+    p.add_argument("--acoustid-key", metavar="KEY", dest="acoustid_key")
     p.add_argument("--skip-fingerprint", action="store_true")
-    p.add_argument("--score-threshold",  metavar="INT",     type=int,
-                   default=_CONFIG.SCORE_THRESHOLD_REJECT)
+    p.add_argument(
+        "--score-threshold", metavar="INT", type=int, default=_CONFIG.SCORE_THRESHOLD_REJECT
+    )
     p.add_argument("--no-silence-check", action="store_true")
 
-    p.add_argument("--skip-existing",    action="store_true")
-    p.add_argument("--update-json",      action="store_true")
-    p.add_argument("--report",           metavar="FORMAT",  action="append",
-                   choices=["json", "csv", "m3u"], default=[], dest="report")
-    p.add_argument("--dry-run",          action="store_true")
-    p.add_argument("--interactive",      action="store_true")
-    p.add_argument("--log-file",         metavar="PATH",    type=Path)
+    p.add_argument("--skip-existing", action="store_true")
+    p.add_argument("--update-json", action="store_true")
+    p.add_argument(
+        "--report",
+        metavar="FORMAT",
+        action="append",
+        choices=["json", "csv", "m3u"],
+        default=[],
+        dest="report",
+    )
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--interactive", action="store_true")
+    p.add_argument("--log-file", metavar="PATH", type=Path)
 
     args = p.parse_args()
     args.workers = max(1, min(args.workers, _CONFIG.MAX_WORKERS))
@@ -764,15 +738,15 @@ def main() -> None:
         else:
             songs = json.loads(args.data)
     except (json.JSONDecodeError, OSError) as exc:
-        console.print(Panel(f"[red]{exc}[/red]",
-                            title="[bold red] Input Error[/bold red]",
-                            border_style="red"))
+        console.print(
+            Panel(
+                f"[red]{exc}[/red]", title="[bold red] Input Error[/bold red]", border_style="red"
+            )
+        )
         sys.exit(1)
 
     pairs: list[tuple[str, str]] = [
-        (artist, song)
-        for artist, lst in songs.items()
-        for song in (lst or [])
+        (artist, song) for artist, lst in songs.items() for song in (lst or [])
     ]
     total = len(pairs)
 
@@ -809,10 +783,9 @@ def main() -> None:
 
     events = RichEvents(console, args.score_threshold, config)
 
-    confirm_fn = None
     if args.interactive:
         stop_event = threading.Event()
-        confirm_fn = _make_interactive_confirm(
+        events.confirm_fn = _make_interactive_confirm(
             console,
             threading.Lock(),
             threading.Lock(),
@@ -820,9 +793,11 @@ def main() -> None:
         )
 
     import musicbrainzngs as _mbz
+
     if args.musicbrainz:
         _mbz.set_useragent(
-            "YTMusicDownloader", "2.0",
+            "YTMusicDownloader",
+            "2.0",
             "https://github.com/example/yt-music-downloader",
         )
 
@@ -845,7 +820,7 @@ def main() -> None:
         proxy=args.proxy,
     )
 
-    results = dl.download_batch(
+    dl.download_batch(
         songs=songs,
         output_dir=args.output,
         fmt=args.format,
@@ -856,9 +831,7 @@ def main() -> None:
     )
 
     if args.report:
-        console.print(
-            f"[green]  Reports saved to: {args.output.resolve()}[/green]"
-        )
+        console.print(f"[green]  Reports saved to: {args.output.resolve()}[/green]")
 
     if log_fh:
         log_fh.close()

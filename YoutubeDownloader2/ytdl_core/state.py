@@ -22,7 +22,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from config import Config
+from .config import Config
 
 _CFG = Config()
 

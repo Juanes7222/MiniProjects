@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import yt_dlp
+import shutil
 from rich.progress import Progress, TaskID
 
 
@@ -76,7 +77,12 @@ def download_audio(
     if opts.get("proxy"):
         ydl_opts["proxy"] = opts["proxy"]
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl: # type: ignore
+    # Speed up download with aria2c if available
+    if shutil.which("aria2c"):
+        ydl_opts["external_downloader"] = "aria2c"
+        ydl_opts["external_downloader_args"] = ["-x", "8", "-s", "8", "-k", "1M"]
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
         ydl.download([url])
 
     for ext in (fmt, "mp3", "m4a", "opus", "ogg", "webm", "flac"):

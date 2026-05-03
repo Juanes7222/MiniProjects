@@ -21,7 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-import mutagen # type: ignore
+import mutagen  # type: ignore
 import musicbrainzngs
 import requests
 from mutagen.id3 import (
@@ -47,7 +47,7 @@ def fetch_musicbrainz(artist: str, song: str) -> Optional[dict]:
     Query MusicBrainz for recording metadata.
 
     Returns a dict with keys: album, year, genre, track_num, mb_id,
-    release_id, cover_url — or None on any failure.
+    release_id, cover_url, duration_seconds — or None on any failure.
     """
     try:
         res = musicbrainzngs.search_recordings(
@@ -62,6 +62,10 @@ def fetch_musicbrainz(artist: str, song: str) -> Optional[dict]:
 
         best = recordings[0]
         album = year = release_id = track_num = genre = mb_id = cover_url = None
+        duration_seconds = None
+
+        if "length" in best and best["length"]:
+            duration_seconds = int(best["length"]) // 1000
 
         release_list = best.get("release-list", [])
         if release_list:
@@ -99,6 +103,7 @@ def fetch_musicbrainz(artist: str, song: str) -> Optional[dict]:
             "mb_id": mb_id,
             "release_id": release_id,
             "cover_url": cover_url,
+            "duration_seconds": duration_seconds,
         }
 
     except (musicbrainzngs.WebServiceError, Exception):
@@ -149,9 +154,7 @@ def _embed_mp3(
     if mb_id:
         tags.add(TXXX(encoding=3, desc="MusicBrainz Track Id", text=mb_id))
     if image:
-        tags.add(
-            APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=image)
-        )
+        tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=image))
     tags.save(str(path), v2_version=3)
 
 
@@ -183,13 +186,9 @@ def _embed_m4a(
         except (ValueError, TypeError):
             pass
     if source_url:
-        tags["----:com.apple.iTunes:Source URL"] = [
-            MP4FreeForm(source_url.encode("utf-8"))
-        ]
+        tags["----:com.apple.iTunes:Source URL"] = [MP4FreeForm(source_url.encode("utf-8"))]
     if mb_id:
-        tags["----:com.apple.iTunes:MusicBrainz Track Id"] = [
-            MP4FreeForm(mb_id.encode("utf-8"))
-        ]
+        tags["----:com.apple.iTunes:MusicBrainz Track Id"] = [MP4FreeForm(mb_id.encode("utf-8"))]
     if image:
         tags["covr"] = [MP4Cover(image, imageformat=MP4Cover.FORMAT_JPEG)]
     tags.save()
@@ -207,9 +206,7 @@ def _embed_opus(
 ) -> None:
     """Embed Vorbis comments. Cover art is not supported in OGG Vorbis."""
     if console_warn_fn:
-        console_warn_fn(
-            "[yellow]⚠ Cover art embedding is not supported for OPUS files.[/yellow]"
-        )
+        console_warn_fn("[yellow]⚠ Cover art embedding is not supported for OPUS files.[/yellow]")
     try:
         tags = OggVorbis(str(path))
         tags["title"] = [title]
@@ -249,36 +246,58 @@ def embed_metadata(
     Returns:
         True on success and integrity check pass; False otherwise.
     """
-    album     = extra.get("album") or ""
-    year      = extra.get("year") or ""
-    genre     = extra.get("genre") or ""
+    album = extra.get("album") or ""
+    year = extra.get("year") or ""
+    genre = extra.get("genre") or ""
     track_num = extra.get("track_num") or ""
-    mb_id     = extra.get("mb_id") or ""
+    mb_id = extra.get("mb_id") or ""
     source_url = extra.get("source_url") or ""
-    cover_url  = extra.get("cover_url") or thumbnail_url
+    cover_url = extra.get("cover_url") or thumbnail_url
 
     image: Optional[bytes] = _fetch_image(cover_url) if cover_url else None
 
     try:
         if fmt == "mp3":
             _embed_mp3(
-                file_path, title, artist, album, year,
-                genre, track_num, mb_id, source_url, image,
+                file_path,
+                title,
+                artist,
+                album,
+                year,
+                genre,
+                track_num,
+                mb_id,
+                source_url,
+                image,
             )
         elif fmt == "m4a":
             _embed_m4a(
-                file_path, title, artist, album, year,
-                genre, track_num, mb_id, source_url, image,
+                file_path,
+                title,
+                artist,
+                album,
+                year,
+                genre,
+                track_num,
+                mb_id,
+                source_url,
+                image,
             )
         elif fmt == "opus":
             _embed_opus(
-                file_path, title, artist, album, year, genre,
-                track_num, console_warn_fn,
+                file_path,
+                title,
+                artist,
+                album,
+                year,
+                genre,
+                track_num,
+                console_warn_fn,
             )
 
         # Post-embed integrity check
-        probe = mutagen.File(str(file_path)) # type: ignore
+        probe = mutagen.File(str(file_path))  # type: ignore
         return probe is not None
 
-    except (mutagen.MutagenError, Exception): # type: ignore
+    except (mutagen.MutagenError, Exception):  # type: ignore
         return False

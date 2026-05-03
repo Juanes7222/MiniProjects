@@ -32,18 +32,14 @@ class DownloaderEvents:
     def on_session_start(self, total: int) -> None:
         """Fired once before any downloads begin."""
 
-    def on_session_complete(
-        self, results: list["DownloadResult"], elapsed: float
-    ) -> None:
+    def on_session_complete(self, results: list["DownloadResult"], elapsed: float) -> None:
         """Fired once after all workers finish."""
 
     def on_interrupted(self, completed: int, total: int, elapsed: float) -> None:
         """Fired on KeyboardInterrupt."""
 
-
     def on_artist_start(self, artist: str, song_count: int) -> None:
         """Fired the first time an artist is encountered in the batch."""
-
 
     def on_search_start(self, artist: str, song: str, source: str) -> None:
         """Fired before querying each source."""
@@ -59,11 +55,8 @@ class DownloaderEvents:
     ) -> None:
         """Fired after scoring, with the full ranked candidate list."""
 
-    def on_search_failed(
-        self, artist: str, song: str, sources_tried: list[str]
-    ) -> None:
+    def on_search_failed(self, artist: str, song: str, sources_tried: list[str]) -> None:
         """Fired when no source produced an acceptable result."""
-
 
     def on_verification_status(
         self,
@@ -74,7 +67,6 @@ class DownloaderEvents:
         fp_label: str,
     ) -> None:
         """Fired after the pre-download scoring + fingerprint decision."""
-
 
     def on_fingerprint_start(self, artist: str, song: str, seconds: int) -> None:
         """Fired before the partial download for fingerprinting."""
@@ -92,9 +84,7 @@ class DownloaderEvents:
     ) -> None:
         """Fired after the AcoustID API call returns."""
 
-    def on_fingerprint_low_confidence(
-        self, artist: str, song: str, matched_title: str
-    ) -> None:
+    def on_fingerprint_low_confidence(self, artist: str, song: str, matched_title: str) -> None:
         """Fired when confidence is > 0.4 but < threshold — trying next candidate."""
 
     def on_fingerprint_no_match(self, artist: str, song: str) -> None:
@@ -103,10 +93,7 @@ class DownloaderEvents:
     def on_fingerprint_error(self, artist: str, song: str, error: str) -> None:
         """Fired when the AcoustID call raises an exception."""
 
-
-    def on_skip_existing(
-        self, artist: str, song: str, file_path: Path, md5_ok: bool
-    ) -> None:
+    def on_skip_existing(self, artist: str, song: str, file_path: Path, md5_ok: bool) -> None:
         """Fired when a song is skipped because it already exists on disk."""
 
     def on_md5_mismatch(self, artist: str, song: str) -> None:
@@ -141,9 +128,7 @@ class DownloaderEvents:
     ) -> None:
         """Fired before each retry sleep."""
 
-    def on_download_failed(
-        self, artist: str, song: str, error: str
-    ) -> None:
+    def on_download_failed(self, artist: str, song: str, error: str) -> None:
         """Fired when all retry attempts are exhausted."""
 
     def on_disk_full(self) -> None:
@@ -168,9 +153,7 @@ class DownloaderEvents:
     ) -> None:
         """Fired after the silence analysis completes."""
 
-    def on_silence_rejected(
-        self, artist: str, song: str, silence_ratio: float
-    ) -> None:
+    def on_silence_rejected(self, artist: str, song: str, silence_ratio: float) -> None:
         """Fired when a file is deleted due to excessive silence."""
 
     def on_post_check_summary(
@@ -182,7 +165,6 @@ class DownloaderEvents:
         silence_ratio: float,
     ) -> None:
         """Fired once with the combined post-check results."""
-
 
     def on_musicbrainz_result(
         self,
@@ -198,7 +180,6 @@ class DownloaderEvents:
 
     def on_warn(self, message: str) -> None:
         """Generic warning channel (e.g. opus cover art not supported)."""
-
 
     def on_result(self, result: "DownloadResult") -> None:
         """

@@ -10,6 +10,7 @@ import re
 import shutil
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -66,8 +67,30 @@ def check_ffmpeg(console: "Console") -> None:
                 "  [bold]macOS (brew):[/bold]   brew install ffmpeg\n"
                 "  [bold]Windows:[/bold]        https://ffmpeg.org/download.html\n"
                 "  [bold]Arch Linux:[/bold]     sudo pacman -S ffmpeg",
-                title="[bold red]⚠ Missing Dependency: ffmpeg[/bold red]",
+                title="[bold red] Missing Dependency: ffmpeg[/bold red]",
                 border_style="red",
             )
         )
         sys.exit(1)
+
+_NOISE_PATTERN = re.compile(
+    r"[\(\[\{][^\)\]\}]{0,40}[\)\]\}]"       # parentheses/brackets blocks
+    r"|official\s*(audio|video|music\s*video|lyric\s*video)?"
+    r"|[\|\-–—]\s*\w[\w\s]{0,30}$"           # trailing " - Channel Name"
+    r"|\b(hd|hq|4k|remastered|visualizer)\b",
+    re.IGNORECASE,
+)
+
+def normalize_title(title: str) -> str:
+    nfkd = unicodedata.normalize("NFKD", title)
+    ascii_title = nfkd.encode("ascii", "ignore").decode("ascii")
+    cleaned = _NOISE_PATTERN.sub(" ", ascii_title)
+    return re.sub(r"\s{2,}", " ", cleaned).strip().lower()
+
+_FEAT_PATTERN = re.compile(
+    r"\s*(feat\.?|ft\.?|with|&|\+)\s+.+$",
+    re.IGNORECASE,
+)
+
+def strip_featuring(text: str) -> str:
+    return _FEAT_PATTERN.sub("", text).strip()
