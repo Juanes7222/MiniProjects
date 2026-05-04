@@ -162,29 +162,30 @@ def score_youtube_result(
     if fuzzy_ratio >= 85:
         breakdown["high_fuzzy"] = config.HIGH_FUZZY_BONUS
     elif fuzzy_ratio >= 70:
-        breakdown["medium_fuzzy"] = 15
+        breakdown["medium_fuzzy"] = 10
     elif song_partial >= 90:
         if length_coverage >= 0.35:
             breakdown["song_in_title"] = 35
         elif length_coverage >= 0.15:
             breakdown["song_in_title"] = 10   
-        # breakdown["song_exact_in_title"] = 30
         if fuzz.partial_ratio(artist_clean, title) > 80:
-            breakdown["artist_in_title"] = 15
+            breakdown["artist_in_title"] = 10
     elif song_only_ratio >= 80:
         breakdown["song_title_match"] = 20
         if fuzz.partial_ratio(artist_clean, title) > 80:
-            breakdown["artist_in_title"] = 15
+            breakdown["artist_in_title"] = 10
             
     song_presence = max(
         fuzz.partial_ratio(song_clean, title),
         fuzz.token_sort_ratio(song_clean, title),
     )
 
-    if song_presence < 45:
+    # Fix: if the expected song exactly matches the normalized title, don't penalize
+    # This prevents extremely short titles like "Tu Puedes" from being wrongly penalized
+    if song_presence < 45 and song_clean not in title:
         breakdown["song_absent_penalty"] = -80
-    elif song_presence < 60:
-        breakdown["song_weak_match_penalty"] = -50
+    elif song_presence < 60 and song_clean not in title:
+        breakdown["song_weak_match_penalty"] = -30
 
     if song_presence >= 45:
         ref = f"{artist_clean} {song_clean}"
@@ -200,7 +201,7 @@ def score_youtube_result(
         breakdown["artist_weak_penalty"] = -20
 
     # 4. Duration scoring
-    if mb_duration_seconds is not None and result_duration > 0:
+    if mb_duration_seconds is not None and result_duration > 0 and mb_duration_seconds > 0:
         ratio = abs(result_duration - mb_duration_seconds) / mb_duration_seconds
         if ratio <= 0.08:
             breakdown["duration_exact"] = config.DURATION_MATCH_BONUS
@@ -209,7 +210,7 @@ def score_youtube_result(
         elif ratio <= 0.40:
             breakdown["duration_far"] = -10
         else:
-            breakdown["duration_mismatch"] = -35
+            breakdown["duration_mismatch"] = -20  # Reduced penalty so it doesn't instantly kill candidates
 
     if view_count > 1_000_000:
         breakdown["high_views"] = 5
@@ -217,6 +218,10 @@ def score_youtube_result(
     # Penalties
     if any(t in title for t in ["live", "en vivo", "concert", "concierto", "tour"]):
         breakdown["live_penalty"] = config.LIVE_PENALTY
+
+    # Check the RAW title for acoustic/acustico to avoid destroying stripped titles
+    if any(t in raw_title_lower for t in ["acoustic", "acústico", "acústica"]):
+        breakdown["acoustic_penalty"] = -25
 
     if any(t in channel for t in ["dj", "mix", "bootleg", "edits"]):
         breakdown["dj_channel_penalty"] = -25
