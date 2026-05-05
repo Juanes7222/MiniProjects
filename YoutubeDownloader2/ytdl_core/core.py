@@ -210,8 +210,8 @@ class MusicDownloader:
         ydl_opts: Any = {
             "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "outtmpl": str(output_dir / "%(playlist)s" / "%(title)s.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
+            "quiet": False,
+            "no_warnings": False,
             "progress_hooks": [_progress_hook],
             "writethumbnail": True,
             "postprocessors": [
@@ -220,6 +220,12 @@ class MusicDownloader:
                 {"key": "EmbedThumbnail", "already_have_thumbnail": False},
             ],
             "extract_flat": False,
+            "ignoreerrors": True,
+            "skip_unavailable_fragments": True,
+            "playliststart": 1,
+            "socket_timeout": 30,
+            "retries": 3,
+            "fragment_retries": 3,
         }
 
         if max_downloads is not None:
