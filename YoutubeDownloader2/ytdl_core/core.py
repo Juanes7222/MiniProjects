@@ -52,6 +52,7 @@ class MusicDownloader:
         min_duration: Optional[int] = None,
         musicbrainz: bool = False,
         cookies_browser: Optional[str] = None,
+        cookies_file: Optional[str] = None,
         proxy: Optional[str] = None,
     ) -> None:
         self.config = config or Config()
@@ -71,6 +72,7 @@ class MusicDownloader:
         self.min_duration = min_duration or self.config.MIN_DURATION_SECONDS
         self.musicbrainz = musicbrainz
         self.cookies_browser = cookies_browser
+        self.cookies_file = cookies_file
         self.proxy = proxy
         self.fpcalc_available: bool = shutil.which("fpcalc") is not None
         self._fp_semaphore = threading.Semaphore(2)
@@ -225,6 +227,8 @@ class MusicDownloader:
 
         if self.cookies_browser:
             ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
+        if self.cookies_file:
+            ydl_opts["cookiefile"] = str(self.cookies_file)
         if self.proxy:
             ydl_opts["proxy"] = self.proxy
 
@@ -407,6 +411,7 @@ class MusicDownloader:
         search_opts = {
             "max_results": self.max_results,
             "cookies_browser": self.cookies_browser,
+            "cookies_file": self.cookies_file,
             "proxy": self.proxy,
         }
 
@@ -613,6 +618,8 @@ class MusicDownloader:
         }
         if self.cookies_browser:
             ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
+        if self.cookies_file:
+            ydl_opts["cookiefile"] = str(self.cookies_file)
         if self.proxy:
             ydl_opts["proxy"] = self.proxy
 
@@ -762,6 +769,8 @@ class MusicDownloader:
         }
         if self.cookies_browser:
             ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
+        if self.cookies_file:
+            ydl_opts["cookiefile"] = str(self.cookies_file)
         if self.proxy:
             ydl_opts["proxy"] = self.proxy
         try:

@@ -533,7 +533,8 @@ def _dry_run_table(
 
     opts: dict[str, Any] = {
         "max_results": args.max_results,
-        "cookies_browser": args.cookies_browser,
+        "cookies_browser": getattr(args, "cookies_browser", None),
+        "cookies_file": getattr(args, "cookies", None),
         "proxy": args.proxy,
     }
     threshold = getattr(args, "score_threshold", config.SCORE_THRESHOLD_REJECT)
@@ -697,6 +698,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--cookies-browser", metavar="BROWSER", choices=["chrome", "firefox", "edge", "safari"]
     )
+    p.add_argument("--cookies", metavar="FILE", type=Path, help="Path to a cookies.txt file")
     p.add_argument("--proxy", metavar="URL")
     p.add_argument("--musicbrainz", action="store_true")
 
@@ -850,6 +852,7 @@ def main() -> None:
         min_duration=args.min_duration,
         musicbrainz=args.musicbrainz,
         cookies_browser=args.cookies_browser,
+        cookies_file=str(args.cookies) if args.cookies else None,
         proxy=args.proxy,
     )
 
