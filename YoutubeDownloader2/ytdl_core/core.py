@@ -208,8 +208,8 @@ class MusicDownloader:
                 )
 
         ydl_opts: Any = {
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-            "outtmpl": str(output_dir / "%(playlist)s" / "%(title)s.%(ext)s"),
+            "format": "bestaudio/best",
+            "outtmpl": str(output_dir / "%(uploader)s" / "%(title)s.%(ext)s"),
             "quiet": False,
             "no_warnings": False,
             "progress_hooks": [_progress_hook],
