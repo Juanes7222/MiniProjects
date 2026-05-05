@@ -214,6 +214,7 @@ class MusicDownloader:
             "no_warnings": False,
             "progress_hooks": [_progress_hook],
             "writethumbnail": True,
+            "extractor_args": {"youtube": ["player_client=android", "client=ANDROID"]},
             "postprocessors": [
                 {"key": "FFmpegExtractAudio", "preferredcodec": fmt, "preferredquality": quality},
                 {"key": "FFmpegMetadata"},
