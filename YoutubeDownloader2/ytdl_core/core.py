@@ -208,7 +208,7 @@ class MusicDownloader:
                 )
 
         ydl_opts: Any = {
-            "format": "bestaudio/best",
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "outtmpl": str(output_dir / "%(playlist)s" / "%(title)s.%(ext)s"),
             "quiet": True,
             "no_warnings": True,
@@ -606,7 +606,7 @@ class MusicDownloader:
                 )
 
         ydl_opts: Any = {
-            "format": "bestaudio/best",
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "outtmpl": output_template,
             "quiet": True,
             "no_warnings": True,
@@ -757,7 +757,7 @@ class MusicDownloader:
         token = uuid4().hex[:8]
         expected = output_dir / f"_partial_{token}.mp3"
         ydl_opts: Any = {
-            "format": "bestaudio/best",
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "outtmpl": str(output_dir / f"_partial_{token}.%(ext)s"),
             "quiet": True,
             "no_warnings": True,
