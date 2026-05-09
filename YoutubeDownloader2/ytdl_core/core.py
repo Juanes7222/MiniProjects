@@ -193,58 +193,156 @@ class MusicDownloader:
         fmt: str = "mp3",
         quality: str = "192",
         max_downloads: Optional[int] = None,
+        skip_existing: bool = False,
     ) -> None:
         """Download directly from an arbitrary URL (e.g. playlist, channel, shorts)."""
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        def _progress_hook(d: dict) -> None:
-            if d.get("status") == "downloading":
-                total_b = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                downloaded_b = d.get("downloaded_bytes") or 0
-                pct = (downloaded_b / total_b * 100.0) if total_b else 0.0
-                self.events.on_download_progress(
-                    "URL", url[:30], pct, d.get("speed") or 0.0, downloaded_b, total_b
-                )
-
-        ydl_opts: Any = {
-            "format": "bestaudio/best",
-            "outtmpl": str(output_dir / "%(uploader)s" / "%(title)s.%(ext)s"),
-            "quiet": False,
-            "no_warnings": False,
-            "progress_hooks": [_progress_hook],
-            "writethumbnail": True,
+        ydl_opts_flat: Any = {
+            "extract_flat": True,
+            "quiet": True,
+            "no_warnings": True,
+            "playlistend": max_downloads if max_downloads else None,
             "extractor_args": {"youtube": ["player_client=ios,android,web"]},
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": fmt, "preferredquality": quality},
-                {"key": "FFmpegMetadata"},
-                {"key": "EmbedThumbnail", "already_have_thumbnail": False},
-            ],
-            "extract_flat": False,
-            "ignoreerrors": True,
-            "skip_unavailable_fragments": True,
-            "playliststart": 1,
-            "socket_timeout": 30,
-            "retries": 3,
-            "fragment_retries": 3,
         }
 
-        if max_downloads is not None:
-            ydl_opts["playlistend"] = max_downloads
-
         if self.cookies_browser:
-            ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
+            ydl_opts_flat["cookiesfrombrowser"] = (self.cookies_browser,)
         if self.cookies_file:
-            ydl_opts["cookiefile"] = str(self.cookies_file)
+            ydl_opts_flat["cookiefile"] = str(self.cookies_file)
         if self.proxy:
-            ydl_opts["proxy"] = self.proxy
+            ydl_opts_flat["proxy"] = self.proxy
 
-        self.events.on_download_start("URL", url, url)
+        with yt_dlp.YoutubeDL(ydl_opts_flat) as ydl:
+            try:
+                info = ydl.extract_info(url, download=False)
+            except Exception as exc:
+                self.events.on_download_failed("URL", url, str(exc))
+                return
+
+        if not info:
+            return
+
+        entries = info.get("entries")
+        if entries is None:
+            entries = [info]
+
+        urls_to_download = []
+        for entry in entries:
+            if not entry:
+                continue
+            e_url = entry.get("url")
+            if not e_url and entry.get("id"):
+                e_url = f"https://www.youtube.com/watch?v={entry['id']}"
+            if e_url:
+                urls_to_download.append((entry.get("uploader", "Unknown"), entry.get("title", "Unknown"), e_url))
+
+        if not urls_to_download:
+            return
+
+        total = len(urls_to_download)
+        self.events.on_session_start(total)
+        
+        all_results: list[DownloadResult] = []
+        results_lock = threading.Lock()
+        stop_event = threading.Event()
+        start = time.monotonic()
+
+        def _process_single_url(item_artist: str, item_title: str, item_url: str):
+            if stop_event.is_set():
+                return
+
+            result = DownloadResult(artist=item_artist, song=item_title)
+            safe_artist = sanitize_filename(item_artist)
+            safe_song = sanitize_filename(item_title)
+            expected_file = output_dir / safe_artist / f"{safe_song}.{fmt}"
+
+            if skip_existing and expected_file.exists():
+                self.events.on_skip_existing(item_artist, item_title, expected_file, True)
+                result.status = "skipped"
+                result.reason = "File exists"
+                result.file_path = expected_file
+                with results_lock:
+                    all_results.append(result)
+                self.events.on_result(result)
+                return
+
+            def _progress_hook(d: dict) -> None:
+                if d.get("status") == "downloading":
+                    total_b = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                    downloaded_b = d.get("downloaded_bytes") or 0
+                    pct = (downloaded_b / total_b * 100.0) if total_b else 0.0
+                    self.events.on_download_progress(
+                        item_artist, item_title[:30], pct, d.get("speed") or 0.0, downloaded_b, total_b
+                    )
+
+            ydl_opts: Any = {
+                "format": "bestaudio/best",
+                "outtmpl": str(output_dir / "%(uploader)s" / "%(title)s.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+                "progress_hooks": [_progress_hook],
+                "writethumbnail": True,
+                "nooverwrites": skip_existing,
+                "windowsfilenames": True,
+                "extractor_args": {"youtube": ["player_client=ios,android,web"]},
+                "postprocessors": [
+                    {"key": "FFmpegExtractAudio", "preferredcodec": fmt, "preferredquality": quality},
+                    {"key": "FFmpegMetadata"},
+                    {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+                ],
+                "extract_flat": False,
+                "ignoreerrors": True,
+                "skip_unavailable_fragments": True,
+                "socket_timeout": 30,
+                "retries": 3,
+                "fragment_retries": 3,
+            }
+
+            if self.cookies_browser:
+                ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
+            if self.cookies_file:
+                ydl_opts["cookiefile"] = str(self.cookies_file)
+            if self.proxy:
+                ydl_opts["proxy"] = self.proxy
+
+            self.events.on_download_start(item_artist, item_title, item_url)
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl_item:
+                    info_dict = ydl_item.extract_info(item_url, download=True)
+                    if info_dict:
+                        result.status = "downloaded"
+                        # Actual target based on info dict
+                        actual_artist = sanitize_filename(info_dict.get("uploader", item_artist))
+                        actual_title = sanitize_filename(info_dict.get("title", item_title))
+                        result.file_path = output_dir / actual_artist / f"{actual_title}.{fmt}"
+                        result.duration_seconds = info_dict.get("duration")
+            except Exception as exc:
+                self.events.on_download_failed(item_artist, item_title, str(exc))
+                result.status = "failed"
+                result.reason = str(exc)
+
+            with results_lock:
+                all_results.append(result)
+            self.events.on_result(result)
+
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-        except Exception as exc:
-            self.events.on_download_failed("URL", url, str(exc))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+                futures = [
+                    executor.submit(_process_single_url, a, t, u)
+                    for a, t, u in urls_to_download
+                ]
+                for fut in concurrent.futures.as_completed(futures):
+                    try:
+                        fut.result()
+                    except Exception:
+                        pass
+        except KeyboardInterrupt:
+            stop_event.set()
+
+        elapsed = time.monotonic() - start
+        self.events.on_session_complete(all_results, elapsed)
 
     def verify_library(
         self,
