@@ -21,6 +21,7 @@ from uuid import uuid4
 import acoustid
 import mutagen
 import yt_dlp
+import random
 from rapidfuzz import fuzz
 from yt_dlp.utils import DownloadError, ExtractorError, download_range_func
 
@@ -40,6 +41,7 @@ class MusicDownloader:
         config: Optional[Config] = None,
         events: Optional[DownloaderEvents] = None,
         acoustid_key: Optional[str] = None,
+        force_fingerprint: bool = False,
         skip_fingerprint: bool = False,
         no_silence_check: bool = False,
         score_threshold: Optional[int] = None,
@@ -58,6 +60,7 @@ class MusicDownloader:
         self.config = config or Config()
         self.events = events or DownloaderEvents()
         self.acoustid_key = acoustid_key
+        self.force_fingerprint = force_fingerprint
         self.skip_fingerprint = skip_fingerprint
         self.no_silence_check = no_silence_check
         self.score_threshold = (
@@ -76,6 +79,11 @@ class MusicDownloader:
         self.proxy = proxy
         self.fpcalc_available: bool = shutil.which("fpcalc") is not None
         self._fp_semaphore = threading.Semaphore(2)
+        
+        self._acoustid_circuit_open = False
+        self._acoustid_cooldown_until = 0.0
+        self._acoustid_circuit_lock = threading.Lock()
+        self._acoustid_cooldown_duration = 60.0
 
     def download(
         self,
@@ -214,7 +222,7 @@ class MusicDownloader:
             "no_warnings": False,
             "progress_hooks": [_progress_hook],
             "writethumbnail": True,
-            "extractor_args": {"youtube": ["player_client=ios,android,web"]},
+            "extractor_args": {"youtube": ["player_client=ios,tv,web"]},
             "postprocessors": [
                 {"key": "FFmpegExtractAudio", "preferredcodec": fmt, "preferredquality": quality},
                 {"key": "FFmpegMetadata"},
@@ -311,7 +319,7 @@ class MusicDownloader:
             result.duration_seconds = actual_duration
 
             if self.acoustid_key:
-                apply_delay(0.2, 0.5)  # Prevent blasting APIs and triggering rate-limits
+                apply_delay(0.2, 0.5) 
                 if getattr(self, "musicbrainz", False):
                     try:
                         mb_data = fetch_musicbrainz(artist, song)
@@ -322,7 +330,9 @@ class MusicDownloader:
                     except Exception:
                         pass
                 
-                fp_ok, fp_conf, fp_title = self._verify_fingerprint(expected_file, artist, song)
+                with self._fp_semaphore:
+                    fp_ok, fp_conf, fp_title = self._verify_fingerprint(expected_file, artist, song)
+                
                 result.fingerprint_verified = fp_ok
                 result.fingerprint_confidence = fp_conf
                 result.fingerprint_matched_title = fp_title
@@ -507,10 +517,12 @@ class MusicDownloader:
         fp_label = "disabled"
 
         needs_fp = (
-            bool(self.acoustid_key)
-            and not self.skip_fingerprint
-            and self.fpcalc_available
-            and composite_score < self.config.SCORE_THRESHOLD_SKIP_FINGERPRINT
+            self.force_fingerprint or (
+                bool(self.acoustid_key)
+                and not self.skip_fingerprint
+                and self.fpcalc_available
+                and composite_score < self.config.SCORE_THRESHOLD_SKIP_FINGERPRINT
+            )
         )
 
         if self.acoustid_key and composite_score >= self.config.SCORE_THRESHOLD_SKIP_FINGERPRINT:
@@ -796,24 +808,65 @@ class MusicDownloader:
     ) -> tuple[bool, float, str]:
         if not self.acoustid_key:
             return False, 0.0, "no_key"
-        try:
-            results = list(acoustid.match(self.acoustid_key, str(partial_path), meta="recordings"))
-            best_conf = 0.0
-            best_title = ""
-            for score, _rec_id, title, a in results:
-                if score < self.config.FINGERPRINT_MIN_CONFIDENCE:
-                    continue
-                a_sim = fuzz.token_sort_ratio(artist.lower(), (a or "").lower())
-                t_sim = fuzz.token_sort_ratio(song.lower(), (title or "").lower())
-                if a_sim > 75 and t_sim > 75:
-                    return True, score, title or ""
-                if score > best_conf:
-                    best_conf = score
-                    best_title = f"{a} -- {title}"
-            return False, best_conf, best_title
-        except Exception as exc:
-            self.events.on_fingerprint_error(artist, song, str(exc))
-            return False, 0.0, "fingerprint_error"
+            
+        with self._acoustid_circuit_lock:
+            if self._acoustid_circuit_open:
+                if time.time() < self._acoustid_cooldown_until:
+                    return False, 0.0, "circuit_breaker_open"
+                else:
+                    self._acoustid_circuit_open = False
+                    self.events.on_warn("[green]AcoustID cooldown finished. Attempting to reconnect...[/green]")
+
+        max_retries = 3 
+        base_delay = 2.0 
+        
+        for attempt in range(max_retries):
+            try:
+                stop_time = random.uniform(5.0, 10.0) 
+                print(f"Applying random delay of {stop_time:.2f}s before AcoustID request...")
+                time.sleep(stop_time)
+                
+                results = list(acoustid.match(self.acoustid_key, str(partial_path), meta="recordings"))
+                best_conf = 0.0
+                best_title = ""
+                
+                for score, _rec_id, title, a in results:
+                    if score < self.config.FINGERPRINT_MIN_CONFIDENCE:
+                        continue
+                    a_sim = fuzz.token_sort_ratio(artist.lower(), (a or "").lower())
+                    t_sim = fuzz.token_sort_ratio(song.lower(), (title or "").lower())
+                    if a_sim > 75 and t_sim > 75:
+                        return True, score, title or ""
+                    if score > best_conf:
+                        best_conf = score
+                        best_title = f"{a} -- {title}"
+                        
+                return False, best_conf, best_title
+                
+            except Exception as exc:
+                err_str = str(exc).lower()
+                
+                if "error" in err_str or "rate limit" in err_str or "429" in err_str:
+                    if attempt < max_retries - 1:
+                        sleep_time = base_delay * (2 ** attempt)
+                        self.events.on_warn(f"[yellow]AcoustID rate limit hit. Local retry in {sleep_time}s...[/yellow]")
+                        time.sleep(sleep_time)
+                        continue
+                    else:
+                        # 2. El Circuit Breaker se ACTIVA si los reintentos locales fallan
+                        with self._acoustid_circuit_lock:
+                            # Evitamos sobrescribir si otro hilo ya activó el breaker
+                            if not self._acoustid_circuit_open:
+                                self._acoustid_circuit_open = True
+                                self._acoustid_cooldown_until = time.time() + self._acoustid_cooldown_duration
+                                self.events.on_warn(
+                                    f"[red]CRITICAL: AcoustID API blocked. Circuit Breaker OPEN. "
+                                    f"Suspending all fingerprinting for {int(self._acoustid_cooldown_duration)} seconds.[/red]"
+                                )
+                        return False, 0.0, "rate_limit_exceeded"
+                        
+                self.events.on_fingerprint_error(artist, song, str(exc))
+                return False, 0.0, "fingerprint_error"
 
     def _has_excessive_silence(self, file_path: Path) -> tuple[bool, float]:
         try:
