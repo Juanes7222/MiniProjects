@@ -1050,6 +1050,7 @@ class MusicDownloader:
         file_path: Optional[str],
         md5: Optional[str],
         output_dir: Path,
+        fingerprint_verified: bool = False,
     ) -> None:
         with lock:
             state.setdefault("downloads", {})[key] = {
@@ -1057,6 +1058,7 @@ class MusicDownloader:
                 "url": url,
                 "file_path": file_path,
                 "md5": md5,
+                "fingerprint_verified": fingerprint_verified,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             save_state(state, output_dir)
