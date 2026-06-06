@@ -32,7 +32,7 @@ def build_search_query(artist: str, song: str, source: str) -> str:
         A formatted query string.
     """
     if source == "youtube":
-        return f'"{song}" "{artist}" official audio'
+        return f"{artist} {song} official audio"
     return f"{song} {artist}"
 
 
@@ -54,9 +54,16 @@ def search_ytmusic_official(artist: str, song: str, opts: dict) -> list[dict]:
     try:
         from ytmusicapi import YTMusic
         ytmusic = YTMusic()
-        max_r = min(opts.get("max_results", 5), 3)
+        max_r = min(opts.get("max_results", 5), 5)
         query = f"{artist} {song}"
         search_results = ytmusic.search(query, filter="songs", limit=max_r)
+        # Fall back to video catalog when the songs index returns fewer hits than expected.
+        if len(search_results) < max_r:
+            try:
+                video_results = ytmusic.search(query, filter="videos", limit=max_r)
+                search_results = search_results + video_results
+            except Exception:
+                pass
     except Exception:
         return []
 
@@ -143,7 +150,7 @@ def build_query_variants(artist: str, song: str, source: str) -> list[str]:
     if source != "youtube":
         return [f"{song} {artist}"]
     return [
-        f'"{song}" "{artist}" official audio',
+        f"{artist} {song} official audio",
         f"{artist} - {song}",
         f"{artist} {song}",
     ]
@@ -179,27 +186,41 @@ def search_with_variants(
 
 def _dedup_results(results: list[dict]) -> list[dict]:
     """
-    Deduplicates tracking lists by using content IDs and metadata signatures.
+    Deduplicates candidates by ID, merging repeated entries into a source count.
 
-    Args:
-        results: A dirty list containing overlapping source entries.
-
-    Returns:
-        A deduplicated clean list of track entries.
+    When the same video ID appears from multiple sources, the first occurrence
+    is kept and its ``_source_count`` is incremented. If a later occurrence
+    comes from ``ytmusic_api``, the stored entry is promoted to that source so
+    the scorer applies the API fast-path regardless of which source resolved first.
+    The ``artists`` list from the API entry is also merged in, since yt_dlp
+    scraping does not populate that field.
     """
-    seen_ids = set()
-    deduped = []
+    seen_ids: dict[str, int] = {}  # id -> index in deduped
+    deduped: list[dict] = []
+    sig_set: set = set()
+
     for r in results:
         vid = r.get("id") or r.get("url")
         if vid:
             if vid in seen_ids:
+                existing = deduped[seen_ids[vid]]
+                existing["_source_count"] = existing.get("_source_count", 1) + 1
+                # Promote to ytmusic_api source and merge artist metadata if available.
+                if r.get("_source") == "ytmusic_api":
+                    existing["_source"] = "ytmusic_api"
+                    if r.get("artists"):
+                        existing["artists"] = r["artists"]
                 continue
-            seen_ids.add(vid)
+            seen_ids[vid] = len(deduped)
+
         sig = (r.get("title"), r.get("channel"), r.get("duration"))
-        if sig in seen_ids:
+        if sig in sig_set:
             continue
-        seen_ids.add(sig)
-        deduped.append(r)
+        sig_set.add(sig)
+        entry = dict(r)
+        entry.setdefault("_source_count", 1)
+        deduped.append(entry)
+
     return deduped
 
 
@@ -278,21 +299,63 @@ def score_youtube_result(
     song_clean = normalize_title(strip_featuring(song.lower()))
 
     if entry.get("_source") == "ytmusic_api":
-        song_match = int(fuzz.token_set_ratio(song_clean, title))
-
-        ytmusic_artists = " ".join(entry.get("artists") or [])
-        artist_match = max(
-            int(fuzz.token_set_ratio(artist_clean, normalize_title(ytmusic_artists))),
-            int(fuzz.token_set_ratio(artist_clean, normalize_title(channel))),
+        # Strip featuring credits from the result title before comparison, mirroring
+        # what strip_featuring already does to song_clean, so that "Dios Es Amor
+        # (feat. Wiso Aponte)" compares cleanly against the query "Dios Es Amor".
+        title_clean = normalize_title(strip_featuring(raw_title.lower()))
+        # Triple blend: token_set catches subset matches (short query vs long title),
+        # token_sort penalizes extra words, and ratio is order-sensitive so that
+        # anagram-like titles ("Amor De Dios" vs "Dios Es Amor") are distinguished.
+        song_match = int(
+            fuzz.token_set_ratio(song_clean, title_clean) * 0.3
+            + fuzz.token_sort_ratio(song_clean, title_clean) * 0.3
+            + fuzz.ratio(song_clean, title_clean) * 0.4
         )
 
-        if song_match >= 75 and artist_match >= 60:
-            breakdown["official_ytmusic_api"] = 120
+        # Match against each artist individually rather than the concatenated string,
+        # so that a feat. artist ("Benjamin Rivera, Wiso Aponte") does not reduce the
+        # score of the primary artist against the query.
+        ytmusic_artist_names = [
+            normalize_title(a) for a in (entry.get("artists") or []) if a
+        ]
+        ytmusic_artist_names.append(normalize_title(channel))
+        artist_match = max(
+            (
+                int(
+                    fuzz.token_set_ratio(artist_clean, name) * 0.3
+                    + fuzz.token_sort_ratio(artist_clean, name) * 0.3
+                    + fuzz.ratio(artist_clean, name) * 0.4
+                )
+                for name in ytmusic_artist_names
+                if name
+            ),
+            default=0,
+        )
+
+        # song_match is a hard gate: a strong artist match cannot rescue a title
+        # that differs significantly from the query (e.g. "Dios Es Asi" != "Dios Es Amor").
+        if song_match >= 80 and artist_match >= 80:
+            artist_factor = artist_match / 100.0
+            
+            api_bonus = int(25 + (song_match * artist_match) ** 0.5 * 0.3 * artist_factor)
+            
+            breakdown["official_ytmusic_api"] = api_bonus
             breakdown["catalog_match"] = song_match
             breakdown["artist_match"] = artist_match
+            
             if mb_duration_seconds is not None and result_duration > 0:
-                if abs(result_duration - mb_duration_seconds) <= 4:
+                diff_seconds = abs(result_duration - mb_duration_seconds)
+                if diff_seconds <= 4:
                     breakdown["duration_perfect"] = config.DURATION_MATCH_BONUS
+                elif diff_seconds <= 12:
+                    breakdown["duration_close"] = 10
+                elif diff_seconds > 25:
+                    breakdown["duration_mismatch"] = -35  # Penalización crucial añadida
+                    
+            source_count = entry.get("_source_count", 1)
+            if source_count > 1:
+                breakdown["cross_source_consensus"] = min(20, (source_count - 1) * 10)
+                
             return sum(breakdown.values()), breakdown
     
     title_tokens = set(title.split())
@@ -355,6 +418,10 @@ def score_youtube_result(
 
     if view_count > 1_000_000:
         breakdown["high_views"] = 5
+
+    source_count = entry.get("_source_count", 1)
+    if source_count > 1:
+        breakdown["cross_source_consensus"] = min(20, (source_count - 1) * 10)
 
     if any(t in channel for t in ["dj", "mix", "bootleg", "edits"]):
         breakdown["dj_channel_penalty"] = -25

@@ -844,7 +844,7 @@ class MusicDownloader:
         if downloaded_file is None or not downloaded_file.exists():
             self.events.on_download_failed(artist, song, last_error)
             result.reason = last_error
-            self._persist(state, state_lock, key, "failed", url, None, None, output_dir)
+            self._persist(state, state_lock, key, "failed", url, None, None, output_dir, needs_fp)
             return result
 
         dur_ok, actual_dur = self._verify_duration(downloaded_file, duration_s)
@@ -856,7 +856,7 @@ class MusicDownloader:
             if discrepancy > 0.40:
                 downloaded_file.unlink(missing_ok=True)
                 result.reason = f"Duration discrepancy {discrepancy:.0%}"
-                self._persist(state, state_lock, key, "failed", url, None, None, output_dir)
+                self._persist(state, state_lock, key, "failed", url, None, None, output_dir, needs_fp)
                 return result
 
         silence_ratio = 0.0
@@ -868,7 +868,7 @@ class MusicDownloader:
                 self.events.on_silence_rejected(artist, song, silence_ratio)
                 downloaded_file.unlink(missing_ok=True)
                 result.reason = f"Excessive silence ({silence_ratio:.1%})"
-                self._persist(state, state_lock, key, "failed", url, None, None, output_dir)
+                self._persist(state, state_lock, key, "failed", url, None, None, output_dir, needs_fp)
                 return result
 
         self.events.on_post_check_summary(artist, song, dur_ok, actual_dur, silence_ratio)
@@ -904,7 +904,7 @@ class MusicDownloader:
             self.events.on_metadata_error(artist, song, downloaded_file.name)
             downloaded_file.unlink(missing_ok=True)
             result.reason = "Metadata integrity check failed"
-            self._persist(state, state_lock, key, "failed", url, None, None, output_dir)
+            self._persist(state, state_lock, key, "failed", url, None, None, output_dir, needs_fp)
             return result
 
         md5 = compute_md5(downloaded_file)
@@ -930,6 +930,7 @@ class MusicDownloader:
             str(downloaded_file),
             md5,
             output_dir,
+            needs_fp,
         )
         return result
 
