@@ -15,7 +15,7 @@ class DownloadResult:
     artist: str
     song: str
 
-    status: Literal["downloaded", "failed", "skipped"] = "failed"
+    status: Literal["downloaded", "failed", "skipped", "verified"] = "failed"
     reason: Optional[str] = None
 
     source: Optional[str] = None

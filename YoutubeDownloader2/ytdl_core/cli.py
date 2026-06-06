@@ -704,6 +704,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--acoustid-key", metavar="KEY", dest="acoustid_key")
     p.add_argument("--skip-fingerprint", action="store_true")
+    p.add_argument("--force-fingerprint", action="store_true")
     p.add_argument(
         "--score-threshold", metavar="INT", type=int, default=_CONFIG.SCORE_THRESHOLD_REJECT
     )
@@ -854,6 +855,7 @@ def main() -> None:
         config=config,
         events=events,
         acoustid_key=args.acoustid_key,
+        force_fingerprint=args.force_fingerprint,
         skip_fingerprint=args.skip_fingerprint,
         no_silence_check=args.no_silence_check,
         score_threshold=args.score_threshold,

@@ -73,19 +73,23 @@ def check_ffmpeg(console: "Console") -> None:
         )
         sys.exit(1)
 
-_NOISE_PATTERN = re.compile(
-    r"[\(\[\{][^\)\]\}]{0,40}[\)\]\}]"       # parentheses/brackets blocks
-    r"|official\s*(audio|video|music\s*video|lyric\s*video)?"
-    r"|[\|\-–—]\s*\w[\w\s]{0,30}$"           # trailing " - Channel Name"
-    r"|\b(hd|hq|4k|remastered|visualizer)\b",
+def normalize_title(title: str) -> str:
+    if not title:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", title)
+    ascii_title = nfkd.encode("ascii", "ignore").decode("ascii")
+    
+    cleaned = re.sub(r'[\(\)\[\]\{\}\-\|\\\/,.:;!?_~*+^=]', ' ', ascii_title)
+    
+    return " ".join(cleaned.lower().split()).strip()
+
+_MATCHING_NOISE_PATTERN = re.compile(
+    r"\b(official\s*(audio|video|music\s*video|lyric\s*video)?|hd|hq|4k|remastered|visualizer)\b",
     re.IGNORECASE,
 )
 
-def normalize_title(title: str) -> str:
-    nfkd = unicodedata.normalize("NFKD", title)
-    ascii_title = nfkd.encode("ascii", "ignore").decode("ascii")
-    cleaned = _NOISE_PATTERN.sub(" ", ascii_title)
-    return re.sub(r"\s{2,}", " ", cleaned).strip().lower()
+def remove_matching_noise(text: str) -> str:
+    return _MATCHING_NOISE_PATTERN.sub("", text).strip()
 
 _FEAT_PATTERN = re.compile(
     r"\s*(feat\.?|ft\.?|with|&|\+)\s+.+$",
@@ -94,3 +98,15 @@ _FEAT_PATTERN = re.compile(
 
 def strip_featuring(text: str) -> str:
     return _FEAT_PATTERN.sub("", text).strip()
+
+def contains_forbidden_phrase(text: str, forbidden: set[str]) -> str | None:
+    """
+    Return the forbidden phrase found in text, or None if not found.
+    """
+    normalized = f" {normalize_title(text)} "
+
+    for phrase in forbidden:
+        if f" {normalize_title(phrase)} " in normalized:
+            return phrase
+
+    return None
