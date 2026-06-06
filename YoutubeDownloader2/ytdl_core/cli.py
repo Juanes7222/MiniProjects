@@ -722,6 +722,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--interactive", action="store_true")
     p.add_argument("--log-file", metavar="FILE", type=Path)
+    p.add_argument("--match-title", metavar="REGEX", type=str, help="Include only videos matching this regex in the title")
+    p.add_argument("--reject-title", metavar="REGEX", type=str, help="Exclude videos matching this regex in the title")
     
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--verify", action="store_true", help="Verify the local library instead of downloading.")
@@ -929,7 +931,9 @@ def main() -> None:
             fmt=args.format,
             quality=args.quality,
             max_downloads=limit_val,
-            skip_existing=args.skip_existing
+            skip_existing=args.skip_existing,
+            match_title=args.match_title,
+            reject_title=args.reject_title
         )
     else:
         dl.download_batch(

@@ -194,6 +194,8 @@ class MusicDownloader:
         quality: str = "192",
         max_downloads: Optional[int] = None,
         skip_existing: bool = False,
+        match_title: Optional[str] = None,
+        reject_title: Optional[str] = None,
     ) -> None:
         """Download directly from an arbitrary URL (e.g. playlist, channel, shorts)."""
         output_dir = Path(output_dir)
@@ -224,21 +226,57 @@ class MusicDownloader:
         if not info:
             return
 
-        entries = info.get("entries")
-        if entries is None:
-            entries = [info]
+        def extract_entries(data_dict):
+            if "entries" in data_dict:
+                for e in data_dict["entries"]:
+                    if e:
+                        yield from extract_entries(e)
+            else:
+                yield data_dict
+
+        entries = list(extract_entries(info))
+        
+        import re
+        match_pattern = re.compile(match_title, re.IGNORECASE) if match_title else None
+        reject_pattern = re.compile(reject_title, re.IGNORECASE) if reject_title else None
 
         urls_to_download = []
         for entry in entries:
             if not entry:
                 continue
+                
+            title = entry.get("title", "Unknown")
+            uploader = entry.get("uploader", "Unknown")
+
+            if match_pattern and not match_pattern.search(title):
+                self.events.on_warn(f"[yellow]  Skipped (doesn't match --match-title): {title}[/yellow]")
+                continue
+            if reject_pattern and reject_pattern.search(title):
+                self.events.on_warn(f"[yellow]  Skipped (matches --reject-title): {title}[/yellow]")
+                continue
+
+            if entry.get("is_live"):
+                self.events.on_warn(f"[yellow]  Skipped (live stream): {title}[/yellow]")
+                continue
+
+            duration = entry.get("duration")
+            if duration is not None:
+                if self.min_duration and duration < self.min_duration:
+                    self.events.on_warn(f"[yellow]  Skipped (too short, {int(duration)}s < {self.min_duration}s): {title}[/yellow]")
+                    continue
+                if self.max_duration and duration > self.max_duration:
+                    self.events.on_warn(f"[yellow]  Skipped (too long, {int(duration)}s > {self.max_duration}s): {title}[/yellow]")
+                    continue
+
             e_url = entry.get("url")
             if not e_url and entry.get("id"):
                 e_url = f"https://www.youtube.com/watch?v={entry['id']}"
-            if e_url:
-                urls_to_download.append((entry.get("uploader", "Unknown"), entry.get("title", "Unknown"), e_url))
+                
+            if e_url and e_url != url and "search?" not in e_url:
+                urls_to_download.append((uploader, title, e_url))
 
         if not urls_to_download:
+            self.events.on_warn("[yellow]No suitable URLs found to download after applying filters.[/yellow]")
             return
 
         total = len(urls_to_download)
@@ -254,19 +292,6 @@ class MusicDownloader:
                 return
 
             result = DownloadResult(artist=item_artist, song=item_title)
-            safe_artist = sanitize_filename(item_artist)
-            safe_song = sanitize_filename(item_title)
-            expected_file = output_dir / safe_artist / f"{safe_song}.{fmt}"
-
-            if skip_existing and expected_file.exists():
-                self.events.on_skip_existing(item_artist, item_title, expected_file, True)
-                result.status = "skipped"
-                result.reason = "File exists"
-                result.file_path = expected_file
-                with results_lock:
-                    all_results.append(result)
-                self.events.on_result(result)
-                return
 
             def _progress_hook(d: dict) -> None:
                 if d.get("status") == "downloading":
@@ -281,10 +306,12 @@ class MusicDownloader:
                 "format": "bestaudio/best",
                 "outtmpl": str(output_dir / "%(uploader)s" / "%(title)s.%(ext)s"),
                 "quiet": True,
+                "noprogress": True,
                 "no_warnings": True,
+                "noplaylist": True,
                 "progress_hooks": [_progress_hook],
                 "writethumbnail": True,
-                "nooverwrites": skip_existing,
+                "nooverwrites": skip_existing, 
                 "windowsfilenames": True,
                 "extractor_args": {"youtube": ["player_client=ios,android,web"]},
                 "postprocessors": [
@@ -294,7 +321,6 @@ class MusicDownloader:
                 ],
                 "extract_flat": False,
                 "ignoreerrors": True,
-                "skip_unavailable_fragments": True,
                 "socket_timeout": 30,
                 "retries": 3,
                 "fragment_retries": 3,
@@ -307,16 +333,30 @@ class MusicDownloader:
             if self.proxy:
                 ydl_opts["proxy"] = self.proxy
 
-            self.events.on_download_start(item_artist, item_title, item_url)
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl_item:
-                    info_dict = ydl_item.extract_info(item_url, download=True)
+                    info_dict = ydl_item.extract_info(item_url, download=False)
                     if info_dict:
-                        result.status = "downloaded"
-                        # Actual target based on info dict
                         actual_artist = sanitize_filename(info_dict.get("uploader", item_artist))
                         actual_title = sanitize_filename(info_dict.get("title", item_title))
-                        result.file_path = output_dir / actual_artist / f"{actual_title}.{fmt}"
+                        
+                        expected_file = output_dir / actual_artist / f"{actual_title}.{fmt}"
+                        
+                        if skip_existing and expected_file.exists():
+                            self.events.on_skip_existing(item_artist, item_title, expected_file, True)
+                            result.status = "skipped"
+                            result.reason = "File exists"
+                            result.file_path = expected_file
+                            with results_lock:
+                                all_results.append(result)
+                            self.events.on_result(result)
+                            return
+
+                        self.events.on_download_start(item_artist, item_title, item_url)
+                        ydl_item.process_info(info_dict) # Realiza la descarga
+                        
+                        result.status = "downloaded"
+                        result.file_path = expected_file
                         result.duration_seconds = info_dict.get("duration")
             except Exception as exc:
                 self.events.on_download_failed(item_artist, item_title, str(exc))
