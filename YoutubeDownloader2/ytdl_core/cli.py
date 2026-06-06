@@ -723,9 +723,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--interactive", action="store_true")
     p.add_argument("--log-file", metavar="FILE", type=Path)
-    p.add_argument("--verify", action="store_true", help="Verify the local library instead of downloading.")
-    p.add_argument("--repair", action="store_true", help="Verify the local library and automatically re-download missing or corrupted files.")
+    
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--verify", action="store_true", help="Verify the local library instead of downloading.")
+    mode.add_argument("--repair", action="store_true", help="Verify the local library and automatically re-download missing or corrupted files.")
+    
     args = p.parse_args()
+    
+    if args.url:
+        if args.verify or args.repair:
+            p.error("--verify and --repair cannot be used with --url")
+        if args.update_json:
+            p.error("--update-json cannot be used with --url")
+        if args.dry_run:
+            p.error("--dry-run cannot be used with --url")
+            
     args.workers = max(1, min(args.workers, _CONFIG.MAX_WORKERS))
     args.sources = [s.strip().lower() for s in args.sources.split(",") if s.strip()]
     return args
@@ -918,7 +930,8 @@ def main() -> None:
             output_dir=args.output,
             fmt=args.format,
             quality=args.quality,
-            max_downloads=limit_val
+            max_downloads=limit_val,
+            skip_existing=args.skip_existing
         )
     else:
         dl.download_batch(
