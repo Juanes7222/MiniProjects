@@ -1,7 +1,5 @@
-"""
-YouTube, YouTube Music API, SoundCloud, and Bandcamp search orchestration,
-candidate scoring heuristic, and selection logic.
-"""
+"""YouTube, YouTube Music API, SoundCloud, and Bandcamp search orchestration,
+candidate scoring heuristic, and selection logic."""
 
 from __future__ import annotations
 
@@ -10,13 +8,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
 
 import yt_dlp
-from rapidfuzz import fuzz
 from rich import box
 from rich.console import Console
 from rich.table import Table
 
 from .config import Config
-from .utils import format_duration, normalize_title, strip_featuring, remove_matching_noise, contains_forbidden_phrase
+from .scorer import rank_results, score_youtube_result  # noqa: F401 — re-exported
+from .utils import format_duration
 
 
 def build_search_query(artist: str, song: str, source: str) -> str:
@@ -264,215 +262,7 @@ def search_all_sources(artist: str, song: str, sources: list[str], opts: dict) -
     return _dedup_results(all_results)
 
 
-def score_youtube_result(
-    result: dict,
-    artist: str,
-    song: str,
-    mb_duration_seconds: int | None,
-    config: Config,
-) -> tuple[int, dict[str, int]]:
-    """
-    Analyzes and ranks a track candidate based on matching metrics and validation filters.
 
-    Employs strict hard-rejection thresholds for forbidden patterns (e.g., covers, live sets, 
-    remixes), checks precise duration alignments in absolute seconds, and evaluates channel authority.
-
-    Args:
-        result: The metadata dictionary of the track candidate.
-        artist: The verified target artist name.
-        song: The verified target song title.
-        mb_duration_seconds: Expected duration from MusicBrainz metadata registry.
-        config: Central parameter definitions and weight allocations.
-
-    Returns:
-        A tuple containing the composite integer score and the metric breakdown dictionary.
-    """
-    entry = dict(result)
-    raw_title = entry.get("title") or ""
-    title: str = normalize_title(raw_title)
-    channel: str = (entry.get("channel") or entry.get("uploader") or "").lower()
-    view_count: int = int(entry.get("view_count") or 0)
-    result_duration: int = int(entry.get("duration") or 0)
-    breakdown: dict[str, int] = {}
-        
-    artist_clean = normalize_title(strip_featuring(artist.lower()))
-    song_clean = normalize_title(strip_featuring(song.lower()))
-
-    if entry.get("_source") == "ytmusic_api":
-        # Strip featuring credits from the result title before comparison, mirroring
-        # what strip_featuring already does to song_clean, so that "Dios Es Amor
-        # (feat. Wiso Aponte)" compares cleanly against the query "Dios Es Amor".
-        title_clean = normalize_title(strip_featuring(raw_title.lower()))
-        # Triple blend: token_set catches subset matches (short query vs long title),
-        # token_sort penalizes extra words, and ratio is order-sensitive so that
-        # anagram-like titles ("Amor De Dios" vs "Dios Es Amor") are distinguished.
-        song_match = int(
-            fuzz.token_set_ratio(song_clean, title_clean) * 0.3
-            + fuzz.token_sort_ratio(song_clean, title_clean) * 0.3
-            + fuzz.ratio(song_clean, title_clean) * 0.4
-        )
-
-        # Match against each artist individually rather than the concatenated string,
-        # so that a feat. artist ("Benjamin Rivera, Wiso Aponte") does not reduce the
-        # score of the primary artist against the query.
-        ytmusic_artist_names = [
-            normalize_title(a) for a in (entry.get("artists") or []) if a
-        ]
-        ytmusic_artist_names.append(normalize_title(channel))
-        artist_match = max(
-            (
-                int(
-                    fuzz.token_set_ratio(artist_clean, name) * 0.3
-                    + fuzz.token_sort_ratio(artist_clean, name) * 0.3
-                    + fuzz.ratio(artist_clean, name) * 0.4
-                )
-                for name in ytmusic_artist_names
-                if name
-            ),
-            default=0,
-        )
-
-        # song_match is a hard gate: a strong artist match cannot rescue a title
-        # that differs significantly from the query (e.g. "Dios Es Asi" != "Dios Es Amor").
-        if song_match >= 80 and artist_match >= 80:
-            artist_factor = artist_match / 100.0
-            
-            api_bonus = int(25 + (song_match * artist_match) ** 0.5 * 0.3 * artist_factor)
-            
-            breakdown["official_ytmusic_api"] = api_bonus
-            breakdown["catalog_match"] = song_match
-            breakdown["artist_match"] = artist_match
-            
-            if mb_duration_seconds is not None and result_duration > 0:
-                diff_seconds = abs(result_duration - mb_duration_seconds)
-                if diff_seconds <= 4:
-                    breakdown["duration_perfect"] = config.DURATION_MATCH_BONUS
-                elif diff_seconds <= 12:
-                    breakdown["duration_close"] = 10
-                elif diff_seconds > 25:
-                    breakdown["duration_mismatch"] = -35  # Penalización crucial añadida
-                    
-            source_count = entry.get("_source_count", 1)
-            if source_count > 1:
-                breakdown["cross_source_consensus"] = min(20, (source_count - 1) * 10)
-                
-            return sum(breakdown.values()), breakdown
-    
-    title_tokens = set(title.split())
-    query_song_tokens = set(song_clean.split())
-    
-    bad_found = contains_forbidden_phrase(raw_title, config.FORBIDEN_TERMS)
-
-    query_text = f"{artist} {song}"
-    bad_in_query = contains_forbidden_phrase(query_text, config.FORBIDEN_TERMS)
-
-    if bad_found and not bad_in_query:
-        return -9999, {
-            f"hard_reject_{bad_found}": -9999
-        }
-
-    if "album" in title_tokens and "album" not in query_song_tokens:
-         return -9999, {"hard_reject_full_album": -9999}
-     
-    title_no_noise = remove_matching_noise(title)
-
-    song_match = int(fuzz.token_set_ratio(song_clean, title_no_noise))
-    artist_in_title = int(fuzz.token_set_ratio(artist_clean, title_no_noise))
-    artist_in_channel = int(fuzz.partial_ratio(artist_clean, channel))
-    
-    if song_match < 55:
-        return -9999, {"hard_reject_song_absent": -9999}
-        
-    artist_presence = max(artist_in_title, artist_in_channel)
-    if artist_presence < 50:
-        return -9999, {"hard_reject_artist_absent": -9999}
-        
-    base_score = song_match + int(artist_presence * 0.4)
-    breakdown["base_match"] = base_score
-
-    raw_title_lower = raw_title.lower()
-    if "official audio" in raw_title_lower:
-        breakdown["official_audio"] = config.OFFICIAL_AUDIO_BONUS
-    elif "official video" in raw_title_lower or "official music video" in raw_title_lower:
-        breakdown["official_video"] = 15
-    elif "official" in raw_title_lower:
-        breakdown["official_signal"] = 10
-
-    if channel.endswith("- topic") and artist_in_channel > 85:
-        breakdown["topic_channel"] = config.TOPIC_CHANNEL_BONUS
-    elif channel.endswith("vevo") and artist_clean in channel.replace("vevo", ""):
-        breakdown["vevo_channel"] = config.VEVO_CHANNEL_BONUS
-    elif artist_in_channel > 85:
-        breakdown["artist_in_channel"] = 25
-
-    if mb_duration_seconds is not None and result_duration > 0:
-        diff_seconds = abs(result_duration - mb_duration_seconds)
-        if diff_seconds <= 4:
-            breakdown["duration_exact"] = config.DURATION_MATCH_BONUS
-        elif diff_seconds <= 12:
-            breakdown["duration_close"] = 10
-        elif diff_seconds <= 25:
-            breakdown["duration_acceptable"] = 0
-        else:
-            breakdown["duration_mismatch"] = -35
-
-    if view_count > 1_000_000:
-        breakdown["high_views"] = 5
-
-    source_count = entry.get("_source_count", 1)
-    if source_count > 1:
-        breakdown["cross_source_consensus"] = min(20, (source_count - 1) * 10)
-
-    if any(t in channel for t in ["dj", "mix", "bootleg", "edits"]):
-        breakdown["dj_channel_penalty"] = -25
-    if any(t in title for t in ["lyrics", "letra", "lyric video"]):
-        breakdown["lyrics_penalty"] = -20
-
-    total = sum(breakdown.values())
-    return total, breakdown
-
-
-def rank_results(
-    results: list[dict],
-    artist: str,
-    song: str,
-    mb_duration_seconds: int | None,
-    config: Config,
-    min_duration: int | None = None,
-    max_duration: int | None = None,
-) -> list[tuple[dict, int, dict]]:
-    """
-    Filters, assesses, and sorts multiple search candidates descending by total score.
-
-    Args:
-        results: List of raw candidate dictionaries.
-        artist: Target artist name.
-        song: Target song title.
-        mb_duration_seconds: Expected duration from Registry.
-        config: Config settings module instance.
-        min_duration: Override minimum runtime constraint.
-        max_duration: Override maximum runtime constraint.
-
-    Returns:
-        A sorted list of tuples holding the complete metadata, raw score, and breakdown data.
-    """
-    min_dur = min_duration if min_duration is not None else config.MIN_DURATION_SECONDS
-    max_dur = max_duration if max_duration is not None else config.MAX_DURATION_SECONDS
-
-    valid = [r for r in results if r.get("duration") and min_dur <= int(r["duration"]) <= max_dur]
-    if not valid:
-        return []
-
-    scored = []
-    for raw in valid:
-        entry = dict(raw)
-        score, breakdown = score_youtube_result(entry, artist, song, mb_duration_seconds, config)
-        entry["_composite_score"] = score
-        entry["_score_breakdown"] = breakdown
-        scored.append((entry, score, breakdown))
-
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return scored
 
 
 def print_candidates_table(
