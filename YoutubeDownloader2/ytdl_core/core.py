@@ -10,7 +10,6 @@ from __future__ import annotations
 import concurrent.futures
 import re
 import shutil
-import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -18,21 +17,25 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
-import acoustid
-import mutagen
 import yt_dlp
-import random
 from rapidfuzz import fuzz
-from yt_dlp.utils import DownloadError, ExtractorError, download_range_func
+from yt_dlp.utils import DownloadError, ExtractorError
 
 from .config import Config
 from .events import DownloaderEvents
+from .fingerprint import (
+    AcoustIDCircuitBreaker,
+    has_excessive_silence,
+    verify_duration,
+    verify_fingerprint,
+)
 from .metadata import embed_metadata, fetch_musicbrainz
 from .reports import export_report, update_json_file
 from .result import DownloadResult
 from .search import search_all_sources, select_best_result
 from .state import load_state, save_state
 from .utils import apply_delay, compute_md5, sanitize_filename
+from .ytdlp_options import build_ytdlp_base_opts, resolve_downloaded_file
 
 
 class MusicDownloader:
@@ -79,13 +82,16 @@ class MusicDownloader:
         self.proxy = proxy
         self.fpcalc_available: bool = shutil.which("fpcalc") is not None
         self._fp_semaphore = threading.Semaphore(2)
-        
-        self._acoustid_circuit_open = False
-        self._acoustid_cooldown_until = 0.0
-        self._acoustid_circuit_lock = threading.Lock()
-        self._acoustid_cooldown_duration = 60.0
+
+        self._circuit_breaker = AcoustIDCircuitBreaker(
+            cooldown_seconds=60.0,
+        )
 
         self._selection_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def download(
         self,
@@ -196,148 +202,6 @@ class MusicDownloader:
 
         return all_results
 
-    def _iter_entries(self, data: dict[str, Any]):
-        """Recursively flatten yt-dlp playlist/channel results into video entries."""
-        entries = data.get("entries")
-        if entries:
-            for e in entries:
-                if not e:
-                    continue
-                yield from self._iter_entries(e)
-            return
-
-        yield data
-
-
-    def _normalize_browser_cookies(self, value: Any) -> tuple[Any, ...]:
-        if isinstance(value, tuple):
-            return value
-        return (value,)
-
-
-    def _build_ytdlp_base_opts(
-        self,
-        output_dir: Path,
-        fmt: str,
-        quality: str,
-        quiet: bool,
-        no_warnings: bool,
-        progress_hook=None,
-        skip_existing: bool = False,
-        max_downloads: Optional[int] = None,
-        cookies_browser: Optional[Any] = None,
-        cookies_file: Optional[Path] = None,
-        proxy: Optional[str] = None,
-        download_archive: Optional[Path] = None,
-        enable_remote_components: bool = True,
-        youtube_player_clients: Optional[list[str]] = None,
-        noplaylist: bool = False,
-        for_scan: bool = False,
-    ) -> dict[str, Any]:
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        is_video = fmt == "mp4"
-        ydl_opts: dict[str, Any] = {
-            "format": f"bestvideo[height<={quality}]+bestaudio/bestvideo[height<={quality}]/best" if is_video else "bestaudio/best",
-            "outtmpl": str(output_dir / "%(uploader)s" / ("%(title)s [%(id)s].mp4" if is_video else "%(title)s [%(id)s].%(ext)s")),
-            "quiet": quiet,
-            "no_warnings": no_warnings,
-            "noprogress": True,
-            "progress_hooks": [progress_hook] if progress_hook else [],
-            "extract_flat": False,
-            "ignoreerrors": for_scan,
-            "skip_unavailable_fragments": True,
-            "socket_timeout": 30,
-            "retries": 10,
-            "fragment_retries": 10,
-            "extractor_retries": 10,
-            "file_access_retries": 5,
-            "windowsfilenames": True,
-            "noplaylist": noplaylist,
-        }
-
-        if not for_scan:
-            ydl_opts["writethumbnail"] = True
-            if is_video:
-                ydl_opts["merge_output_format"] = "mp4"
-                ydl_opts["postprocessors"] = [
-                    {"key": "FFmpegMetadata"},
-                    {"key": "EmbedThumbnail", "already_have_thumbnail": False},
-                ]
-            else:
-                ydl_opts["postprocessors"] = [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": fmt,
-                        "preferredquality": quality,
-                    },
-                    {"key": "FFmpegMetadata"},
-                    {"key": "EmbedThumbnail", "already_have_thumbnail": False},
-                ]
-
-        if skip_existing:
-            ydl_opts["nooverwrites"] = True
-
-        if max_downloads is not None:
-            ydl_opts["playlist_items"] = f"1-{max_downloads}"
-
-        if cookies_browser:
-            ydl_opts["cookiesfrombrowser"] = self._normalize_browser_cookies(cookies_browser)
-
-        if cookies_file:
-            ydl_opts["cookiefile"] = str(cookies_file)
-
-        if proxy:
-            ydl_opts["proxy"] = proxy
-
-        if download_archive:
-            ydl_opts["download_archive"] = str(download_archive)
-
-        if youtube_player_clients:
-            ydl_opts["extractor_args"] = {
-                "youtube": {
-                    "player_client": list(youtube_player_clients),
-                }
-            }
-
-        node_path = shutil.which("node")
-        if node_path:
-            ydl_opts["js_runtimes"] = {
-                "node": {"path": node_path}
-            }
-
-        if enable_remote_components:
-            ydl_opts["remote_components"] = ["ejs:github"]
-
-        return ydl_opts
-
-    def _resolve_downloaded_file(self, base_file: Path, fmt: str) -> Optional[Path]:
-        """
-        Try to find the final converted file produced by yt-dlp/ffmpeg.
-        """
-        exact = base_file.with_suffix(f".{fmt}")
-        if exact.exists():
-            return exact
-
-        parent = base_file.parent
-        stem = base_file.stem
-
-        candidates = []
-        for ext in (fmt, "mp3", "m4a", "opus", "mp4", "ogg", "webm", "flac", "aac", "wav"):
-            candidate = parent / f"{stem}.{ext}"
-            if candidate.exists():
-                candidates.append(candidate)
-
-        if candidates:
-            return max(candidates, key=lambda p: p.stat().st_mtime)
-
-        globbed = sorted(
-            parent.glob(f"{stem}.*"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        return globbed[0] if globbed else None
-
     def download_url(
         self,
         url: str,
@@ -374,9 +238,9 @@ class MusicDownloader:
                 total_b = d.get("total_bytes") or d.get("downloaded_bytes") or 0
                 self.events.on_download_progress("URL", url[:30], 100.0, 0.0, total_b, total_b)
             elif status == "processing":
-                self.events.on_info(f"[cyan]Processing playlist item...[/cyan]")
+                self.events.on_info("[cyan]Processing playlist item...[/cyan]")
 
-        scan_opts = self._build_ytdlp_base_opts(
+        scan_opts = build_ytdlp_base_opts(
             output_dir=output_dir,
             fmt=fmt,
             quality=quality,
@@ -491,7 +355,7 @@ class MusicDownloader:
                 elif status == "processing":
                     self.events.on_info(f"[cyan]Processing: {item_title}[/cyan]")
 
-            item_opts = self._build_ytdlp_base_opts(
+            item_opts = build_ytdlp_base_opts(
                 output_dir=output_dir,
                 fmt=fmt,
                 quality=quality,
@@ -531,7 +395,7 @@ class MusicDownloader:
                         raise RuntimeError("yt-dlp returned no info_dict")
 
                     source_file = Path(ydl_item.prepare_filename(info_dict))
-                    downloaded_file = self._resolve_downloaded_file(source_file, fmt)
+                    downloaded_file = resolve_downloaded_file(source_file, fmt)
 
                     if downloaded_file is None:
                         raise FileNotFoundError(
@@ -581,10 +445,10 @@ class MusicDownloader:
         """
         output_dir = Path(output_dir)
         state = load_state(output_dir)
-        
+
         results_map = {}
         pairs_to_process = []
-        
+
         # Build the complete map and separate items that actually need processing
         for artist, lst in songs.items():
             if not lst:
@@ -593,7 +457,7 @@ class MusicDownloader:
                 key = f"{artist}::{song}"
                 entry_state = state.get("downloads", {}).get(key, {})
                 status = entry_state.get("status")
-                
+
                 # If it's already verified, construct a successful DownloadResult immediately
                 if status == "verified":
                     res = DownloadResult(artist=artist, song=song, status="verified")
@@ -603,7 +467,9 @@ class MusicDownloader:
                     results_map[(artist, song)] = res
                 else:
                     # Initialize as skipped, add to queue for processing
-                    results_map[(artist, song)] = DownloadResult(artist=artist, song=song, status="skipped", reason="Not verified in state")
+                    results_map[(artist, song)] = DownloadResult(
+                        artist=artist, song=song, status="skipped", reason="Not verified in state"
+                    )
                     # Only process if it was marked as downloaded
                     if status == "downloaded":
                         pairs_to_process.append((artist, song))
@@ -624,14 +490,14 @@ class MusicDownloader:
                     seen_artists.add(artist)
                     count = sum(1 for a, _ in pairs_to_process if a == artist)
                     self.events.on_artist_start(artist, count)
-            
+
             result = DownloadResult(artist=artist, song=song)
-            
+
             if stop_event.is_set():
                 result.status = "skipped"
                 result.reason = "Interrupted"
                 return result
-                
+
             safe_artist = sanitize_filename(artist)
             safe_song = sanitize_filename(song)
             expected_file = output_dir / safe_artist / f"{safe_song}.{fmt}"
@@ -640,7 +506,7 @@ class MusicDownloader:
                 result.status = "failed"
                 result.reason = "File does not exist"
                 return result
-            
+
             try:
                 size = expected_file.stat().st_size
                 if size < 1024 * 50:
@@ -654,17 +520,17 @@ class MusicDownloader:
                 result.reason = "Could not read file size"
                 return result
 
-            duration_ok, actual_duration = self._verify_duration(expected_file, 0)
+            duration_ok, actual_duration = verify_duration(expected_file, 0)
             if not duration_ok and actual_duration == 0:
                 result.status = "failed"
                 result.reason = "Corrupted file or missing metadata"
                 result.file_path = expected_file
                 return result
-                
+
             result.duration_seconds = actual_duration
 
             if self.acoustid_key:
-                apply_delay(0.2, 0.5) 
+                apply_delay(0.2, 0.5)
                 if getattr(self, "musicbrainz", False):
                     try:
                         mb_data = fetch_musicbrainz(artist, song)
@@ -674,14 +540,24 @@ class MusicDownloader:
                                 result.duration_seconds = mb_data["duration_seconds"]
                     except Exception:
                         pass
-                
+
                 with self._fp_semaphore:
-                    fp_ok, fp_conf, fp_title = self._verify_fingerprint(expected_file, artist, song)
-                
+                    fp_ok, fp_conf, fp_title = verify_fingerprint(
+                        expected_file,
+                        artist,
+                        song,
+                        self.acoustid_key,
+                        self.config,
+                        self._circuit_breaker,
+                        on_warn=self.events.on_warn,
+                        on_info=self.events.on_info,
+                        on_fingerprint_error=self.events.on_fingerprint_error,
+                    )
+
                 result.fingerprint_verified = fp_ok
                 result.fingerprint_confidence = fp_conf
                 result.fingerprint_matched_title = fp_title
-                
+
                 if not fp_ok and fp_conf > 0:
                     result.status = "failed"
                     result.reason = f"Fingerprint mismatch: Found '{fp_title}' ({fp_conf*100:.1f}%)"
@@ -702,25 +578,27 @@ class MusicDownloader:
                     for fut in concurrent.futures.as_completed(futures):
                         artist, song = futures[fut]
                         key = f"{artist}::{song}"
-                        
+
                         try:
                             res = fut.result()
                         except Exception as exc:
-                            res = DownloadResult(artist=artist, song=song, status="failed", reason=f"Exception: {str(exc)}")
-                        
+                            res = DownloadResult(
+                                artist=artist, song=song, status="failed", reason=f"Exception: {str(exc)}"
+                            )
+
                         results_map[(artist, song)] = res
                         self.events.on_result(res)
-                        
+
                         if res.status != "skipped":
                             with state_lock:
                                 existing = state.get("downloads", {}).get(key, {})
-                                
+
                             current_md5 = existing.get("md5")
                             if not current_md5 and res.file_path and Path(res.file_path).exists():
                                 current_md5 = compute_md5(Path(res.file_path))
-                                
+
                             fingerprint_verified = getattr(res, "fingerprint_verified", False)
-                                
+
                             self._persist(
                                 state,
                                 state_lock,
@@ -731,7 +609,7 @@ class MusicDownloader:
                                 current_md5,
                                 output_dir,
                                 fingerprint_verified=fingerprint_verified,
-                                preserve_timestamp=True
+                                preserve_timestamp=True,
                             )
 
                 except KeyboardInterrupt:
@@ -742,9 +620,13 @@ class MusicDownloader:
         all_results = list(results_map.values())
         elapsed = time.monotonic() - start
         self.events.on_session_complete(all_results, elapsed)
-        
+
         return all_results
-    
+
+    # ------------------------------------------------------------------
+    # Internal: single-song processing pipeline
+    # ------------------------------------------------------------------
+
     def _process_song(
         self,
         artist: str,
@@ -944,7 +826,17 @@ class MusicDownloader:
                         self.events.on_fingerprint_partial_failed(artist, song)
                         fp_label = "partial download failed"
                     else:
-                        is_match, conf, fp_title = self._verify_fingerprint(partial_path, artist, song)
+                        is_match, conf, fp_title = verify_fingerprint(
+                            partial_path,
+                            artist,
+                            song,
+                            self.acoustid_key,
+                            self.config,
+                            self._circuit_breaker,
+                            on_warn=self.events.on_warn,
+                            on_info=self.events.on_info,
+                            on_fingerprint_error=self.events.on_fingerprint_error,
+                        )
                         time.sleep(0.35)
                         fp_confidence = conf
                         fp_matched_title = fp_title
@@ -964,8 +856,16 @@ class MusicDownloader:
                                 try:
                                     next_partial = self._download_partial(next_url, output_dir)
                                     if next_partial:
-                                        n_ok, n_conf, n_title = self._verify_fingerprint(
-                                            next_partial, artist, song
+                                        n_ok, n_conf, n_title = verify_fingerprint(
+                                            next_partial,
+                                            artist,
+                                            song,
+                                            self.acoustid_key,
+                                            self.config,
+                                            self._circuit_breaker,
+                                            on_warn=self.events.on_warn,
+                                            on_info=self.events.on_info,
+                                            on_fingerprint_error=self.events.on_fingerprint_error,
                                         )
                                         time.sleep(0.35)
                                         if n_ok:
@@ -1009,7 +909,11 @@ class MusicDownloader:
 
         (output_dir / safe_artist).mkdir(parents=True, exist_ok=True)
         is_video = fmt == "mp4"
-        output_template = str(output_dir / safe_artist / f"{safe_song}.mp4" if is_video else f"{safe_song}.%(ext)s")
+        output_template = str(
+            output_dir / safe_artist / f"{safe_song}.mp4"
+            if is_video
+            else f"{safe_song}.%(ext)s"
+        )
         self.events.on_download_start(artist, song, url)
 
         def _progress_hook(d: dict) -> None:
@@ -1096,7 +1000,7 @@ class MusicDownloader:
                     info_dict = ydl.extract_info(url, download=True)
                     if info_dict:
                         source_file = Path(ydl.prepare_filename(info_dict))
-                        downloaded_file = self._resolve_downloaded_file(source_file, fmt)
+                        downloaded_file = resolve_downloaded_file(source_file, fmt)
 
                 if downloaded_file and downloaded_file.exists():
                     break
@@ -1129,7 +1033,7 @@ class MusicDownloader:
             self._persist(state, state_lock, key, "failed", url, None, None, output_dir, needs_fp)
             return result
 
-        dur_ok, actual_dur = self._verify_duration(downloaded_file, duration_s)
+        dur_ok, actual_dur = verify_duration(downloaded_file, duration_s)
         result.duration_verified = dur_ok
         self.events.on_duration_check(artist, song, duration_s, actual_dur, dur_ok)
 
@@ -1143,7 +1047,7 @@ class MusicDownloader:
 
         silence_ratio = 0.0
         if not self.no_silence_check:
-            is_excessive, silence_ratio = self._has_excessive_silence(downloaded_file)
+            is_excessive, silence_ratio = has_excessive_silence(downloaded_file, self.config)
             result.silence_ratio = silence_ratio
             self.events.on_silence_check(artist, song, silence_ratio, is_excessive)
             if is_excessive:
@@ -1215,6 +1119,22 @@ class MusicDownloader:
             needs_fp,
         )
         return result
+
+    # ------------------------------------------------------------------
+    # Internal: helpers
+    # ------------------------------------------------------------------
+
+    def _iter_entries(self, data: dict[str, Any]):
+        """Recursively flatten yt-dlp playlist/channel results into video entries."""
+        entries = data.get("entries")
+        if entries:
+            for e in entries:
+                if not e:
+                    continue
+                yield from self._iter_entries(e)
+            return
+
+        yield data
 
     def _download_partial(self, url: str, output_dir: Path) -> Optional[Path]:
         token = uuid4().hex[:8]
@@ -1312,123 +1232,6 @@ class MusicDownloader:
 
         return None
 
-    def _verify_fingerprint(
-        self, partial_path: Path, artist: str, song: str
-    ) -> tuple[bool, float, str]:
-        if not self.acoustid_key:
-            return False, 0.0, "no_key"
-            
-        with self._acoustid_circuit_lock:
-            if self._acoustid_circuit_open:
-                if time.time() < self._acoustid_cooldown_until:
-                    return False, 0.0, "circuit_breaker_open"
-                else:
-                    self._acoustid_circuit_open = False
-                    self.events.on_warn("[green]AcoustID cooldown finished. Attempting to reconnect...[/green]")
-
-        max_retries = 3 
-        base_delay = 2.0 
-        
-        for attempt in range(max_retries):
-            try:
-                stop_time = random.uniform(3.0, 7.0) 
-                self.events.on_warn(f"[yellow]Applying random delay of {stop_time:.2f}s before AcoustID request...[/yellow]")
-                time.sleep(stop_time)
-                
-                results = list(acoustid.match(self.acoustid_key, str(partial_path), meta="recordings"))
-                best_conf = 0.0
-                best_title = ""
-                
-                for score, _rec_id, title, a in results:
-                    if score < self.config.FINGERPRINT_MIN_CONFIDENCE:
-                        continue
-                    a_sim = fuzz.token_sort_ratio(artist.lower(), (a or "").lower())
-                    t_sim = fuzz.token_sort_ratio(song.lower(), (title or "").lower())
-                    if a_sim > 75 and t_sim > 75:
-                        self.events.on_info(f"[green]Fingerprint match: '{a} - {title}' with confidence {score:.2f} (artist sim: {a_sim}, title sim: {t_sim})[/green]")
-                        return True, score, title or ""
-                    if score > best_conf:
-                        best_conf = score
-                        best_title = f"{a} -- {title}"
-                        self.events.on_info(f"[yellow]Best match found: {best_title} (confidence: {best_conf:.2f})[/yellow]")
-                return False, best_conf, best_title
-                
-            except Exception as exc:
-                err_str = str(exc).lower()
-                
-                if "error" in err_str or "rate limit" in err_str or "429" in err_str:
-                    if attempt < max_retries - 1:
-                        sleep_time = base_delay * (2 ** attempt)
-                        self.events.on_warn(f"[yellow]AcoustID rate limit hit. Local retry in {sleep_time}s...[/yellow]")
-                        time.sleep(sleep_time)
-                        continue
-                    else:
-                        # 2. El Circuit Breaker se ACTIVA si los reintentos locales fallan
-                        with self._acoustid_circuit_lock:
-                            # Evitamos sobrescribir si otro hilo ya activó el breaker
-                            if not self._acoustid_circuit_open:
-                                self._acoustid_circuit_open = True
-                                self._acoustid_cooldown_until = time.time() + self._acoustid_cooldown_duration
-                                self.events.on_warn(
-                                    f"[red]CRITICAL: AcoustID API blocked. Circuit Breaker OPEN. "
-                                    f"Suspending all fingerprinting for {int(self._acoustid_cooldown_duration)} seconds.[/red]"
-                                )
-                        return False, 0.0, "rate_limit_exceeded"
-                        
-                self.events.on_fingerprint_error(artist, song, str(exc))
-                return False, 0.0, "fingerprint_error"
-
-    def _has_excessive_silence(self, file_path: Path) -> tuple[bool, float]:
-        try:
-            # Use ffmpeg via subprocess for lightning-fast silence detection natively (avoids RAM bloat)
-            min_dur_sec = self.config.SILENCE_MIN_DURATION_MS / 1000.0
-            thresh_db = self.config.SILENCE_THRESHOLD_DB
-            
-            cmd = [
-                "ffmpeg", "-v", "info", "-nostdin",
-                "-i", str(file_path),
-                "-af", f"silencedetect=noise={thresh_db}dB:d={min_dur_sec}",
-                "-f", "null", "-"
-            ]
-            
-            # Run ffmpeg, capture output on stderr where the logs appear
-            res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            
-            # Find all silence durations reported by silencedetect
-            silences = [float(match) for match in re.findall(r"silence_duration: ([\d\.]+)", res.stderr)]
-            total_silence_sec = sum(silences)
-            
-            # Find the total track duration to calculate the ratio
-            dur_match = re.search(r"Duration: (\d{2}):(\d{2}):([\d\.]+)", res.stderr)
-            if not dur_match:
-                return False, 0.0
-                
-            h, m, s = dur_match.groups()
-            total_dur_sec = int(h) * 3600 + int(m) * 60 + float(s)
-            
-            if total_dur_sec <= 0:
-                return False, 0.0
-                
-            ratio = total_silence_sec / total_dur_sec
-            return ratio > self.config.EXCESSIVE_SILENCE_RATIO, ratio
-        except Exception:
-            return False, 0.0
-
-    def _verify_duration(
-        self, path: Path, expected: int, tolerance: float = 0.20
-    ) -> tuple[bool, int]:
-        try:
-            info = mutagen.File(str(path))  # type: ignore
-            if info is None or info.info is None:
-                return False, 0
-            actual = int(info.info.length)
-            if expected == 0:
-                return True, actual
-            ratio = abs(actual - expected) / max(expected, 1)
-            return ratio <= tolerance, actual
-        except Exception:
-            return False, 0
-
     @staticmethod
     def _persist(
         state: dict,
@@ -1440,17 +1243,17 @@ class MusicDownloader:
         md5: Optional[str],
         output_dir: Path,
         fingerprint_verified: bool = False,
-        preserve_timestamp: bool = False
+        preserve_timestamp: bool = False,
     ) -> None:
         with lock:
             downloads = state.setdefault("downloads", {})
             existing = downloads.get(key)
-            
-            if preserve_timestamp and "timestamp" in existing:
+
+            if preserve_timestamp and existing and "timestamp" in existing:
                 ts = existing["timestamp"]
             else:
                 ts = datetime.now(timezone.utc).isoformat()
-                
+
             downloads[key] = {
                 "status": status,
                 "url": url,
