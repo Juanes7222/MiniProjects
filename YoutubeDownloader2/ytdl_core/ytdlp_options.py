@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+from .events import DownloaderEvents
 
 
 def normalize_browser_cookies(value: Any) -> tuple[Any, ...]:
@@ -151,6 +153,37 @@ def build_ytdlp_base_opts(
         ydl_opts["remote_components"] = ["ejs:github"]
 
     return ydl_opts
+
+
+def make_progress_hook(
+    events: DownloaderEvents,
+    artist: str,
+    song: str,
+) -> Callable[[dict], None]:
+    """
+    Create a yt-dlp progress hook that forwards events to *events*.
+
+    This eliminates the four nearly-identical ``_progress_hook`` / ``_hook``
+    closures that were scattered across ``_process_song``, ``download_url``,
+    and ``_download_partial``.
+    """
+
+    def _hook(d: dict) -> None:
+        status = d.get("status")
+        if status == "downloading":
+            total_b = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            downloaded_b = d.get("downloaded_bytes") or 0
+            pct = (downloaded_b / total_b * 100.0) if total_b else 0.0
+            events.on_download_progress(
+                artist, song[:30], pct, d.get("speed") or 0.0, downloaded_b, total_b
+            )
+        elif status == "finished":
+            total_b = d.get("total_bytes") or d.get("downloaded_bytes") or 0
+            events.on_download_progress(artist, song[:30], 100.0, 0.0, total_b, total_b)
+        elif status == "processing":
+            events.on_info(f"[cyan]Processing: {song}[/cyan]")
+
+    return _hook
 
 
 def resolve_downloaded_file(base_file: Path, fmt: str) -> Optional[Path]:
