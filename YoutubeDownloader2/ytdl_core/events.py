@@ -178,6 +178,9 @@ class DownloaderEvents:
     def on_metadata_error(self, artist: str, song: str, file_name: str) -> None:
         """Fired when embed_metadata returns False (integrity check failed)."""
 
+    def on_info(self, message: str) -> None:
+        """Generic info channel (e.g. debug information)."""
+
     def on_warn(self, message: str) -> None:
         """Generic warning channel (e.g. opus cover art not supported)."""
 

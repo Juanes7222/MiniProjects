@@ -240,7 +240,7 @@ def embed_metadata(
         extra: dict with optional keys: album, year, genre, track_num,
                mb_id, source_url, cover_url.
         thumbnail_url: fallback image URL if extra["cover_url"] is absent.
-        fmt:   "mp3" | "m4a" | "opus".
+        fmt:   "mp3" | "m4a" | "mp4" | "opus".
         console_warn_fn: callable(str) for Rich warnings (optional).
 
     Returns:
@@ -271,6 +271,19 @@ def embed_metadata(
                 image,
             )
         elif fmt == "m4a":
+            _embed_m4a(
+                file_path,
+                title,
+                artist,
+                album,
+                year,
+                genre,
+                track_num,
+                mb_id,
+                source_url,
+                image,
+            )
+        elif fmt == "mp4":
             _embed_m4a(
                 file_path,
                 title,

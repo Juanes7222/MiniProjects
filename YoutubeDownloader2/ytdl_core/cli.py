@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -64,12 +65,51 @@ class RichEvents(DownloaderEvents):
         self._tasks: dict[str, TaskID] = {}
         self._tasks_lock = threading.Lock()
 
+        self._buffer: list[str] = []
+        self._buffering = False
+
     def _k(self, artist: str, song: str) -> str:
         return f"{artist}::{song}"
 
+    def suspend_progress(self) -> None:
+        if self._progress:
+            with self._lock:
+                self._progress.stop()
+
+    def resume_progress(self) -> None:
+        if self._progress:
+            with self._lock:
+                self._progress.start()
+
     def _print(self, *args, **kwargs) -> None:
         with self._lock:
-            self.console.print(*args, **kwargs)
+            if self._buffering:
+                self._buffer.append((args, kwargs))
+            else:
+                self.console.print(*args, **kwargs)
+
+    def start_buffering(self) -> None:
+        with self._lock:
+            self._buffering = True
+
+    def stop_buffering(self) -> None:
+        with self._lock:
+            self._buffering = False
+
+    def flush_buffer(self) -> None:
+        with self._lock:
+            items = list(self._buffer)
+            self._buffer.clear()
+            was_buffering = self._buffering
+            self._buffering = False
+        for args, kwargs in items:
+            try:
+                self.console.print(*args, **kwargs)
+            except Exception:
+                pass
+        if was_buffering:
+            with self._lock:
+                self._buffering = True
 
     def on_session_start(self, total: int, is_verify: bool = False) -> None:
         columns = [
@@ -112,6 +152,9 @@ class RichEvents(DownloaderEvents):
         self._print(Rule(f"[bold cyan]{escape(str(artist))}[/bold cyan] [dim]({song_count} songs)[/dim]"))
 
     def on_search_start(self, artist: str, song: str, source: str) -> None:
+        # Suppress in select mode — the candidates table is sufficient
+        if self._buffering:
+            return
         from rich.markup import escape
         self._print(f"[dim]  [{escape(str(source))}] {escape(str(song))} -- {escape(str(artist))}[/dim]")
 
@@ -602,6 +645,351 @@ def _dry_run_table(
     console.print(tbl)
 
 
+def _preview_candidate(
+    candidate: dict,
+    preview_type: str,
+    seconds: int,
+    opts: dict,
+) -> bool:
+    """Stream a short preview of a candidate to ffplay.
+
+    Args:
+        candidate: The candidate metadata dict (must contain webpage_url or url).
+        preview_type: 'audio' or 'video'.
+        seconds: How many seconds to preview.
+        opts: Search options dict (cookies, proxy, etc.)
+
+    Returns:
+        True if the preview played successfully, False otherwise.
+    """
+    url = candidate.get("webpage_url") or candidate.get("url", "")
+    if not url:
+        return False
+
+    if not shutil.which("ffplay"):
+        return False
+
+    try:
+        ydl_opts: dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+        if opts.get("cookies_browser"):
+            ydl_opts["cookiesfrombrowser"] = (opts["cookies_browser"],)
+        if opts.get("cookies_file"):
+            ydl_opts["cookiefile"] = str(opts["cookies_file"])
+        if opts.get("proxy"):
+            ydl_opts["proxy"] = opts["proxy"]
+
+        import yt_dlp
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info:
+                return False
+
+            if preview_type == "audio":
+                candidates = [
+                    f
+                    for f in info.get("formats", [])
+                    if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url")
+                ]
+            else:
+                candidates = [
+                    f
+                    for f in info.get("formats", [])
+                    if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url")
+                ]
+
+            if candidates:
+                stream_url = candidates[0]["url"]
+            else:
+                stream_url = info.get("url", "")
+            if not stream_url:
+                return False
+
+        cmd = [
+            "ffplay",
+            "-t", str(seconds),
+            "-autoexit",
+            "-loglevel", "quiet",
+        ]
+        if preview_type == "audio":
+            cmd.extend(["-nodisp", "-vn"])
+        cmd.append(stream_url)
+
+        subprocess.run(
+            cmd, timeout=seconds + 30, check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return True
+
+    except Exception:
+        return False
+
+
+def _render_selection(
+    console: Console,
+    ranked: list[tuple[dict, int, dict]],
+    current: int,
+    preview: bool,
+    video_preview: bool,
+) -> None:
+    from .utils import format_duration as _fd
+    from rich.markup import escape as _esc
+
+    entry, sc, _bd = ranked[current]
+    title = _esc(str(entry.get("title", ""))[:60])
+    channel = _esc(str(entry.get("channel") or entry.get("uploader", ""))[:25])
+    dur = _fd(entry.get("duration") or 0)
+    n = len(ranked)
+
+    sep = "═" * min(60, console.width - 4)
+    console.print(f"  [dim]╔{sep}╗[/dim]")
+    console.print(
+        f"  [dim]║[/dim] [bold cyan]#{current + 1}[/bold cyan] of [bold]{n}[/bold]     "
+        f"[white]{title}[/white] [dim]|[/dim] "
+        f"[yellow]{channel}[/yellow] [dim]|[/dim] "
+        f"[green]{dur}[/green] [dim]|[/dim] Score: [bold]{sc}[/bold]"
+    )
+    help_parts = ["[bold]↑↓[/bold]=navigate", "[bold]Enter[/bold]=download"]
+    if preview or video_preview:
+        help_parts.append("[bold]Space[/bold]=preview")
+    help_parts.append("[bold]Esc[/bold]=skip")
+    help_parts.append("[bold]Q[/bold]=quit")
+    console.print(f"  [dim]╚{sep}╝[/dim]  [dim]{' | '.join(help_parts)}[/dim]")
+
+
+def _keyboard_select(
+    console: Console,
+    interactive_lock: threading.Lock,
+    console_lock: threading.Lock,
+    ranked: list[tuple[dict, int, dict]],
+    stop_event: threading.Event,
+    preview: bool,
+    video_preview: bool,
+    preview_seconds: int,
+    search_opts: dict,
+    events: Optional["RichEvents"] = None,
+) -> Optional[dict]:
+    import msvcrt
+    import sys
+
+    n = len(ranked)
+    current = 0
+    first = True
+
+    # Flush any buffered output before starting selection
+    if events:
+        events.flush_buffer()
+        events.start_buffering()
+
+    try:
+        # Suspend the progress bar so ANSI escape codes work cleanly
+        if events:
+            events.suspend_progress()
+
+        while not stop_event.is_set():
+            # Flush buffered output from other threads before redrawing prompt
+            if events and not first:
+                events.flush_buffer()
+
+            with interactive_lock:
+                with console_lock:
+                    if not first:
+                        sys.stdout.write("\033[4A\033[J")
+                    first = False
+                    _render_selection(console, ranked, current, preview, video_preview)
+
+            key = msvcrt.getch()
+
+            if key == b"\xe0":
+                key = msvcrt.getch()
+                if key == b"H":
+                    current = (current - 1) % n
+                elif key == b"P":
+                    current = (current + 1) % n
+
+            elif key == b"\r":
+                if events:
+                    events.flush_buffer()
+                entry, sc, _bd = ranked[current]
+                with interactive_lock:
+                    with console_lock:
+                        sys.stdout.write("\033[4A\033[J")
+                        console.print(
+                            f"  [green]Downloading #{current + 1}: {entry.get('title', '')} "
+                            f"(score: {sc})[/green]"
+                        )
+                return entry
+
+            elif key == b" " and (preview or video_preview):
+                if events:
+                    events.flush_buffer()
+                entry = ranked[current][0]
+                pt = "video" if video_preview else "audio"
+                with interactive_lock:
+                    with console_lock:
+                        sys.stdout.write("\033[4A\033[J")
+                        console.print(
+                            f"  [cyan]Previewing ({pt}) candidate #{current + 1}: "
+                            f"{entry.get('title', '')[:60]}...[/cyan]"
+                        )
+                _preview_candidate(entry, pt, preview_seconds, search_opts)
+
+            elif key == b"\x1b":
+                if events:
+                    events.flush_buffer()
+                return None
+
+            elif key in (b"q", b"Q"):
+                if events:
+                    events.flush_buffer()
+                stop_event.set()
+                return None
+    finally:
+        if events:
+            events.resume_progress()
+            events.stop_buffering()
+            events.flush_buffer()
+
+    return None
+
+
+def _make_interactive_selector(
+    console: Console,
+    console_lock: threading.Lock,
+    interactive_lock: threading.Lock,
+    stop_event: threading.Event,
+    preview: bool,
+    video_preview: bool,
+    preview_seconds: int,
+    search_opts: dict,
+    pause_progress: Optional[callable] = None,
+    resume_progress: Optional[callable] = None,
+    events: Optional["RichEvents"] = None,
+) -> Any:
+    use_keyboard = False
+    try:
+        import msvcrt
+        use_keyboard = True
+    except ImportError:
+        pass
+
+    def selector_fn(
+        artist: str,
+        song: str,
+        ranked: list[tuple[dict, int, dict]],
+    ) -> Optional[dict]:
+
+        if not ranked:
+            with interactive_lock:
+                with console_lock:
+                    console.print("[yellow]  No candidates to select from.[/yellow]")
+            return None
+
+        if use_keyboard:
+            return _keyboard_select(
+                console, interactive_lock, console_lock,
+                ranked, stop_event, preview, video_preview,
+                preview_seconds, search_opts, events,
+            )
+
+        # Fallback: input()-based selector for non-Windows platforms
+        while not stop_event.is_set():
+            with interactive_lock:
+                with console_lock:
+                    console.print()
+                    prompt_parts = [
+                        f"[bold yellow]Select candidate[/bold yellow] [1-{len(ranked)}]"
+                    ]
+                    if preview:
+                        prompt_parts.append("[bold]p#[/bold]=preview audio")
+                    if video_preview:
+                        prompt_parts.append("[bold]v#[/bold]=preview video")
+                    prompt_parts.append("[bold]s[/bold]=skip")
+                    prompt_parts.append("[bold]q[/bold]=quit")
+                    console.print("  " + " | ".join(prompt_parts))
+
+            try:
+                if pause_progress:
+                    pause_progress()
+                choice = input("  Choice: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                choice = "q"
+            finally:
+                if resume_progress:
+                    resume_progress()
+
+            if choice == "q":
+                stop_event.set()
+                return None
+
+            if choice == "s":
+                return None
+
+            if choice.startswith(("p", "v")):
+                try:
+                    idx = int(choice[1:]) - 1
+                except (ValueError, IndexError):
+                    with interactive_lock:
+                        with console_lock:
+                            console.print("  [red]Invalid format. Use p#, v#, or just a number.[/red]")
+                    continue
+
+                if idx < 0 or idx >= len(ranked):
+                    with interactive_lock:
+                        with console_lock:
+                            console.print(f"  [red]Invalid index. Must be 1-{len(ranked)}.[/red]")
+                    continue
+
+                preview_type = "video" if choice.startswith("v") else "audio"
+                entry = ranked[idx][0]
+                with interactive_lock:
+                    with console_lock:
+                        console.print(
+                            f"  [cyan]Previewing ({preview_type}) candidate #{idx + 1}: "
+                            f"{entry.get('title', '')[:60]}...[/cyan]"
+                        )
+
+                ok = _preview_candidate(entry, preview_type, preview_seconds, search_opts)
+                if not ok:
+                    with interactive_lock:
+                        with console_lock:
+                            console.print(
+                                "  [red]Preview failed (ffplay not found or stream error).[/red]"
+                            )
+                continue
+
+            try:
+                idx = int(choice) - 1
+            except ValueError:
+                with interactive_lock:
+                    with console_lock:
+                        console.print("  [red]Invalid input. Enter a number, p#, v#, s, or q.[/red]")
+                continue
+
+            if idx < 0 or idx >= len(ranked):
+                with interactive_lock:
+                    with console_lock:
+                        console.print(f"  [red]Invalid index. Must be 1-{len(ranked)}.[/red]")
+                continue
+
+            entry, sc, _bd = ranked[idx]
+            with interactive_lock:
+                with console_lock:
+                    console.print(
+                        f"  [green]Selected #{idx + 1}: {entry.get('title', '')} "
+                        f"(score: {sc})[/green]"
+                    )
+            return entry
+
+        return None
+
+    return selector_fn
+
+
 def _make_interactive_confirm(
     console: Console,
     console_lock: threading.Lock,
@@ -676,8 +1064,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--quality",
         metavar="QUALITY",
-        choices=["128", "192", "320"],
         default=_CONFIG.DEFAULT_QUALITY,
+        help="Audio bitrate (128, 192, 320) or video height (360, 480, 720, 1080, etc.)",
     )
     p.add_argument("--limit", metavar="INT", type=int, help="Limit number of downloads from a URL (e.g. for playlists)")
     p.add_argument("--max-results", metavar="INT", type=int, default=_CONFIG.DEFAULT_MAX_RESULTS)
@@ -722,6 +1110,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--interactive", action="store_true")
+    p.add_argument("--select", action="store_true",
+                   help="Interactive candidate selection: browse all results and pick which to download")
+    p.add_argument("--preview", action="store_true",
+                   help="Enable audio preview in --select mode (requires ffplay)")
+    p.add_argument("--video-preview", action="store_true",
+                   help="Enable video preview in --select mode (requires ffplay)")
+    p.add_argument("--preview-seconds", metavar="INT", type=int, default=15,
+                   help="Preview duration in seconds (default: 15)")
     p.add_argument("--log-file", metavar="FILE", type=Path)
     p.add_argument("--match-title", metavar="REGEX", type=str, help="Include only videos matching this regex in the title")
     p.add_argument("--reject-title", metavar="REGEX", type=str, help="Exclude videos matching this regex in the title")
@@ -840,6 +1236,28 @@ def main() -> None:
             threading.Lock(),
             threading.Lock(),
             stop_event,
+        )
+
+    if args.select:
+        stop_event = threading.Event()
+        search_opts = {
+            "max_results": args.max_results,
+            "cookies_browser": args.cookies_browser,
+            "cookies_file": str(args.cookies) if args.cookies else None,
+            "proxy": args.proxy,
+        }
+        events.selector_fn = _make_interactive_selector(
+            console,
+            threading.Lock(),
+            threading.Lock(),
+            stop_event,
+            preview=args.preview or args.video_preview,
+            video_preview=args.video_preview,
+            preview_seconds=args.preview_seconds,
+            search_opts=search_opts,
+            pause_progress=events.suspend_progress,
+            resume_progress=events.resume_progress,
+            events=events,
         )
 
     import musicbrainzngs as _mbz

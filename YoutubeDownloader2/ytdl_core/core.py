@@ -85,6 +85,8 @@ class MusicDownloader:
         self._acoustid_circuit_lock = threading.Lock()
         self._acoustid_cooldown_duration = 60.0
 
+        self._selection_lock = threading.Lock()
+
     def download(
         self,
         artist: str,
@@ -194,6 +196,148 @@ class MusicDownloader:
 
         return all_results
 
+    def _iter_entries(self, data: dict[str, Any]):
+        """Recursively flatten yt-dlp playlist/channel results into video entries."""
+        entries = data.get("entries")
+        if entries:
+            for e in entries:
+                if not e:
+                    continue
+                yield from self._iter_entries(e)
+            return
+
+        yield data
+
+
+    def _normalize_browser_cookies(self, value: Any) -> tuple[Any, ...]:
+        if isinstance(value, tuple):
+            return value
+        return (value,)
+
+
+    def _build_ytdlp_base_opts(
+        self,
+        output_dir: Path,
+        fmt: str,
+        quality: str,
+        quiet: bool,
+        no_warnings: bool,
+        progress_hook=None,
+        skip_existing: bool = False,
+        max_downloads: Optional[int] = None,
+        cookies_browser: Optional[Any] = None,
+        cookies_file: Optional[Path] = None,
+        proxy: Optional[str] = None,
+        download_archive: Optional[Path] = None,
+        enable_remote_components: bool = True,
+        youtube_player_clients: Optional[list[str]] = None,
+        noplaylist: bool = False,
+        for_scan: bool = False,
+    ) -> dict[str, Any]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        is_video = fmt == "mp4"
+        ydl_opts: dict[str, Any] = {
+            "format": f"bestvideo[height<={quality}]+bestaudio/bestvideo[height<={quality}]/best" if is_video else "bestaudio/best",
+            "outtmpl": str(output_dir / "%(uploader)s" / ("%(title)s [%(id)s].mp4" if is_video else "%(title)s [%(id)s].%(ext)s")),
+            "quiet": quiet,
+            "no_warnings": no_warnings,
+            "noprogress": True,
+            "progress_hooks": [progress_hook] if progress_hook else [],
+            "extract_flat": False,
+            "ignoreerrors": for_scan,
+            "skip_unavailable_fragments": True,
+            "socket_timeout": 30,
+            "retries": 10,
+            "fragment_retries": 10,
+            "extractor_retries": 10,
+            "file_access_retries": 5,
+            "windowsfilenames": True,
+            "noplaylist": noplaylist,
+        }
+
+        if not for_scan:
+            ydl_opts["writethumbnail"] = True
+            if is_video:
+                ydl_opts["merge_output_format"] = "mp4"
+                ydl_opts["postprocessors"] = [
+                    {"key": "FFmpegMetadata"},
+                    {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+                ]
+            else:
+                ydl_opts["postprocessors"] = [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": fmt,
+                        "preferredquality": quality,
+                    },
+                    {"key": "FFmpegMetadata"},
+                    {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+                ]
+
+        if skip_existing:
+            ydl_opts["nooverwrites"] = True
+
+        if max_downloads is not None:
+            ydl_opts["playlist_items"] = f"1-{max_downloads}"
+
+        if cookies_browser:
+            ydl_opts["cookiesfrombrowser"] = self._normalize_browser_cookies(cookies_browser)
+
+        if cookies_file:
+            ydl_opts["cookiefile"] = str(cookies_file)
+
+        if proxy:
+            ydl_opts["proxy"] = proxy
+
+        if download_archive:
+            ydl_opts["download_archive"] = str(download_archive)
+
+        if youtube_player_clients:
+            ydl_opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": list(youtube_player_clients),
+                }
+            }
+
+        node_path = shutil.which("node")
+        if node_path:
+            ydl_opts["js_runtimes"] = {
+                "node": {"path": node_path}
+            }
+
+        if enable_remote_components:
+            ydl_opts["remote_components"] = ["ejs:github"]
+
+        return ydl_opts
+
+    def _resolve_downloaded_file(self, base_file: Path, fmt: str) -> Optional[Path]:
+        """
+        Try to find the final converted file produced by yt-dlp/ffmpeg.
+        """
+        exact = base_file.with_suffix(f".{fmt}")
+        if exact.exists():
+            return exact
+
+        parent = base_file.parent
+        stem = base_file.stem
+
+        candidates = []
+        for ext in (fmt, "mp3", "m4a", "opus", "mp4", "ogg", "webm", "flac", "aac", "wav"):
+            candidate = parent / f"{stem}.{ext}"
+            if candidate.exists():
+                candidates.append(candidate)
+
+        if candidates:
+            return max(candidates, key=lambda p: p.stat().st_mtime)
+
+        globbed = sorted(
+            parent.glob(f"{stem}.*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        return globbed[0] if globbed else None
+
     def download_url(
         self,
         url: str,
@@ -205,83 +349,75 @@ class MusicDownloader:
         match_title: Optional[str] = None,
         reject_title: Optional[str] = None,
     ) -> None:
-        """Download directly from an arbitrary URL (e.g. playlist, channel, shorts)."""
+        """Download directly from an arbitrary URL (playlist, channel, shorts, video, etc.)."""
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        
-        def _progress_hook(d: dict) -> None:
-            if d.get("status") == "downloading":
+
+        match_pattern = re.compile(match_title, re.IGNORECASE) if match_title else None
+        reject_pattern = re.compile(reject_title, re.IGNORECASE) if reject_title else None
+
+        def _session_progress_hook(d: dict) -> None:
+            status = d.get("status")
+            if status == "downloading":
                 total_b = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
                 downloaded_b = d.get("downloaded_bytes") or 0
                 pct = (downloaded_b / total_b * 100.0) if total_b else 0.0
                 self.events.on_download_progress(
-                    "URL", url[:30], pct, d.get("speed") or 0.0, downloaded_b, total_b
+                    "URL",
+                    url[:30],
+                    pct,
+                    d.get("speed") or 0.0,
+                    downloaded_b,
+                    total_b,
                 )
+            elif status == "finished":
+                total_b = d.get("total_bytes") or d.get("downloaded_bytes") or 0
+                self.events.on_download_progress("URL", url[:30], 100.0, 0.0, total_b, total_b)
+            elif status == "processing":
+                self.events.on_info(f"[cyan]Processing playlist item...[/cyan]")
 
-        ydl_opts: Any = {
-            "format": "bestaudio/best",
-            "outtmpl": str(output_dir / "%(uploader)s" / "%(title)s.%(ext)s"),
-            "quiet": False,
-            "no_warnings": False,
-            "progress_hooks": [_progress_hook],
-            "writethumbnail": True,
-            "extractor_args": {"youtube": ["player_client=ios,tv,web"]},
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": fmt, "preferredquality": quality},
-                {"key": "FFmpegMetadata"},
-                {"key": "EmbedThumbnail", "already_have_thumbnail": False},
-            ],
-            "extract_flat": False,
-            "ignoreerrors": True,
-            "skip_unavailable_fragments": True,
-            "playlistend": max_downloads if max_downloads else None,
-            "socket_timeout": 30,
-            "retries": 3,
-            "fragment_retries": 3,
-        }
+        scan_opts = self._build_ytdlp_base_opts(
+            output_dir=output_dir,
+            fmt=fmt,
+            quality=quality,
+            quiet=False,
+            no_warnings=False,
+            progress_hook=None,
+            skip_existing=False,
+            max_downloads=max_downloads,
+            cookies_browser=self.cookies_browser,
+            cookies_file=self.cookies_file,
+            proxy=self.proxy,
+            enable_remote_components=True,
+            youtube_player_clients=["web"],
+            noplaylist=False,
+            for_scan=True,
+        )
 
-        if self.cookies_browser:
-            ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
-        if self.cookies_file:
-            ydl_opts["cookiefile"] = str(self.cookies_file)
-        if self.proxy:
-            ydl_opts["proxy"] = self.proxy
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
+        try:
+            with yt_dlp.YoutubeDL(scan_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-            except Exception as exc:
-                self.events.on_download_failed("URL", url, str(exc))
-                return
+        except Exception as exc:
+            self.events.on_download_failed("URL", url, str(exc))
+            return
 
         if not info:
             return
 
-        def extract_entries(data_dict):
-            if "entries" in data_dict:
-                for e in data_dict["entries"]:
-                    if e:
-                        yield from extract_entries(e)
-            else:
-                yield data_dict
+        entries = list(self._iter_entries(info))
 
-        entries = list(extract_entries(info))
-        
-        import re
-        match_pattern = re.compile(match_title, re.IGNORECASE) if match_title else None
-        reject_pattern = re.compile(reject_title, re.IGNORECASE) if reject_title else None
-
-        urls_to_download = []
+        urls_to_download: list[tuple[str, str, str]] = []
         for entry in entries:
             if not entry:
                 continue
-                
+
             title = entry.get("title", "Unknown")
             uploader = entry.get("uploader", "Unknown")
 
             if match_pattern and not match_pattern.search(title):
                 self.events.on_warn(f"[yellow]  Skipped (doesn't match --match-title): {title}[/yellow]")
                 continue
+
             if reject_pattern and reject_pattern.search(title):
                 self.events.on_warn(f"[yellow]  Skipped (matches --reject-title): {title}[/yellow]")
                 continue
@@ -293,18 +429,22 @@ class MusicDownloader:
             duration = entry.get("duration")
             if duration is not None:
                 if self.min_duration and duration < self.min_duration:
-                    self.events.on_warn(f"[yellow]  Skipped (too short, {int(duration)}s < {self.min_duration}s): {title}[/yellow]")
+                    self.events.on_warn(
+                        f"[yellow]  Skipped (too short, {int(duration)}s < {self.min_duration}s): {title}[/yellow]"
+                    )
                     continue
                 if self.max_duration and duration > self.max_duration:
-                    self.events.on_warn(f"[yellow]  Skipped (too long, {int(duration)}s > {self.max_duration}s): {title}[/yellow]")
+                    self.events.on_warn(
+                        f"[yellow]  Skipped (too long, {int(duration)}s > {self.max_duration}s): {title}[/yellow]"
+                    )
                     continue
 
-            e_url = entry.get("url")
-            if not e_url and entry.get("id"):
-                e_url = f"https://www.youtube.com/watch?v={entry['id']}"
-                
-            if e_url and e_url != url and "search?" not in e_url:
-                urls_to_download.append((uploader, title, e_url))
+            item_url = entry.get("webpage_url") or entry.get("url")
+            if not item_url and entry.get("id"):
+                item_url = f"https://www.youtube.com/watch?v={entry['id']}"
+
+            if item_url and item_url != url and "search?" not in item_url:
+                urls_to_download.append((uploader, title, item_url))
 
         if not urls_to_download:
             self.events.on_warn("[yellow]No suitable URLs found to download after applying filters.[/yellow]")
@@ -312,83 +452,96 @@ class MusicDownloader:
 
         total = len(urls_to_download)
         self.events.on_session_start(total)
-        
+
         all_results: list[DownloadResult] = []
         results_lock = threading.Lock()
         stop_event = threading.Event()
         start = time.monotonic()
 
-        def _process_single_url(item_artist: str, item_title: str, item_url: str):
+        def _process_single_url(item_artist: str, item_title: str, item_url: str) -> None:
             if stop_event.is_set():
                 return
 
             result = DownloadResult(artist=item_artist, song=item_title)
 
-            def _progress_hook(d: dict) -> None:
-                if d.get("status") == "downloading":
+            def _item_progress_hook(d: dict) -> None:
+                status = d.get("status")
+                if status == "downloading":
                     total_b = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
                     downloaded_b = d.get("downloaded_bytes") or 0
                     pct = (downloaded_b / total_b * 100.0) if total_b else 0.0
                     self.events.on_download_progress(
-                        item_artist, item_title[:30], pct, d.get("speed") or 0.0, downloaded_b, total_b
+                        item_artist,
+                        item_title[:30],
+                        pct,
+                        d.get("speed") or 0.0,
+                        downloaded_b,
+                        total_b,
                     )
+                elif status == "finished":
+                    total_b = d.get("total_bytes") or d.get("downloaded_bytes") or 0
+                    self.events.on_download_progress(
+                        item_artist,
+                        item_title[:30],
+                        100.0,
+                        0.0,
+                        total_b,
+                        total_b,
+                    )
+                elif status == "processing":
+                    self.events.on_info(f"[cyan]Processing: {item_title}[/cyan]")
 
-            ydl_opts: Any = {
-                "format": "bestaudio/best",
-                "outtmpl": str(output_dir / "%(uploader)s" / "%(title)s.%(ext)s"),
-                "quiet": True,
-                "noprogress": True,
-                "no_warnings": True,
-                "noplaylist": True,
-                "progress_hooks": [_progress_hook],
-                "writethumbnail": True,
-                "nooverwrites": skip_existing, 
-                "windowsfilenames": True,
-                "extractor_args": {"youtube": ["player_client=ios,android,web"]},
-                "postprocessors": [
-                    {"key": "FFmpegExtractAudio", "preferredcodec": fmt, "preferredquality": quality},
-                    {"key": "FFmpegMetadata"},
-                    {"key": "EmbedThumbnail", "already_have_thumbnail": False},
-                ],
-                "extract_flat": False,
-                "ignoreerrors": True,
-                "socket_timeout": 30,
-                "retries": 3,
-                "fragment_retries": 3,
-            }
+            item_opts = self._build_ytdlp_base_opts(
+                output_dir=output_dir,
+                fmt=fmt,
+                quality=quality,
+                quiet=True,
+                no_warnings=True,
+                progress_hook=_item_progress_hook,
+                skip_existing=skip_existing,
+                cookies_browser=self.cookies_browser,
+                cookies_file=self.cookies_file,
+                proxy=self.proxy,
+                enable_remote_components=True,
+                youtube_player_clients=["web"],
+                noplaylist=True,
+                for_scan=False,
+            )
 
-            if self.cookies_browser:
-                ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
-            if self.cookies_file:
-                ydl_opts["cookiefile"] = str(self.cookies_file)
-            if self.proxy:
-                ydl_opts["proxy"] = self.proxy
+            safe_artist = sanitize_filename(item_artist)
+            safe_title = sanitize_filename(item_title)
+            guess_file = output_dir / safe_artist / f"{safe_title}.{fmt}"
+
+            if skip_existing and guess_file.exists():
+                self.events.on_skip_existing(item_artist, item_title, guess_file, True)
+                result.status = "skipped"
+                result.reason = "File exists"
+                result.file_path = guess_file
+                with results_lock:
+                    all_results.append(result)
+                self.events.on_result(result)
+                return
+
+            self.events.on_download_start(item_artist, item_title, item_url)
 
             try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl_item:
-                    info_dict = ydl_item.extract_info(item_url, download=False)
-                    if info_dict:
-                        actual_artist = sanitize_filename(info_dict.get("uploader", item_artist))
-                        actual_title = sanitize_filename(info_dict.get("title", item_title))
-                        
-                        expected_file = output_dir / actual_artist / f"{actual_title}.{fmt}"
-                        
-                        if skip_existing and expected_file.exists():
-                            self.events.on_skip_existing(item_artist, item_title, expected_file, True)
-                            result.status = "skipped"
-                            result.reason = "File exists"
-                            result.file_path = expected_file
-                            with results_lock:
-                                all_results.append(result)
-                            self.events.on_result(result)
-                            return
+                with yt_dlp.YoutubeDL(item_opts) as ydl_item:
+                    info_dict = ydl_item.extract_info(item_url, download=True)
+                    if not info_dict:
+                        raise RuntimeError("yt-dlp returned no info_dict")
 
-                        self.events.on_download_start(item_artist, item_title, item_url)
-                        ydl_item.process_info(info_dict) # Realiza la descarga
-                        
-                        result.status = "downloaded"
-                        result.file_path = expected_file
-                        result.duration_seconds = info_dict.get("duration")
+                    source_file = Path(ydl_item.prepare_filename(info_dict))
+                    downloaded_file = self._resolve_downloaded_file(source_file, fmt)
+
+                    if downloaded_file is None:
+                        raise FileNotFoundError(
+                            f"yt-dlp finished but no output file was found for {item_artist} - {item_title}"
+                        )
+
+                    result.status = "downloaded"
+                    result.file_path = downloaded_file
+                    result.duration_seconds = info_dict.get("duration")
+
             except Exception as exc:
                 self.events.on_download_failed(item_artist, item_title, str(exc))
                 result.status = "failed"
@@ -401,8 +554,8 @@ class MusicDownloader:
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
                 futures = [
-                    executor.submit(_process_single_url, a, t, u)
-                    for a, t, u in urls_to_download
+                    executor.submit(_process_single_url, artist, title, item_url)
+                    for artist, title, item_url in urls_to_download
                 ]
                 for fut in concurrent.futures.as_completed(futures):
                     try:
@@ -421,13 +574,44 @@ class MusicDownloader:
         output_dir: Path,
         fmt: str = "mp3",
     ) -> list[DownloadResult]:
+        """
+        Validates the existence, size, duration, and fingerprint of local audio tracks.
+        Implements progressive state saving to preserve progress upon interruption.
+        Includes all requested songs in the final result, regardless of when they were verified.
+        """
         output_dir = Path(output_dir)
-        pairs = [(artist, song) for artist, lst in songs.items() for song in lst if lst]
-        total = len(pairs)
+        state = load_state(output_dir)
+        
+        results_map = {}
+        pairs_to_process = []
+        
+        # Build the complete map and separate items that actually need processing
+        for artist, lst in songs.items():
+            if not lst:
+                continue
+            for song in lst:
+                key = f"{artist}::{song}"
+                entry_state = state.get("downloads", {}).get(key, {})
+                status = entry_state.get("status")
+                
+                # If it's already verified, construct a successful DownloadResult immediately
+                if status == "verified":
+                    res = DownloadResult(artist=artist, song=song, status="verified")
+                    res.file_path = Path(entry_state["file_path"]) if entry_state.get("file_path") else None
+                    res.md5 = entry_state.get("md5")
+                    res.fingerprint_verified = entry_state.get("fingerprint_verified", False)
+                    results_map[(artist, song)] = res
+                else:
+                    # Initialize as skipped, add to queue for processing
+                    results_map[(artist, song)] = DownloadResult(artist=artist, song=song, status="skipped", reason="Not verified in state")
+                    # Only process if it was marked as downloaded
+                    if status == "downloaded":
+                        pairs_to_process.append((artist, song))
+
+        total = len(pairs_to_process)
         self.events.on_session_start(total, is_verify=True)
 
-        all_results: list[DownloadResult] = []
-        results_lock = threading.Lock()
+        state_lock = threading.Lock()
         stop_event = threading.Event()
         start = time.monotonic()
 
@@ -438,7 +622,7 @@ class MusicDownloader:
             with seen_artists_lock:
                 if artist not in seen_artists:
                     seen_artists.add(artist)
-                    count = sum(1 for a, _ in pairs if a == artist)
+                    count = sum(1 for a, _ in pairs_to_process if a == artist)
                     self.events.on_artist_start(artist, count)
             
             result = DownloadResult(artist=artist, song=song)
@@ -459,7 +643,7 @@ class MusicDownloader:
             
             try:
                 size = expected_file.stat().st_size
-                if size < 1024 * 50:  # < 50KB usually indicates an error
+                if size < 1024 * 50:
                     result.status = "failed"
                     result.reason = "File is extremely small (<50KB)"
                     result.file_path = expected_file
@@ -508,29 +692,59 @@ class MusicDownloader:
             result.file_path = expected_file
             return result
 
-        try:
+        if pairs_to_process:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
                 futures = {
                     executor.submit(_verify_single, artist, song): (artist, song)
-                    for artist, song in pairs
+                    for artist, song in pairs_to_process
                 }
-                for fut in concurrent.futures.as_completed(futures):
-                    artist, song = futures[fut]
-                    try:
-                        res = fut.result()
-                    except Exception as e:
-                        res = DownloadResult(artist=artist, song=song, status="failed", reason=f"Exception: {str(e)}")
-                    with results_lock:
-                        all_results.append(res)
-                    self.events.on_result(res)
-        except KeyboardInterrupt:
-            stop_event.set()
-        
+                try:
+                    for fut in concurrent.futures.as_completed(futures):
+                        artist, song = futures[fut]
+                        key = f"{artist}::{song}"
+                        
+                        try:
+                            res = fut.result()
+                        except Exception as exc:
+                            res = DownloadResult(artist=artist, song=song, status="failed", reason=f"Exception: {str(exc)}")
+                        
+                        results_map[(artist, song)] = res
+                        self.events.on_result(res)
+                        
+                        if res.status != "skipped":
+                            with state_lock:
+                                existing = state.get("downloads", {}).get(key, {})
+                                
+                            current_md5 = existing.get("md5")
+                            if not current_md5 and res.file_path and Path(res.file_path).exists():
+                                current_md5 = compute_md5(Path(res.file_path))
+                                
+                            fingerprint_verified = getattr(res, "fingerprint_verified", False)
+                                
+                            self._persist(
+                                state,
+                                state_lock,
+                                key,
+                                res.status,
+                                existing.get("url"),
+                                str(res.file_path) if res.file_path else existing.get("file_path"),
+                                current_md5,
+                                output_dir,
+                                fingerprint_verified=fingerprint_verified,
+                                preserve_timestamp=True
+                            )
+
+                except KeyboardInterrupt:
+                    stop_event.set()
+                    for fut in futures:
+                        fut.cancel()
+
+        all_results = list(results_map.values())
         elapsed = time.monotonic() - start
         self.events.on_session_complete(all_results, elapsed)
         
         return all_results
-
+    
     def _process_song(
         self,
         artist: str,
@@ -595,7 +809,6 @@ class MusicDownloader:
 
         mb_duration_seconds: Optional[int] = None
 
-        # Call MusicBrainz to enrich duration before searching
         if getattr(self, "musicbrainz", False):
             try:
                 mb_data = fetch_musicbrainz(artist, song)
@@ -604,7 +817,6 @@ class MusicDownloader:
                     mb_duration_seconds = mb_data.get("duration_seconds")
             except Exception as mb_exc:
                 self.events.on_warn(f"[yellow]MusicBrainz failed: {mb_exc}[/yellow]")
-
 
         best_result: Optional[dict] = None
         ranked_candidates: list[tuple[dict, int, dict]] = []
@@ -616,11 +828,8 @@ class MusicDownloader:
 
         self.events.on_search_start(artist, song, "parallel sources")
         raw = search_all_sources(artist, song, self.sources, search_opts)
-        
-        if not raw:
-            for source in self.sources:
-                self.events.on_no_results(artist, song, source)
-        else:
+
+        if raw:
             found, ranked = select_best_result(
                 results=raw,
                 artist=artist,
@@ -633,21 +842,52 @@ class MusicDownloader:
                 max_duration=self.max_duration,
                 score_threshold=self.score_threshold,
             )
-            if found is None:
+
+            has_selector = hasattr(self.events, "selector_fn") and callable(self.events.selector_fn)
+            has_confirm = hasattr(self.events, "confirm_fn") and callable(self.events.confirm_fn)
+
+            # Only report "search failed" when there's nothing to choose from
+            if not ranked:
                 self.events.on_search_failed(artist, song, self.sources)
-                
-            self.events.on_candidates_scored(artist, song, ranked)
-            if found:
-                # Interactive mode hook
-                if hasattr(self.events, "confirm_fn") and callable(self.events.confirm_fn):
+            else:
+                self.events.on_candidates_scored(artist, song, ranked)
+
+            if ranked:
+                if hasattr(self.events, "selector_fn") and callable(self.events.selector_fn):
+                    with self._selection_lock:
+                        if stop_event.is_set():
+                            result.status = "skipped"
+                            result.reason = "Interrupted"
+                            return result
+                        chosen = self.events.selector_fn(artist, song, ranked)
+                    if chosen is None:
+                        result.status = "skipped"
+                        result.reason = "User skipped in select mode"
+                        return result
+                    best_result = chosen
+                    ranked_candidates = ranked
+                    chosen_source = chosen.get("_source", "unknown")
+                elif has_confirm:
+                    if found is None:
+                        self.events.on_search_failed(artist, song, self.sources)
+                        result.reason = "No valid result found after all sources"
+                        self._persist(state, state_lock, key, "failed", None, None, None, output_dir)
+                        return result
                     if not self.events.confirm_fn(artist, song, found):
                         result.status = "skipped"
                         result.reason = "User skipped in interactive mode"
                         return result
-                
-                best_result = found
-                ranked_candidates = ranked
-                chosen_source = best_result.get("_source", "unknown")
+                    best_result = found
+                    ranked_candidates = ranked
+                    chosen_source = best_result.get("_source", "unknown")
+                else:
+                    if found is not None:
+                        best_result = found
+                        ranked_candidates = ranked
+                        chosen_source = best_result.get("_source", "unknown")
+        else:
+            for source in self.sources:
+                self.events.on_no_results(artist, song, source)
 
         if best_result is None:
             self.events.on_search_failed(artist, song, self.sources)
@@ -678,7 +918,8 @@ class MusicDownloader:
         fp_label = "disabled"
 
         needs_fp = (
-            self.force_fingerprint or (
+            self.force_fingerprint
+            or (
                 bool(self.acoustid_key)
                 and not self.skip_fingerprint
                 and self.fpcalc_available
@@ -703,9 +944,7 @@ class MusicDownloader:
                         self.events.on_fingerprint_partial_failed(artist, song)
                         fp_label = "partial download failed"
                     else:
-                        is_match, conf, fp_title = self._verify_fingerprint(
-                            partial_path, artist, song
-                        )
+                        is_match, conf, fp_title = self._verify_fingerprint(partial_path, artist, song)
                         time.sleep(0.35)
                         fp_confidence = conf
                         fp_matched_title = fp_title
@@ -741,12 +980,8 @@ class MusicDownloader:
                                             result.url = url
                                             result.matched_title = matched_title
                                             result.duration_seconds = duration_s
-                                            result.composite_score = cand_r.get(
-                                                "_composite_score", 0
-                                            )
-                                            result.score_breakdown = cand_r.get(
-                                                "_score_breakdown", {}
-                                            )
+                                            result.composite_score = cand_r.get("_composite_score", 0)
+                                            result.score_breakdown = cand_r.get("_score_breakdown", {})
                                             break
                                 finally:
                                     if next_partial and next_partial.exists():
@@ -773,29 +1008,76 @@ class MusicDownloader:
         result.fingerprint_matched_title = fp_matched_title
 
         (output_dir / safe_artist).mkdir(parents=True, exist_ok=True)
-        output_template = str(output_dir / safe_artist / f"{safe_song}.%(ext)s")
+        is_video = fmt == "mp4"
+        output_template = str(output_dir / safe_artist / f"{safe_song}.mp4" if is_video else f"{safe_song}.%(ext)s")
         self.events.on_download_start(artist, song, url)
 
         def _progress_hook(d: dict) -> None:
-            if d.get("status") == "downloading":
+            status = d.get("status")
+            if status == "downloading":
                 total_b = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
                 downloaded_b = d.get("downloaded_bytes") or 0
                 pct = (downloaded_b / total_b * 100.0) if total_b else 0.0
                 self.events.on_download_progress(
                     artist, song, pct, d.get("speed") or 0.0, downloaded_b, total_b
                 )
+            elif status == "finished":
+                total_b = d.get("total_bytes") or d.get("downloaded_bytes") or 0
+                self.events.on_download_progress(
+                    artist, song, 100.0, 0.0, total_b, total_b
+                )
+            elif status == "processing":
+                self.events.on_info(f"[cyan]Processing: {song}[/cyan]")
 
-        ydl_opts: Any = {
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-            "outtmpl": output_template,
-            "quiet": True,
-            "no_warnings": True,
-            "progress_hooks": [_progress_hook],
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": fmt, "preferredquality": quality}
-            ],
-            "noplaylist": True,
-        }
+        if is_video:
+            ydl_opts: Any = {
+                "format": f"bestvideo[height<={quality}]+bestaudio/bestvideo[height<={quality}]/best",
+                "outtmpl": output_template,
+                "merge_output_format": "mp4",
+                "quiet": True,
+                "no_warnings": True,
+                "progress_hooks": [_progress_hook],
+                "postprocessors": [
+                    {"key": "FFmpegMetadata"},
+                    {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+                ],
+                "noplaylist": True,
+                "writethumbnail": True,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["web"],
+                    }
+                },
+            }
+        else:
+            ydl_opts: Any = {
+                "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+                "outtmpl": output_template,
+                "quiet": True,
+                "no_warnings": True,
+                "progress_hooks": [_progress_hook],
+                "postprocessors": [
+                    {"key": "FFmpegExtractAudio", "preferredcodec": fmt, "preferredquality": quality},
+                    {"key": "FFmpegMetadata"},
+                    {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+                ],
+                "noplaylist": True,
+                "writethumbnail": True,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["web"],
+                    }
+                },
+            }
+
+        node_path = shutil.which("node")
+        if node_path:
+            ydl_opts["js_runtimes"] = {
+                "node": {"path": node_path}
+            }
+
+        ydl_opts["remote_components"] = ["ejs:github"]
+
         if self.cookies_browser:
             ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
         if self.cookies_file:
@@ -811,14 +1093,14 @@ class MusicDownloader:
                 break
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-                for ext in (fmt, "mp3", "m4a", "opus", "webm", "ogg"):
-                    candidate = output_dir / safe_artist / f"{safe_song}.{ext}"
-                    if candidate.exists():
-                        downloaded_file = candidate
-                        break
+                    info_dict = ydl.extract_info(url, download=True)
+                    if info_dict:
+                        source_file = Path(ydl.prepare_filename(info_dict))
+                        downloaded_file = self._resolve_downloaded_file(source_file, fmt)
+
                 if downloaded_file and downloaded_file.exists():
                     break
+
             except DownloadError as exc:
                 last_error = f"DownloadError: {exc}"
             except ExtractorError as exc:
@@ -936,33 +1218,98 @@ class MusicDownloader:
 
     def _download_partial(self, url: str, output_dir: Path) -> Optional[Path]:
         token = uuid4().hex[:8]
-        expected = output_dir / f"_partial_{token}.mp3"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        partial_base = output_dir / f"_partial_{token}"
+        expected_mp3 = partial_base.with_suffix(".mp3")
+
         ydl_opts: Any = {
             "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-            "outtmpl": str(output_dir / f"_partial_{token}.%(ext)s"),
+            "outtmpl": str(partial_base) + ".%(ext)s",
             "quiet": True,
             "no_warnings": True,
+            "noprogress": True,
+            "noplaylist": True,
+            "ignoreerrors": False,
+            "socket_timeout": 30,
+            "retries": 5,
+            "fragment_retries": 5,
+            "extractor_retries": 5,
             "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "128",
+                }
             ],
-            "download_ranges": download_range_func([], [(0, self.config.PARTIAL_DOWNLOAD_SECONDS)]),
-            "force_keyframes_at_cuts": True,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["web"],
+                }
+            },
+            "remote_components": ["ejs:github"],
         }
+
+        node_path = shutil.which("node")
+        if node_path:
+            ydl_opts["js_runtimes"] = {
+                "node": {"path": node_path}
+            }
+
         if self.cookies_browser:
             ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
         if self.cookies_file:
             ydl_opts["cookiefile"] = str(self.cookies_file)
         if self.proxy:
             ydl_opts["proxy"] = self.proxy
+
+        def _hook(d: dict) -> None:
+            status = d.get("status")
+            if status == "downloading":
+                total_b = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                downloaded_b = d.get("downloaded_bytes") or 0
+                pct = (downloaded_b / total_b * 100.0) if total_b else 0.0
+                self.events.on_download_progress(
+                    "Partial",
+                    url[:30],
+                    pct,
+                    d.get("speed") or 0.0,
+                    downloaded_b,
+                    total_b,
+                )
+            elif status == "finished":
+                total_b = d.get("total_bytes") or d.get("downloaded_bytes") or 0
+                self.events.on_download_progress("Partial", url[:30], 100.0, 0.0, total_b, total_b)
+
+        ydl_opts["progress_hooks"] = [_hook]
+
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-            if expected.exists():
-                return expected
-            for candidate in output_dir.glob(f"_partial_{token}.*"):
-                return candidate
+                info = ydl.extract_info(url, download=True)
+                if not info:
+                    return None
+
+                source_file = Path(ydl.prepare_filename(info))
+                final_mp3 = source_file.with_suffix(".mp3")
+
+                if final_mp3.exists():
+                    return final_mp3
+
+                if expected_mp3.exists():
+                    return expected_mp3
+
+                for candidate in sorted(
+                    output_dir.glob(f"_partial_{token}.*"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                ):
+                    if candidate.exists():
+                        return candidate
+
         except Exception:
-            pass
+            return None
+
         return None
 
     def _verify_fingerprint(
@@ -984,8 +1331,8 @@ class MusicDownloader:
         
         for attempt in range(max_retries):
             try:
-                stop_time = random.uniform(5.0, 10.0) 
-                print(f"Applying random delay of {stop_time:.2f}s before AcoustID request...")
+                stop_time = random.uniform(3.0, 7.0) 
+                self.events.on_warn(f"[yellow]Applying random delay of {stop_time:.2f}s before AcoustID request...[/yellow]")
                 time.sleep(stop_time)
                 
                 results = list(acoustid.match(self.acoustid_key, str(partial_path), meta="recordings"))
@@ -998,11 +1345,12 @@ class MusicDownloader:
                     a_sim = fuzz.token_sort_ratio(artist.lower(), (a or "").lower())
                     t_sim = fuzz.token_sort_ratio(song.lower(), (title or "").lower())
                     if a_sim > 75 and t_sim > 75:
+                        self.events.on_info(f"[green]Fingerprint match: '{a} - {title}' with confidence {score:.2f} (artist sim: {a_sim}, title sim: {t_sim})[/green]")
                         return True, score, title or ""
                     if score > best_conf:
                         best_conf = score
                         best_title = f"{a} -- {title}"
-                        
+                        self.events.on_info(f"[yellow]Best match found: {best_title} (confidence: {best_conf:.2f})[/yellow]")
                 return False, best_conf, best_title
                 
             except Exception as exc:
@@ -1092,14 +1440,23 @@ class MusicDownloader:
         md5: Optional[str],
         output_dir: Path,
         fingerprint_verified: bool = False,
+        preserve_timestamp: bool = False
     ) -> None:
         with lock:
-            state.setdefault("downloads", {})[key] = {
+            downloads = state.setdefault("downloads", {})
+            existing = downloads.get(key)
+            
+            if preserve_timestamp and "timestamp" in existing:
+                ts = existing["timestamp"]
+            else:
+                ts = datetime.now(timezone.utc).isoformat()
+                
+            downloads[key] = {
                 "status": status,
                 "url": url,
                 "file_path": file_path,
                 "md5": md5,
                 "fingerprint_verified": fingerprint_verified,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": ts,
             }
             save_state(state, output_dir)
