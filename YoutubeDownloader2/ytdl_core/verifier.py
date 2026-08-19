@@ -35,6 +35,7 @@ def _verify_single(
     musicbrainz: bool,
     events: DownloaderEvents,
     stop_event: threading.Event,
+    require_fingerprint: bool = False,
 ) -> DownloadResult:
     """Verify a single audio file on disk."""
     result = DownloadResult(artist=artist, song=song)
@@ -103,10 +104,28 @@ def _verify_single(
         result.fingerprint_verified = fp_ok
         result.fingerprint_confidence = fp_conf
         result.fingerprint_matched_title = fp_title
+        _fp_errors = {
+            "no_key",
+            "circuit_breaker_open",
+            "rate_limit_exceeded",
+            "fingerprint_error",
+            "max_retries_exceeded",
+        }
+        if fp_ok:
+            result.fingerprint_label = f"verified {fp_conf:.0%}"
+        elif fp_title in _fp_errors:
+            result.fingerprint_label = fp_title
+        elif fp_conf > 0:
+            result.fingerprint_label = f"no match ({fp_title or 'unknown'})"
+        else:
+            result.fingerprint_label = "no match"
 
-        if not fp_ok and fp_conf > 0:
+        if not fp_ok and (require_fingerprint or fp_conf > 0):
             result.status = "failed"
-            result.reason = f"Fingerprint mismatch: Found '{fp_title}' ({fp_conf*100:.1f}%)"
+            if require_fingerprint:
+                result.reason = "Fingerprint did not confirm the song"
+            else:
+                result.reason = f"Fingerprint mismatch: Found '{fp_title}' ({fp_conf*100:.1f}%)"
             result.file_path = expected_file
             return result
 
@@ -129,6 +148,7 @@ def verify_library(
     persist_fn: callable,
     state: dict,
     state_lock: threading.Lock,
+    require_fingerprint: bool = False,
 ) -> list[DownloadResult]:
     """
     Verify a local library of audio files.
@@ -155,19 +175,38 @@ def verify_library(
             entry_state = state.get("downloads", {}).get(key, {})
             status = entry_state.get("status")
 
-            if status == "verified":
+            if status == "verified" and not (
+                require_fingerprint and not entry_state.get("fingerprint_verified", False)
+            ):
                 res = DownloadResult(artist=artist, song=song, status="verified")
                 res.file_path = (
                     Path(entry_state["file_path"]) if entry_state.get("file_path") else None
                 )
                 res.md5 = entry_state.get("md5")
                 res.fingerprint_verified = entry_state.get("fingerprint_verified", False)
+                res.fingerprint_confidence = entry_state.get("fingerprint_confidence", 0.0)
+                if res.fingerprint_verified:
+                    res.fingerprint_label = entry_state.get(
+                        "fingerprint_label", "verified (stored)"
+                    )
+                if res.file_path:
+                    try:
+                        if res.file_path.exists():
+                            res.file_size_bytes = res.file_path.stat().st_size
+                            _, dur = verify_duration(res.file_path, 0)
+                            res.duration_seconds = dur
+                    except Exception:
+                        pass
                 results_map[(artist, song)] = res
             else:
                 results_map[(artist, song)] = DownloadResult(
                     artist=artist, song=song, status="skipped", reason="Not verified in state"
                 )
-                if status == "downloaded":
+                if status == "downloaded" or (
+                    require_fingerprint
+                    and status == "verified"
+                    and not entry_state.get("fingerprint_verified", False)
+                ):
                     pairs_to_process.append((artist, song))
 
     total = len(pairs_to_process)
@@ -188,6 +227,7 @@ def verify_library(
         return _verify_single(
             artist, song, output_dir, fmt, acoustid_key, config,
             circuit_breaker, fp_semaphore, musicbrainz, events, stop_event,
+            require_fingerprint,
         )
 
     if pairs_to_process:
@@ -234,6 +274,8 @@ def verify_library(
                             current_md5,
                             output_dir,
                             fingerprint_verified=fingerprint_verified,
+                            fingerprint_confidence=getattr(res, "fingerprint_confidence", 0.0),
+                            fingerprint_label=getattr(res, "fingerprint_label", None),
                             preserve_timestamp=True,
                         )
 

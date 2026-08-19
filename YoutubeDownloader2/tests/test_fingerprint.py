@@ -11,6 +11,7 @@ import pytest
 from ytdl_core.config import Config
 from ytdl_core.fingerprint import (
     AcoustIDCircuitBreaker,
+    _artist_stem,
     has_excessive_silence,
     verify_duration,
     verify_fingerprint,
@@ -126,6 +127,64 @@ class TestVerifyFingerprint:
         assert ok is False
         assert title == "rate_limit_exceeded"
         assert cb.is_open is True
+
+
+# ---------------------------------------------------------------------------
+# _artist_stem
+# ---------------------------------------------------------------------------
+
+class TestArtistStem:
+    def test_plain_artist_unchanged(self):
+        assert _artist_stem("Barak") == "Barak"
+
+    def test_strips_feat_clause(self):
+        assert _artist_stem("Barak feat. Marcos Yaroide") == "Barak"
+
+    def test_strips_ft_abbreviation(self):
+        assert _artist_stem("Wiso Aponte ft. Redimi2") == "Wiso Aponte"
+
+    def test_strips_featuring_and_con(self):
+        assert _artist_stem("Generación 12 featuring Coalo Zamorano") == "Generación 12"
+        assert _artist_stem("Barak con Marcos Yaroide") == "Barak"
+
+    def test_empty_input(self):
+        assert _artist_stem("") == ""
+        assert _artist_stem(None) == ""
+
+
+# ---------------------------------------------------------------------------
+# verify_fingerprint with featured artists (mocked acoustid)
+# ---------------------------------------------------------------------------
+
+class TestVerifyFingerprintFeaturing:
+    def test_matches_when_artist_has_feat_credit(self, tmp_path, config):
+        """A recording credited 'Barak feat. Marcos Yaroide' must still match
+        the query artist 'Barak' (feature credits are dropped)."""
+        cb = AcoustIDCircuitBreaker()
+        fake = tmp_path / "fake.mp3"
+        fake.write_bytes(b"x")
+        with patch("ytdl_core.fingerprint.acoustid.match", return_value=[
+            (0.95, "rec1", "Sumérgeme en tu gloria", "Barak feat. Marcos Yaroide"),
+        ]):
+            ok, conf, title = verify_fingerprint(
+                fake, "Barak", "Sumérgeme en Tu Gloria", "KEY", config, cb
+            )
+        assert ok is True
+        assert title == "Sumérgeme en tu gloria"
+
+    def test_rejects_when_artist_truly_differs(self, tmp_path, config):
+        """A Marco Barrientos recording must NOT match the query artist Barak."""
+        cb = AcoustIDCircuitBreaker()
+        fake = tmp_path / "fake.mp3"
+        fake.write_bytes(b"x")
+        with patch("ytdl_core.fingerprint.acoustid.match", return_value=[
+            (0.96, "rec1", "Levántate y resplandece", "Marco Barrientos"),
+        ]):
+            ok, conf, title = verify_fingerprint(
+                fake, "Barak", "Levántate y Resplandece", "KEY", config, cb
+            )
+        assert ok is False
+        assert "Marco Barrientos" in title
 
 
 # ---------------------------------------------------------------------------

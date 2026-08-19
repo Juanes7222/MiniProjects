@@ -98,8 +98,10 @@ class SpyEvents(DownloaderEvents):
     def on_silence_rejected(self, artist, song, silence_ratio):
         self._record("on_silence_rejected", artist, song, silence_ratio)
 
-    def on_post_check_summary(self, artist, song, dur_ok, actual_dur, silence_ratio):
-        self._record("on_post_check_summary", artist, song, dur_ok, actual_dur, silence_ratio)
+    def on_post_check_summary(self, artist, song, dur_ok, actual_dur, silence_ratio, silence_checked=True):
+        self._record(
+            "on_post_check_summary", artist, song, dur_ok, actual_dur, silence_ratio, silence_checked
+        )
 
     def on_musicbrainz_result(self, artist, song, enriched, data):
         self._record("on_musicbrainz_result", artist, song, enriched, data)

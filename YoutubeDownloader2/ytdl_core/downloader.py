@@ -57,11 +57,10 @@ def execute_download(
     safe_artist = sanitize_filename(artist)
     safe_song = sanitize_filename(song)
     is_video = fmt == "mp4"
-    output_template = str(
-        output_dir / safe_artist / f"{safe_song}.mp4"
-        if is_video
-        else f"{safe_song}.%(ext)s"
-    )
+    if is_video:
+        output_template = str(output_dir / safe_artist / f"{safe_song}.mp4")
+    else:
+        output_template = str(output_dir / safe_artist / f"{safe_song}.%(ext)s")
 
     progress_hook = make_progress_hook(events, artist, song)
 
@@ -79,7 +78,9 @@ def execute_download(
             ],
             "noplaylist": True,
             "writethumbnail": True,
-            "extractor_args": {"youtube": {"player_client": ["web"]}},
+            "extractor_args": {
+                "youtube": {"player_client": list(config.YOUTUBE_PLAYER_CLIENTS)}
+            },
         }
     else:
         ydl_opts: Any = {
@@ -95,7 +96,9 @@ def execute_download(
             ],
             "noplaylist": True,
             "writethumbnail": True,
-            "extractor_args": {"youtube": {"player_client": ["web"]}},
+            "extractor_args": {
+                "youtube": {"player_client": list(config.YOUTUBE_PLAYER_CLIENTS)}
+            },
         }
 
     node_path = shutil.which("node")
@@ -161,6 +164,7 @@ def download_partial(
     cookies_browser: Optional[str] = None,
     cookies_file: Optional[str] = None,
     proxy: Optional[str] = None,
+    config: Optional[Config] = None,
 ) -> Optional[Path]:
     """
     Download a short partial clip for fingerprint verification.
@@ -170,6 +174,7 @@ def download_partial(
     token = uuid4().hex[:8]
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    config = config or Config()
 
     partial_base = output_dir / f"_partial_{token}"
     expected_mp3 = partial_base.with_suffix(".mp3")
@@ -193,7 +198,9 @@ def download_partial(
                 "preferredquality": "128",
             }
         ],
-        "extractor_args": {"youtube": {"player_client": ["web"]}},
+        "extractor_args": {
+            "youtube": {"player_client": list(config.YOUTUBE_PLAYER_CLIENTS)}
+        },
         "remote_components": ["ejs:github"],
     }
 

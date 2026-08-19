@@ -163,6 +163,7 @@ class DownloaderEvents:
         dur_ok: bool,
         actual_dur: int,
         silence_ratio: float,
+        silence_checked: bool = True,
     ) -> None:
         """Fired once with the combined post-check results."""
 

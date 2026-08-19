@@ -403,14 +403,17 @@ class RichEvents(DownloaderEvents):
         dur_ok: bool,
         actual_dur: int,
         silence_ratio: float,
+        silence_checked: bool = True,
     ) -> None:
         dur_label = (
             f"DURATION: {format_duration(actual_dur)} matches"
             if dur_ok
             else f"DURATION: mismatch {format_duration(actual_dur)}"
         )
-        if silence_ratio <= 0.0:
+        if not silence_checked:
             sil_label = "SILENCE: check disabled"
+        elif silence_ratio <= 0.0:
+            sil_label = "SILENCE: 0.0% -- normal"
         elif silence_ratio < 0.15:
             sil_label = f"SILENCE: {silence_ratio:.1%} -- normal"
         elif silence_ratio <= 0.30:
@@ -516,7 +519,6 @@ class RichEvents(DownloaderEvents):
         tbl = Table(
             title="[bold] Summary[/bold]",
             box=box.ROUNDED,
-            show_lines=True,
             caption=(
                 f" {len(downloaded)} success "
                 f" {len(skipped)} skipped "
@@ -525,17 +527,17 @@ class RichEvents(DownloaderEvents):
             ),
         )
         tbl.add_column("#", style="dim", width=4)
-        tbl.add_column("Artist", style="cyan", min_width=14)
-        tbl.add_column("Song", style="white", min_width=18)
-        tbl.add_column("Status", min_width=14)
-        tbl.add_column("Duration", style="yellow", width=10)
-        tbl.add_column("Fuzzy", style="magenta", width=6)
-        tbl.add_column("Score", width=7)
-        tbl.add_column("Fingerprint", width=16)
-        tbl.add_column("Silence", width=10)
-        tbl.add_column("MusicBrainz", style="blue", width=12)
-        tbl.add_column("Size", style="green", width=9)
-        tbl.add_column("File / Reason", style="dim", min_width=28)
+        tbl.add_column("Artist", style="cyan", overflow="ellipsis", ratio=2)
+        tbl.add_column("Song", style="white", overflow="ellipsis", ratio=3)
+        tbl.add_column("Status", overflow="ellipsis")
+        tbl.add_column("Duration", style="yellow", width=9)
+        tbl.add_column("Fuzzy", style="magenta", width=5)
+        tbl.add_column("Score", width=6)
+        tbl.add_column("Fingerprint", overflow="ellipsis", ratio=2)
+        tbl.add_column("Silence", width=8)
+        tbl.add_column("MusicBrainz", style="blue", width=8)
+        tbl.add_column("Size", style="green", width=8)
+        tbl.add_column("File / Reason", style="dim", overflow="ellipsis", ratio=2)
 
         for i, r in enumerate(results, 1):
             if r.status == "downloaded":
@@ -555,12 +557,15 @@ class RichEvents(DownloaderEvents):
             else:
                 score_cell = f"[red]{sc}[/red]" if sc > 0 else "--"
 
+            fl = r.fingerprint_label
             if r.fingerprint_verified:
                 fp_cell = f"[green]verified {r.fingerprint_confidence:.0%}[/green]"
-            elif r.fingerprint_confidence > 0:
-                fp_cell = "[yellow]no match[/yellow]"
+            elif fl and "disabled" not in fl:
+                fp_cell = f"[yellow]{fl[:14]}[/yellow]"
+            elif fl:
+                fp_cell = "[dim]disabled[/dim]"
             else:
-                fp_cell = "[dim]-- disabled[/dim]"
+                fp_cell = "[dim]--[/dim]"
 
             sil = r.silence_ratio
             if sil <= 0.0:
@@ -579,7 +584,7 @@ class RichEvents(DownloaderEvents):
 
             from rich.markup import escape
 
-            tbl.add_row(
+            row = [
                 str(i),
                 escape(str(r.artist)),
                 escape(str(r.song)),
@@ -592,6 +597,7 @@ class RichEvents(DownloaderEvents):
                 mb,
                 sz,
                 escape(str(detail)),
-            )
+            ]
+            tbl.add_row(*row)
 
         self.console.print(tbl)

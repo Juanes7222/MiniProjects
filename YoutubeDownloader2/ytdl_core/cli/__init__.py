@@ -31,6 +31,7 @@ from rich.panel import Panel
 
 from ..config import Config
 from ..core import MusicDownloader
+from ..result import DownloadResult
 from ..utils import check_ffmpeg
 
 # Re-export the submodules so ``from .cli import parse_args`` still works.
@@ -40,7 +41,69 @@ from .interactive import make_interactive_confirm, make_interactive_selector
 from .rich_ui import RichEvents  # noqa: F401
 
 
+def report_unverified(
+    console: Console, results: list[DownloadResult], output_dir: Path
+) -> None:
+    """Merge into not_verified.json the downloaded songs that AcoustID could
+    not confirm (keyed by artist::song), and show a block listing them so the
+    user can review them manually. Never clobbers previous runs."""
+    unverified = [
+        r
+        for r in results
+        if r.status in ("downloaded", "verified") and not r.fingerprint_verified
+    ]
+    if not unverified:
+        return
+
+    out_file = Path(output_dir) / "not_verified.json"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    merged: dict[str, dict] = {}
+    if out_file.exists():
+        try:
+            with out_file.open("r", encoding="utf-8") as fh:
+                for entry in json.load(fh):
+                    key = f"{entry.get('artist')}::{entry.get('song')}"
+                    merged[key] = entry
+        except (json.JSONDecodeError, OSError):
+            pass
+    for r in unverified:
+        key = f"{r.artist}::{r.song}"
+        merged[key] = {
+            "artist": r.artist,
+            "song": r.song,
+            "file_path": str(r.file_path) if r.file_path else None,
+            "fingerprint": r.fingerprint_label or "not attempted",
+            "composite_score": r.composite_score,
+        }
+    data = list(merged.values())
+    with out_file.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+
+    console.print(
+        Panel(
+            f"[yellow]{len(data)} downloaded songs were NOT confirmed by "
+            f"AcoustID fingerprint.[/yellow]\n"
+            f"Full list saved to: [cyan]{out_file.resolve()}[/cyan]\n\n"
+            + "\n".join(
+                f"  - [bold]{r.artist} -- {r.song}[/bold] ({r.fingerprint_label or 'not attempted'})"
+                for r in unverified[:25]
+            )
+            + (f"\n  ... and {len(unverified) - 25} more" if len(unverified) > 25 else ""),
+            title="[bold yellow] Fingerprint Not Verified[/bold yellow]",
+            border_style="yellow",
+        )
+    )
+
+
 def main() -> None:
+    # Force UTF-8 output so non-ASCII metadata (emoji, accented titles, etc.)
+    # never raises UnicodeEncodeError when stdout is redirected or codepage-limited.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     args = parse_args()
     config = Config()
 
@@ -112,6 +175,8 @@ def main() -> None:
             f"[bold]MusicBrainz:[/bold] {'enabled' if args.musicbrainz else 'disabled'} | "
             f"[bold]Dry run:[/bold] {'yes' if args.dry_run else 'no'}\n"
             f"[bold]AcoustID:[/bold] {acoustid_status}\n"
+            f"[bold]Fingerprint:[/bold] "
+            f"{'strict (download blocked unless confirmed)' if args.fingerprint_mode == 'strict' else 'lenient (report unverified)'}\n"
             f"[bold]Silence check:[/bold] "
             f"{'disabled' if args.no_silence_check else 'enabled'} | "
             f"[bold]Score threshold:[/bold] {args.score_threshold}",
@@ -168,12 +233,20 @@ def main() -> None:
             "https://github.com/example/yt-music-downloader",
         )
 
+    require_fingerprint = args.fingerprint_mode == "strict"
+    force_fingerprint = args.force_fingerprint or (
+        args.fingerprint_mode == "lenient"
+        and bool(args.acoustid_key)
+        and not args.skip_fingerprint
+    )
+
     dl = MusicDownloader(
         config=config,
         events=events,
         acoustid_key=args.acoustid_key,
-        force_fingerprint=args.force_fingerprint,
+        force_fingerprint=force_fingerprint,
         skip_fingerprint=args.skip_fingerprint,
+        require_fingerprint=require_fingerprint,
         no_silence_check=args.no_silence_check,
         score_threshold=args.score_threshold,
         sources=args.sources,
@@ -266,7 +339,7 @@ def main() -> None:
             reject_title=args.reject_title,
         )
     else:
-        dl.download_batch(
+        results = dl.download_batch(
             songs=songs,
             output_dir=args.output,
             fmt=args.format,
@@ -275,6 +348,7 @@ def main() -> None:
             report_formats=args.report or None,
             update_json_path=args.file if args.update_json else None,
         )
+        report_unverified(console, results or [], args.output)
 
     if not (getattr(args, "verify", False) or getattr(args, "repair", False)) and args.report:
         console.print(f"[green]  Reports saved to: {args.output.resolve()}[/green]")

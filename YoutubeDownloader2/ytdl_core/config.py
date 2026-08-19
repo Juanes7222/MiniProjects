@@ -24,6 +24,9 @@ class Config:
     DEFAULT_DELAY_MAX: float = 5.0
     DEFAULT_FUZZY_THRESHOLD: int = 65
     DEFAULT_SOURCES: List[str] = field(default_factory=lambda: ["youtube", "soundcloud"])
+    YOUTUBE_PLAYER_CLIENTS: List[str] = field(
+        default_factory=lambda: ["android", "mweb", "web_embedded"]
+    )
     SUPPORTED_FORMATS: List[str] = field(default_factory=lambda: ["mp3", "m4a", "opus", "mp4"])
     MUSICBRAINZ_APP: str = "YTMusicDownloader/2.0"
     STATE_FILE: str = ".download_state.json"

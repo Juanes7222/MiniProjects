@@ -91,6 +91,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-fingerprint", action="store_true")
     p.add_argument("--force-fingerprint", action="store_true")
     p.add_argument(
+        "--fingerprint-mode",
+        choices=["lenient", "strict"],
+        default="lenient",
+        help="lenient: download everything, attempt AcoustID on all songs and "
+        "report which ones could not be confirmed (default). "
+        "strict: only download a song when AcoustID confirms it; "
+        "unconfirmed songs are marked failed.",
+    )
+    p.add_argument(
         "--score-threshold", metavar="INT", type=int, default=_CONFIG.SCORE_THRESHOLD_REJECT
     )
     p.add_argument("--no-silence-check", action="store_true")

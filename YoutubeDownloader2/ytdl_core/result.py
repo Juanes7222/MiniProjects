@@ -39,6 +39,7 @@ class DownloadResult:
     fingerprint_verified: bool = False
     fingerprint_confidence: float = 0.0
     fingerprint_matched_title: Optional[str] = None
+    fingerprint_label: Optional[str] = None
     silence_ratio: float = 0.0
     duration_verified: bool = True
 

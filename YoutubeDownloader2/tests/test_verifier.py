@@ -77,6 +77,26 @@ class TestVerifySingle:
         assert result.duration_seconds == 180
         assert result.file_size_bytes == 60000
 
+    def test_strict_mode_fails_without_fingerprint_match(self, tmp_path, spy_events, config):
+        cb = AcoustIDCircuitBreaker()
+        sem = threading.Semaphore(2)
+        stop = threading.Event()
+
+        dest = tmp_path / "Artist" / "Song.mp3"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"\x00" * 60000)
+
+        with patch("ytdl_core.verifier.verify_duration", return_value=(True, 180)):
+            with patch(
+                "ytdl_core.verifier.verify_fingerprint", return_value=(False, 0.0, "")
+            ):
+                result = _verify_single(
+                    "Artist", "Song", tmp_path, "mp3", "KEY", config, cb, sem,
+                    False, spy_events, stop, require_fingerprint=True,
+                )
+        assert result.status == "failed"
+        assert "Fingerprint did not confirm" in result.reason
+
 
 class TestVerifyLibrary:
     def test_returns_empty_for_empty_songs(self, tmp_path, spy_events, config):

@@ -7,7 +7,6 @@ and reuse outside the main class.
 
 from __future__ import annotations
 
-import random
 import re
 import subprocess
 import threading
@@ -20,6 +19,26 @@ import mutagen
 from rapidfuzz import fuzz
 
 from .config import Config
+
+# AcoustID free-tier API limit: 3 requests/second. A single shared limiter
+# (lock + last-request timestamp) throttles ALL workers so parallel batches
+# never burst past the limit.
+ACOUSTID_RATE_PER_SECOND: float = 3.0
+_acoustid_lock = threading.Lock()
+_acoustid_last_request = 0.0
+
+
+def _wait_for_acoustid_slot() -> None:
+    """Block until the global AcoustID request budget allows another call."""
+    global _acoustid_last_request
+    min_interval = 1.0 / ACOUSTID_RATE_PER_SECOND
+    with _acoustid_lock:
+        now = time.time()
+        wait = min_interval - (now - _acoustid_last_request)
+        if wait > 0:
+            time.sleep(wait)
+            now = time.time()
+        _acoustid_last_request = now
 
 
 class AcoustIDCircuitBreaker:
@@ -54,6 +73,18 @@ class AcoustIDCircuitBreaker:
                 self._cooldown_until = time.time() + self._cooldown_duration
 
 
+def _artist_stem(name: str) -> str:
+    """Return the leading artist name, dropping feat./ft./featuring clauses.
+
+    'Barak feat. Marcos Yaroide' -> 'Barak'
+    """
+    if not name:
+        return ""
+    return re.split(
+        r"\s+(?:feat\.?|ft\.?|featuring|con)\s+", name, flags=re.IGNORECASE
+    )[0].strip()
+
+
 def verify_fingerprint(
     partial_path: Path,
     artist: str,
@@ -83,14 +114,9 @@ def verify_fingerprint(
 
     for attempt in range(max_retries):
         try:
-            # Random delay to be polite to the API
-            stop_time = random.uniform(3.0, 7.0)
-            if on_warn:
-                on_warn(
-                    f"[yellow]Applying random delay of {stop_time:.2f}s "
-                    f"before AcoustID request...[/yellow]"
-                )
-            time.sleep(stop_time)
+            # Global throttle: never exceed the AcoustID free-tier request rate,
+            # regardless of how many workers are running in parallel.
+            _wait_for_acoustid_slot()
 
             results = list(acoustid.match(acoustid_key, str(partial_path), meta="recordings"))
             best_conf = 0.0
@@ -99,7 +125,8 @@ def verify_fingerprint(
             for score, _rec_id, title, a in results:
                 if score < config.FINGERPRINT_MIN_CONFIDENCE:
                     continue
-                a_sim = fuzz.token_sort_ratio(artist.lower(), (a or "").lower())
+                a_sim = fuzz.token_sort_ratio(
+                    _artist_stem(artist).lower(), _artist_stem(a).lower())
                 t_sim = fuzz.token_sort_ratio(song.lower(), (title or "").lower())
                 if a_sim > 75 and t_sim > 75:
                     if on_info:

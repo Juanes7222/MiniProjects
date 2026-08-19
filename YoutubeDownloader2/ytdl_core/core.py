@@ -35,15 +35,16 @@ from .ytdlp_options import build_ytdlp_base_opts, make_progress_hook, resolve_do
 
 class MusicDownloader:
     def __init__(self, config=None, events=None, acoustid_key=None, force_fingerprint=False,
-                 skip_fingerprint=False, no_silence_check=False, score_threshold=None,
-                 sources=None, workers=2, delay=(2.0, 5.0), max_results=5, fuzzy_threshold=65,
-                 max_duration=None, min_duration=None, musicbrainz=False, cookies_browser=None,
-                 cookies_file=None, proxy=None):
+                 skip_fingerprint=False, require_fingerprint=False, no_silence_check=False,
+                 score_threshold=None, sources=None, workers=2, delay=(2.0, 5.0),
+                 max_results=5, fuzzy_threshold=65, max_duration=None, min_duration=None,
+                 musicbrainz=False, cookies_browser=None, cookies_file=None, proxy=None):
         self.config = config or Config()
         self.events = events or DownloaderEvents()
         self.acoustid_key = acoustid_key
         self.force_fingerprint = force_fingerprint
         self.skip_fingerprint = skip_fingerprint
+        self.require_fingerprint = require_fingerprint
         self.no_silence_check = no_silence_check
         self.score_threshold = score_threshold if score_threshold is not None else self.config.SCORE_THRESHOLD_REJECT
         self.sources = sources or list(self.config.DEFAULT_SOURCES)
@@ -58,7 +59,7 @@ class MusicDownloader:
         self.cookies_file = cookies_file
         self.proxy = proxy
         self.fpcalc_available = shutil.which("fpcalc") is not None
-        self._fp_semaphore = threading.Semaphore(2)
+        self._fp_semaphore = threading.Semaphore(3)
         self._circuit_breaker = AcoustIDCircuitBreaker(cooldown_seconds=60.0)
         self._selection_lock = threading.Lock()
 
@@ -128,7 +129,7 @@ class MusicDownloader:
         scan_opts = build_ytdlp_base_opts(output_dir, fmt, quality, quiet=False, no_warnings=False,
                                           progress_hook=None, skip_existing=False, max_downloads=max_downloads,
                                           cookies_browser=self.cookies_browser, cookies_file=self.cookies_file,
-                                          proxy=self.proxy, enable_remote_components=True, youtube_player_clients=["web"],
+                                          proxy=self.proxy, enable_remote_components=True, youtube_player_clients=list(self.config.YOUTUBE_PLAYER_CLIENTS),
                                           noplaylist=False, for_scan=True)
         try:
             with yt_dlp.YoutubeDL(scan_opts) as ydl:
@@ -190,7 +191,7 @@ class MusicDownloader:
                 output_dir, fmt, quality, quiet=True, no_warnings=True, progress_hook=hook,
                 skip_existing=skip_existing, cookies_browser=self.cookies_browser,
                 cookies_file=self.cookies_file, proxy=self.proxy, enable_remote_components=True,
-                youtube_player_clients=["web"], noplaylist=True, for_scan=False,
+                youtube_player_clients=list(self.config.YOUTUBE_PLAYER_CLIENTS), noplaylist=True, for_scan=False,
             )
             sf = output_dir / \
                 sanitize_filename(ia) / f"{sanitize_filename(it)}.{fmt}"
@@ -239,7 +240,8 @@ class MusicDownloader:
         return _verify_library(songs, Path(output_dir), fmt, self.workers, self.acoustid_key,
                                self.config, self._circuit_breaker, self._fp_semaphore,
                                self.musicbrainz, self.events, self._persist,
-                               load_state(Path(output_dir)), threading.Lock())
+                               load_state(Path(output_dir)), threading.Lock(),
+                               require_fingerprint=self.require_fingerprint)
 
     # Internal: single-song pipeline
 
@@ -311,6 +313,21 @@ class MusicDownloader:
         result.fingerprint_verified = fp_ok
         result.fingerprint_confidence = fp_conf
         result.fingerprint_matched_title = fp_title
+        result.fingerprint_label = fp_label
+        if self.require_fingerprint and not fp_ok:
+            self.events.on_warn(
+                f"[red]Strict fingerprint: cannot confirm "
+                f"[bold]{artist} -- {song}[/bold] ({fp_label or 'no match'}). "
+                f"Download blocked.[/red]"
+            )
+            result.status = "failed"
+            result.reason = "Fingerprint did not confirm the song"
+            self._persist(state, state_lock, key, "failed",
+                          url, None, None, output_dir)
+            return result
+        if result.url:
+            url = result.url
+            dur_s = result.duration_seconds or dur_s
         (output_dir / safe_a).mkdir(parents=True, exist_ok=True)
         self.events.on_download_start(artist, song, url)
         dl_file, err = execute_download(url, output_dir, fmt, quality, artist, song, self.events, self.config,
@@ -385,9 +402,9 @@ class MusicDownloader:
     def _fingerprint_check(self, artist, song, url, output_dir, best, ranked, result):
         fp_ok, fp_conf, fp_title, fp_label = False, 0.0, None, "disabled"
         sc = result.composite_score
-        needs = self.force_fingerprint or (bool(
+        needs = self.force_fingerprint or self.require_fingerprint or (bool(
             self.acoustid_key) and not self.skip_fingerprint and self.fpcalc_available and sc < self.config.SCORE_THRESHOLD_SKIP_FINGERPRINT)
-        if self.acoustid_key and sc >= self.config.SCORE_THRESHOLD_SKIP_FINGERPRINT:
+        if self.acoustid_key and sc >= self.config.SCORE_THRESHOLD_SKIP_FINGERPRINT and not self.require_fingerprint and not self.force_fingerprint:
             fp_label = f"skipped -- score {sc} >= threshold"
         elif self.acoustid_key and not self.fpcalc_available:
             fp_label = "disabled -- fpcalc not found"
@@ -414,10 +431,10 @@ class MusicDownloader:
                             artist, song, is_m, conf, t)
                         if is_m:
                             fp_ok, fp_label = True, f"verified {conf:.0%} conf."
-                        elif conf > 0.4:
-                            fp_label = f"low confidence ({t})"
-                            self.events.on_fingerprint_low_confidence(
-                                artist, song, t)
+                        elif conf > 0.4 or self.require_fingerprint:
+                            if conf > 0.4:
+                                self.events.on_fingerprint_low_confidence(
+                                    artist, song, t)
                             fp_ok, fp_conf, fp_title, fp_label = self._try_next_fp(
                                 ranked, artist, song, output_dir, result)
                         else:
@@ -451,7 +468,6 @@ class MusicDownloader:
             finally:
                 if np_ and np_.exists():
                     np_.unlink(missing_ok=True)
-            break
         return False, 0.0, None, "low confidence (no alternate match)"
 
     def _post_download_checks(self, f, artist, song, url, thumb, fmt, dur_s, state, state_lock, key, result, out):
@@ -471,7 +487,7 @@ class MusicDownloader:
                 self._persist(state, state_lock, key,
                               "failed", url, None, None, out)
                 return result
-        self.events.on_post_check_summary(artist, song, ok, actual, sil)
+        self.events.on_post_check_summary(artist, song, ok, actual, sil, not self.no_silence_check)
         mb, mb_e = enrich_musicbrainz(
             artist, song, self.musicbrainz, self.events)
         if not embed_and_verify(f, song, artist, url, thumb, fmt, mb, self.events):
@@ -492,7 +508,10 @@ class MusicDownloader:
         result.silence_ratio = sil
         result.duration_verified = ok
         self._persist(state, state_lock, key,
-                      "downloaded", url, str(f), md5, out)
+                      "downloaded", url, str(f), md5, out,
+                      fingerprint_verified=result.fingerprint_verified,
+                      fingerprint_confidence=result.fingerprint_confidence,
+                      fingerprint_label=result.fingerprint_label)
         return result
 
     @staticmethod
@@ -506,7 +525,9 @@ class MusicDownloader:
         yield data
 
     @staticmethod
-    def _persist(state, lock, key, status, url, file_path, md5, out, fingerprint_verified=False, preserve_timestamp=False):
+    def _persist(state, lock, key, status, url, file_path, md5, out,
+                 fingerprint_verified=False, fingerprint_confidence=0.0,
+                 fingerprint_label=None, preserve_timestamp=False):
         from datetime import datetime, timezone
         with lock:
             dl = state.setdefault("downloads", {})
@@ -514,5 +535,8 @@ class MusicDownloader:
             ts = ex.get("timestamp") if (
                 preserve_timestamp and ex and "timestamp" in ex) else datetime.now(timezone.utc).isoformat()
             dl[key] = {"status": status, "url": url, "file_path": file_path,
-                       "md5": md5, "fingerprint_verified": fingerprint_verified, "timestamp": ts}
+                       "md5": md5, "fingerprint_verified": fingerprint_verified,
+                       "fingerprint_confidence": fingerprint_confidence,
+                       "fingerprint_label": fingerprint_label,
+                       "timestamp": ts}
             save_state(state, out)
