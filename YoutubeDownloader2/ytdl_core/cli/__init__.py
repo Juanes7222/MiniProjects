@@ -16,6 +16,7 @@ arg_parser   – argparse definitions (``parse_args``)
 rich_ui      – ``RichEvents(DownloaderEvents)`` implementation
 dry_run      – dry-run preview table
 interactive  – keyboard/input candidate selection + ffplay preview
+review       – interactive manual review of unverified files
 """
 
 from __future__ import annotations
@@ -323,6 +324,20 @@ def main() -> None:
                 )
         else:
             console.print("[green]  All songs verified successfully![/green]")
+
+    elif getattr(args, "review", False):
+        from .review import run_interactive_review
+
+        run_interactive_review(
+            console=console,
+            dl=dl,
+            songs=songs,
+            output_dir=args.output,
+            fmt=args.format,
+            quality=args.quality,
+            only_suspects=args.review_only_suspects,
+            clip_seconds=args.review_clip_seconds,
+        )
 
     elif getattr(args, "url", None):
         console.print(f"[cyan]Downloading from URL: {args.url}[/cyan]")

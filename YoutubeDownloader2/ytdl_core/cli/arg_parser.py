@@ -8,7 +8,6 @@ a fully-validated ``argparse.Namespace``.
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 from ..config import Config
@@ -163,16 +162,42 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Verify the local library and automatically re-download missing or corrupted files.",
     )
+    mode.add_argument(
+        "--review",
+        action="store_true",
+        help="Interactively review fingerprint-unverified files: accept, delete, "
+        "re-download, re-run fingerprint, or listen before deciding.",
+    )
+
+    p.add_argument(
+        "--review-only-suspects",
+        action="store_true",
+        help="In --review, only show files AcoustID matched to a different song "
+        "(suspected wrong downloads).",
+    )
+
+    p.add_argument(
+        "--review-clip-seconds",
+        metavar="INT",
+        type=int,
+        default=12,
+        help="Length in seconds of the listening clip used by --review (default: 12)",
+    )
 
     args = p.parse_args()
 
     if args.url:
-        if args.verify or args.repair:
-            p.error("--verify and --repair cannot be used with --url")
+        if args.verify or args.repair or args.review:
+            p.error("--verify, --repair, and --review cannot be used with --url")
         if args.update_json:
             p.error("--update-json cannot be used with --url")
         if args.dry_run:
             p.error("--dry-run cannot be used with --url")
+
+    if args.review_only_suspects and not args.review:
+        p.error("--review-only-suspects requires --review")
+    if args.review and (args.verify or args.repair):
+        p.error("--review cannot be combined with --verify or --repair")
 
     args.workers = max(1, min(args.workers, _CONFIG.MAX_WORKERS))
     args.sources = [s.strip().lower() for s in args.sources.split(",") if s.strip()]
