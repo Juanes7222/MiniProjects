@@ -749,6 +749,32 @@ class TestDownloadUrl:
 
         assert any(c[0] == "on_download_failed" for c in spy.calls)
 
+    def test_results_api_returns_failures(self, dl, output_dir, spy):
+        with patch("ytdl_core.core.yt_dlp.YoutubeDL") as MockYDL:
+            instance = MockYDL.return_value.__enter__.return_value
+            instance.extract_info.side_effect = [
+                {
+                    "entries": [
+                        {
+                            "title": "Artist - Song",
+                            "uploader": "Channel",
+                            "duration": 200,
+                            "webpage_url": "http://example.com/1",
+                        }
+                    ]
+                },
+                RuntimeError("network error"),
+            ]
+
+            results = dl.download_url_results(
+                "http://example.com/playlist",
+                output_dir,
+            )
+
+        assert len(results) == 1
+        assert results[0].status == "failed"
+        assert "network error" in results[0].reason
+
     def test_no_entries(self, dl, output_dir, spy):
         with patch("ytdl_core.core.yt_dlp.YoutubeDL") as MockYDL:
             instance = MockYDL.return_value.__enter__.return_value

@@ -1,0 +1,20 @@
+[profiles.high-quality]
+output = "./downloads"
+format = "mp3"
+quality = "320"
+workers = 4
+delay = [1.0, 3.0]
+sources = ["youtube", "soundcloud"]
+musicbrainz = true
+skip-existing = true
+max-results = 8
+score-threshold = 30
+report = ["json"]
+
+[profiles.fast]
+output = "./downloads"
+format = "mp3"
+quality = "192"
+workers = 2
+skip-fingerprint = true
+no-silence-check = true

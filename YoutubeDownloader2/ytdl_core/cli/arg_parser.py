@@ -8,18 +8,55 @@ a fully-validated ``argparse.Namespace``.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from ..config import Config
+from ..profiles import ProfileError, load_profile
 
 _CONFIG = Config()
 
 
-def parse_args() -> argparse.Namespace:
+def _explicit_source_options(argv: list[str] | None) -> set[str]:
+    option_map = {
+        "--file": "file",
+        "--data": "data",
+        "--url": "url",
+        "--retry": "retry",
+    }
+    tokens = list(argv) if argv is not None else sys.argv[1:]
+    return {
+        option_map[token.split("=", 1)[0]]
+        for token in tokens
+        if token.split("=", 1)[0] in option_map
+    }
+
+
+def _validate_profile_choices(
+    parser: argparse.ArgumentParser,
+    settings: dict[str, object],
+    profile_name: str,
+) -> None:
+    actions = {action.dest: action for action in parser._actions}
+    for key, value in settings.items():
+        action = actions.get(key)
+        if action is None or not action.choices:
+            continue
+        values = value if isinstance(value, list) else [value]
+        invalid = [item for item in values if item not in action.choices]
+        if invalid:
+            parser.error(
+                f"Invalid value for '{key}' in profile '{profile_name}': "
+                f"{invalid[0]!r}. Expected one of {', '.join(map(str, action.choices))}"
+            )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="ytdl",
         description="YT Music Downloader v2.0 -- batch audio download with metadata",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
         epilog=(
             "Examples:\n"
             "  ytdl --file songs.json\n"
@@ -27,11 +64,13 @@ def parse_args() -> argparse.Namespace:
             "--workers 3 --musicbrainz --report json\n"
             "  ytdl --file songs.json --acoustid-key KEY --quality 320\n"
             "  ytdl --file songs.json --skip-fingerprint --no-silence-check\n"
-            '  ytdl --data \'{"Radiohead": ["Creep"]}\' --dry-run'
+            '  ytdl --data \'{"Radiohead": ["Creep"]}\' --dry-run\n'
+            "  ytdl --profile high-quality --file songs.json\n"
+            "  ytdl --output ./downloads --retry"
         ),
     )
 
-    src = p.add_mutually_exclusive_group(required=True)
+    src = p.add_mutually_exclusive_group()
     src.add_argument("--file", metavar="PATH", type=Path)
     src.add_argument("--data", metavar="JSON_STR")
     src.add_argument(
@@ -39,6 +78,23 @@ def parse_args() -> argparse.Namespace:
         metavar="URL",
         type=str,
         help="Download a playlist, channel, or video directly by URL",
+    )
+    src.add_argument(
+        "--retry",
+        action="store_true",
+        help="Retry songs saved in the output directory retry queue",
+    )
+
+    p.add_argument(
+        "--profile",
+        metavar="NAME",
+        help="Apply a profile from profiles.toml",
+    )
+    p.add_argument(
+        "--profiles-file",
+        metavar="PATH",
+        type=Path,
+        help="Path to profiles.toml",
     )
 
     p.add_argument("--output", metavar="DIR", type=Path, default=Path(_CONFIG.DEFAULT_OUTPUT_DIR))
@@ -265,7 +321,52 @@ def parse_args() -> argparse.Namespace:
         help="Length in seconds of the listening clip used by --review (default: 12)",
     )
 
-    args = p.parse_args()
+    known, _ = p.parse_known_args(argv)
+    if known.profiles_file and not known.profile:
+        p.error("--profiles-file requires --profile")
+
+    settings: dict[str, object] = {}
+    profiles_path = None
+    if known.profile:
+        allowed_keys = {
+            action.dest
+            for action in p._actions
+            if action.dest not in {"help", "profile", "profiles_file"}
+        }
+        try:
+            profiles_path, settings = load_profile(
+                known.profile,
+                known.profiles_file,
+                allowed_keys,
+            )
+        except ProfileError as error:
+            p.error(str(error))
+
+        explicit_sources = _explicit_source_options(argv)
+        if explicit_sources:
+            for option in ("file", "data", "url", "retry"):
+                settings.pop(option, None)
+        profile_sources = [
+            option for option in ("file", "data", "url", "retry") if settings.get(option)
+        ]
+        if len(profile_sources) > 1:
+            p.error(
+                f"Profile '{known.profile}' defines multiple sources: {', '.join(profile_sources)}"
+            )
+        _validate_profile_choices(p, settings, known.profile)
+        p.set_defaults(**settings)
+
+    args = p.parse_args(argv)
+    args.profiles_path = profiles_path
+    if known.report:
+        args.report = known.report
+
+    if args.retry and (args.verify or args.repair or args.review):
+        p.error("--retry cannot be combined with --verify, --repair, or --review")
+
+    sources = [args.file, args.data, args.url, args.retry]
+    if sum(source is not None and source is not False for source in sources) != 1:
+        p.error("exactly one of --file, --data, --url, or --retry is required")
 
     if args.url:
         if args.verify or args.repair or args.review:
@@ -305,5 +406,10 @@ def parse_args() -> argparse.Namespace:
         p.error("--kev cannot be used with --dry-run")
 
     args.workers = max(1, min(args.workers, _CONFIG.MAX_WORKERS))
-    args.sources = [s.strip().lower() for s in args.sources.split(",") if s.strip()]
+    raw_sources = (
+        args.sources.split(",")
+        if isinstance(args.sources, str)
+        else [str(source) for source in args.sources]
+    )
+    args.sources = [source.strip().lower() for source in raw_sources if source.strip()]
     return args

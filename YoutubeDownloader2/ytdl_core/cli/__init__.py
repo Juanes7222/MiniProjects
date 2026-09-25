@@ -44,6 +44,7 @@ def __getattr__(name: str):
         from .arg_parser import parse_args
 
         return parse_args
+
     if name == "RichEvents":
         from .rich_ui import RichEvents
 
@@ -107,6 +108,14 @@ def main() -> None:
     from rich.console import Console
     from rich.panel import Panel
 
+    from ..retry_queue import (
+        RetryQueueError,
+        load_retry_details,
+        queue_path,
+        read_retry_queue,
+        record_retry_queue,
+    )
+    from .action_summary import print_action_summary
     from .arg_parser import parse_args
     from .dry_run import dry_run_table
     from .interactive import make_interactive_confirm, make_interactive_selector
@@ -149,7 +158,28 @@ def main() -> None:
     songs: dict[str, list[str]]
     pairs: list[tuple[str, str]]
     try:
-        if args.url:
+        if args.retry:
+            retry_file = queue_path(args.output)
+            if not retry_file.is_file():
+                console.print(
+                    Panel(
+                        f"[red]Retry queue not found:[/red] {retry_file}",
+                        title="[bold red] Retry Queue[/bold red]",
+                        border_style="red",
+                    )
+                )
+                if log_fh:
+                    log_fh.close()
+                raise SystemExit(1)
+            try:
+                songs, warning = read_retry_queue(args.output)
+            except RetryQueueError as error:
+                console.print(f"[red]{error}[/red]")
+                raise SystemExit(1) from error
+            if warning:
+                console.print(f"[yellow]{warning}[/yellow]")
+            pairs = [(artist, song) for artist, song_list in songs.items() for song in song_list]
+        elif args.url:
             songs = {}
             pairs = []
         elif args.file:
@@ -176,6 +206,18 @@ def main() -> None:
             )
         )
         sys.exit(1)
+
+    if args.retry and not songs:
+        console.print(
+            Panel(
+                "[green]No pending retries.[/green]",
+                title="[bold green] Retry Queue[/bold green]",
+                border_style="green",
+            )
+        )
+        if log_fh:
+            log_fh.close()
+        return
 
     total = len(pairs)
 
@@ -379,7 +421,7 @@ def main() -> None:
                 )
 
                 # Force re-download by bypassing 'skip_existing'
-                dl.download_batch(
+                repair_results = dl.download_batch(
                     songs=missing_songs,
                     output_dir=args.output,
                     fmt=args.format,
@@ -387,6 +429,34 @@ def main() -> None:
                     skip_existing=False,
                     report_formats=args.report or None,
                     update_json_path=args.file if args.update_json else None,
+                )
+                queue_stats = record_retry_queue(args.output, repair_results or [])
+                print_action_summary(
+                    console,
+                    repair_results or [],
+                    args,
+                    queue_stats,
+                    load_retry_details(args.output),
+                )
+            else:
+                try:
+                    pending_songs, warning = read_retry_queue(args.output)
+                except RetryQueueError as error:
+                    pending_songs, warning = {}, str(error)
+                verify_queue_stats: dict[str, int | str] = {
+                    "pending": sum(len(items) for items in pending_songs.values()),
+                    "added": 0,
+                    "requeued": 0,
+                    "removed": 0,
+                }
+                if warning:
+                    verify_queue_stats["warning"] = warning
+                print_action_summary(
+                    console,
+                    all_results,
+                    args,
+                    verify_queue_stats,
+                    load_retry_details(args.output),
                 )
         else:
             console.print("[green]  All songs verified successfully![/green]")
@@ -409,7 +479,7 @@ def main() -> None:
         console.print(f"[cyan]Downloading from URL: {args.url}[/cyan]")
 
         limit_val = getattr(args, "limit", None)
-        dl.download_url(
+        url_results = dl.download_url_results(
             url=args.url,
             output_dir=args.output,
             fmt=args.format,
@@ -418,6 +488,14 @@ def main() -> None:
             skip_existing=args.skip_existing,
             match_title=args.match_title,
             reject_title=args.reject_title,
+        )
+        queue_stats = record_retry_queue(args.output, url_results or [])
+        print_action_summary(
+            console,
+            url_results or [],
+            args,
+            queue_stats,
+            load_retry_details(args.output),
         )
     else:
         results = dl.download_batch(
@@ -430,6 +508,14 @@ def main() -> None:
             update_json_path=args.file if args.update_json else None,
         )
         report_unverified(console, results or [], args.output)
+        queue_stats = record_retry_queue(args.output, results or [])
+        print_action_summary(
+            console,
+            results or [],
+            args,
+            queue_stats,
+            load_retry_details(args.output),
+        )
 
     if not (getattr(args, "verify", False) or getattr(args, "repair", False)) and args.report:
         console.print(f"[green]  Reports saved to: {args.output.resolve()}[/green]")

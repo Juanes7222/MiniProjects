@@ -230,6 +230,28 @@ class MusicDownloader:
         match_title=None,
         reject_title=None,
     ):
+        self.download_url_results(
+            url,
+            output_dir,
+            fmt,
+            quality,
+            max_downloads,
+            skip_existing,
+            match_title,
+            reject_title,
+        )
+
+    def download_url_results(
+        self,
+        url,
+        output_dir,
+        fmt="mp3",
+        quality="192",
+        max_downloads=None,
+        skip_existing=False,
+        match_title=None,
+        reject_title=None,
+    ) -> list[DownloadResult]:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         match_re = re.compile(match_title, re.IGNORECASE) if match_title else None
@@ -256,9 +278,9 @@ class MusicDownloader:
                 info = ydl.extract_info(url, download=False)
         except Exception as exc:
             self.events.on_download_failed("URL", url, str(exc))
-            return
+            return []
         if not info:
-            return
+            return []
         entries = list(self._iter_entries(info))
         urls = []
         for e in entries:
@@ -290,7 +312,7 @@ class MusicDownloader:
                 urls.append((uploader, title, iu))
         if not urls:
             self.events.on_warn("No suitable URLs found.")
-            return
+            return []
         self.events.on_session_start(len(urls))
         all_results = []
         lock = threading.Lock()
@@ -362,6 +384,7 @@ class MusicDownloader:
         except KeyboardInterrupt:
             stop.set()
         self.events.on_session_complete(all_results, time.monotonic() - start)
+        return all_results
 
     def verify_library(self, songs, output_dir, fmt="mp3"):
         return _verify_library(

@@ -35,6 +35,29 @@ After installing with the `cli` dependencies, you can use the command-line inter
 ytdl --help
 ```
 
+## Profiles
+
+Copy `profiles.example.toml` to `profiles.toml` and run:
+
+```bash
+ytdl --profile high-quality --file songs.json
+```
+
+Explicit command-line options always override profile values.
+
+## Retry queue
+
+Failed songs are saved to `retry_queue.json` inside the output directory. Retry
+only those songs with:
+
+```bash
+ytdl --output ./downloads --retry
+```
+
+Successful retries are removed from the queue automatically. The final summary
+shows pending retries, unverified files, and the exact command for the next
+recommended action.
+
 ## License
 
 This project is licensed under the MIT License.
