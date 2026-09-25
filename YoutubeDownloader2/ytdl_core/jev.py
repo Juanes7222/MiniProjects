@@ -16,7 +16,7 @@ class JevClassifier:
         self,
         project_root: Path | None = None,
         node_command: str = "node",
-        threshold: float = 0.75,
+        threshold: float = 0.60,
         timeout_seconds: int = 60,
     ) -> None:
         self.project_root = project_root or Path(__file__).resolve().parents[1]
@@ -29,6 +29,7 @@ class JevClassifier:
         artist: str,
         song: str,
         candidates: list[dict],
+        reference_metadata: dict | None = None,
     ) -> tuple[dict | None, list[tuple[dict, int, dict[str, int]]]]:
         if not candidates:
             return None, []
@@ -36,7 +37,11 @@ class JevClassifier:
         candidate_payloads = [self._candidate_payload(candidate, index) for index, candidate in enumerate(candidates)]
         payload = {
             "state": {
-                "target": {"artist": artist, "song": song},
+                "target": {
+                    "artist": artist,
+                    "song": song,
+                    "reference_metadata": self._reference_metadata(reference_metadata),
+                },
                 "candidates": candidate_payloads,
             },
             "candidates": [
@@ -124,6 +129,21 @@ class JevClassifier:
         return answers
 
     @staticmethod
+    def _reference_metadata(metadata: dict | None) -> dict[str, Any]:
+        if not isinstance(metadata, dict):
+            return {}
+        keys = ("album", "year", "genre", "track_num", "mb_id", "release_id")
+        return {key: metadata[key] for key in keys if metadata.get(key) not in (None, "")}
+
+    @staticmethod
+    def _first_value(candidate: dict, *keys: str) -> Any:
+        for key in keys:
+            value = candidate.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    @staticmethod
     def _candidate_payload(candidate: dict, index: int) -> dict[str, Any]:
         return {
             "key": f"candidate_{index}",
@@ -133,6 +153,14 @@ class JevClassifier:
             "duration_seconds": candidate.get("duration"),
             "source": str(candidate.get("_source") or "unknown"),
             "heuristic_score": candidate.get("_composite_score", 0),
+            "description": str(candidate.get("description") or "")[:1500],
+            "upload_date": JevClassifier._first_value(candidate, "upload_date", "release_date"),
+            "release_date": JevClassifier._first_value(candidate, "release_date", "upload_date"),
+            "album": candidate.get("album"),
+            "year": JevClassifier._first_value(candidate, "year", "release_year"),
+            "genre": candidate.get("genre"),
+            "view_count": candidate.get("view_count"),
+            "is_live": bool(candidate.get("is_live")),
         }
 
     @staticmethod

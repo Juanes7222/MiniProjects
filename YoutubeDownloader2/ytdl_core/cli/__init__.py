@@ -195,7 +195,12 @@ def main() -> None:
             log_fh.close()
         return
 
-    events = RichEvents(console, args.score_threshold, config)
+    events = RichEvents(
+        console,
+        args.score_threshold,
+        config,
+        jev_threshold=args.jev_threshold,
+    )
 
     if args.interactive:
         stop_event = threading.Event()

@@ -289,7 +289,7 @@ class MusicDownloader:
                     result.file_path = expected
                     return result
         apply_delay(self.delay[0], self.delay[1])
-        mb_dur = None
+        mb = None
         if self.musicbrainz:
             try:
                 mb = fetch_musicbrainz(artist, song)
@@ -299,9 +299,8 @@ class MusicDownloader:
                 mb = None
             if mb:
                 self.events.on_musicbrainz_result(artist, song, True, mb)
-                mb_dur = mb.get("duration_seconds")
         best, ranked, src = self._search_and_select(
-            artist, song, output_dir, state, state_lock, key, result, stop_event, mb_dur)
+            artist, song, output_dir, state, state_lock, key, result, stop_event, mb)
         if best is None:
             return result
         url = best.get("webpage_url") or best.get("url", "")
@@ -312,6 +311,9 @@ class MusicDownloader:
         result.fuzzy_score = int(fuzz.token_sort_ratio(
             f"{artist} {song}".lower(), (best.get("title") or "").lower()))
         result.duration_seconds = dur_s
+        result.heuristic_score = int(
+            best.get("_heuristic_score", best.get("_composite_score", 0))
+        )
         result.composite_score = best.get("_composite_score", 0)
         result.score_breakdown = best.get("_score_breakdown", {})
         result.jev_probability = best.get("_jev_probability")
@@ -351,9 +353,10 @@ class MusicDownloader:
             return result
         return self._post_download_checks(dl_file, artist, song, url, best.get("thumbnail"), fmt, dur_s, state, state_lock, key, result, output_dir)
 
-    def _search_and_select(self, artist, song, output_dir, state, state_lock, key, result, stop_event, mb_dur):
+    def _search_and_select(self, artist, song, output_dir, state, state_lock, key, result, stop_event, mb_data):
         opts = {"max_results": self.max_results, "cookies_browser": self.cookies_browser,
                 "cookies_file": self.cookies_file, "proxy": self.proxy}
+        mb_duration = mb_data.get("duration_seconds") if isinstance(mb_data, dict) else None
         best, ranked, src = None, [], None
         if stop_event.is_set():
             result.status = "skipped"
@@ -362,7 +365,7 @@ class MusicDownloader:
         raw = search_all_sources(artist, song, self.sources, opts)
         if raw:
             found, ranked = select_best_result(
-                raw, artist, song, mb_dur, self.config, None, None, self.min_duration, self.max_duration, self.score_threshold)
+                raw, artist, song, mb_duration, self.config, None, None, self.min_duration, self.max_duration, self.score_threshold)
             has_sel = hasattr(self.events, "selector_fn") and callable(
                 self.events.selector_fn)
             has_con = hasattr(self.events, "confirm_fn") and callable(
@@ -372,7 +375,10 @@ class MusicDownloader:
             elif self.jev_classifier is not None:
                 try:
                     jev_best, jev_ranked = self.jev_classifier.select(
-                        artist, song, [entry for entry, _, _ in ranked]
+                        artist,
+                        song,
+                        [entry for entry, _, _ in ranked],
+                        reference_metadata=mb_data,
                     )
                 except JevEvaluationError as exc:
                     result.selection_method = "jev"

@@ -49,7 +49,7 @@ class Config:
     COVER_KARAOKE_PENALTY: int = -50
     REACTION_REMIX_PENALTY: int = -50
     IDENTITY_OVERRIDE_THRESHOLD = 40
-    JEV_DEFAULT_THRESHOLD: float = 0.75
+    JEV_DEFAULT_THRESHOLD: float = 0.60
     
     FORBIDEN_TERMS = {
         "cover",

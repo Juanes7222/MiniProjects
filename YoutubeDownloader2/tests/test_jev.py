@@ -43,6 +43,50 @@ def test_selects_candidate_with_highest_probability(monkeypatch):
     assert ranked[0][0]["_heuristic_score"] == 110
 
 
+def test_candidate_payload_includes_release_metadata():
+    candidate = _candidate("Artist - Song", 120)
+    candidate.update(
+        {
+            "description": "Official album recording",
+            "upload_date": "20240102",
+            "album": "Album",
+            "year": "2024",
+            "genre": "Gospel",
+            "view_count": 1000,
+            "is_live": False,
+        }
+    )
+
+    payload = JevClassifier._candidate_payload(candidate, 0)
+
+    assert payload["description"] == "Official album recording"
+    assert payload["upload_date"] == "20240102"
+    assert payload["album"] == "Album"
+    assert payload["year"] == "2024"
+    assert payload["genre"] == "Gospel"
+    assert payload["view_count"] == 1000
+
+
+def test_select_includes_reference_metadata(monkeypatch):
+    classifier = JevClassifier()
+    captured = {}
+
+    def fake_evaluate(payload):
+        captured.update(payload)
+        return {"candidate_0": {"type": "boolean", "probability": 0.9}}
+
+    monkeypatch.setattr(classifier, "_evaluate", fake_evaluate)
+    classifier.select(
+        "Artist",
+        "Song",
+        [_candidate("Artist - Song", 120)],
+        reference_metadata={"album": "Reference Album", "year": "2024"},
+    )
+
+    reference = captured["state"]["target"]["reference_metadata"]
+    assert reference == {"album": "Reference Album", "year": "2024"}
+
+
 def test_rejects_when_probability_is_below_threshold(monkeypatch):
     classifier = JevClassifier(threshold=0.75)
     monkeypatch.setattr(

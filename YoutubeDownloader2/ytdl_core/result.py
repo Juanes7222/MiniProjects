@@ -23,6 +23,7 @@ class DownloadResult:
     matched_title: Optional[str] = None
     fuzzy_score: int = 0
 
+    heuristic_score: int = 0
     composite_score: int = 0
     score_breakdown: dict[str, int] = field(default_factory=dict)
     jev_probability: Optional[float] = None

@@ -42,10 +42,17 @@ class RichEvents(DownloaderEvents):
     is protected by self._lock.
     """
 
-    def __init__(self, console: Console, score_threshold: int, config: Config) -> None:
+    def __init__(
+        self,
+        console: Console,
+        score_threshold: int,
+        config: Config,
+        jev_threshold: float = 0.60,
+    ) -> None:
         self.console = console
         self.score_threshold = score_threshold
         self.config = config
+        self.jev_threshold = jev_threshold
         self._lock = threading.Lock()
 
         self._progress: Optional[Progress] = None
@@ -189,33 +196,63 @@ class RichEvents(DownloaderEvents):
         tbl.add_column("Title", max_width=55)
         tbl.add_column("Channel", max_width=30)
         tbl.add_column("Duration", width=10, style="yellow")
-        tbl.add_column("Score", width=7)
+        has_jev = any("_jev_probability" in entry for entry, _, _ in ranked)
+        if has_jev:
+            tbl.add_column("Jev", width=8)
+        tbl.add_column("Heur.", width=8)
         tbl.add_column("Top signals", min_width=30, style="dim")
 
-        best_idx = 0 if ranked and ranked[0][1] >= self.score_threshold else None
+        if has_jev:
+            best_idx = (
+                0
+                if float(ranked[0][0].get("_jev_probability") or 0) >= self.jev_threshold
+                else None
+            )
+        else:
+            best_idx = 0 if ranked[0][1] >= self.score_threshold else None
 
         for i, (entry, sc, bd) in enumerate(ranked):
             dur = int(entry.get("duration") or 0)
             title_str = (entry.get("title") or "")[:55]
             channel_str = (entry.get("channel") or entry.get("uploader") or "")[:30]
-            top = sorted(bd.items(), key=lambda kv: abs(kv[1]), reverse=True)[:3]
-            signals = ", ".join(f"{'+' if v >= 0 else ''}{v} {k}" for k, v in top)
-            if sc >= 70:
-                score_cell = f"[green]{sc}[/green]"
-            elif sc >= 30:
-                score_cell = f"[yellow]{sc}[/yellow]"
+            heuristic_score = int(entry.get("_heuristic_score", sc))
+            top = sorted(
+                ((key, value) for key, value in bd.items() if key != "jev_probability"),
+                key=lambda kv: abs(kv[1]),
+                reverse=True,
+            )[:3]
+            signals = ", ".join(
+                f"{'+' if value >= 0 else ''}{value} {key}" for key, value in top
+            )
+            if heuristic_score >= 70:
+                heuristic_cell = f"[green]{heuristic_score}[/green]"
+            elif heuristic_score >= 30:
+                heuristic_cell = f"[yellow]{heuristic_score}[/yellow]"
             else:
-                score_cell = f"[red]{sc}[/red]"
+                heuristic_cell = f"[red]{heuristic_score}[/red]"
 
-            prefix = ">" if i == best_idx else " "
-            tbl.add_row(
-                f"{prefix}{i + 1}",
+            row = [
+                f"{'>' if i == best_idx else ' '}{i + 1}",
                 title_str,
                 channel_str,
                 format_duration(dur),
-                score_cell,
-                signals,
-            )
+            ]
+            if has_jev:
+                probability = entry.get("_jev_probability")
+                if probability is None:
+                    jev_cell = "--"
+                else:
+                    probability = float(probability)
+                    jev_percent = int(round(probability * 100))
+                    if probability >= self.jev_threshold:
+                        jev_cell = f"[green]{jev_percent}%[/green]"
+                    elif probability >= self.jev_threshold - 0.15:
+                        jev_cell = f"[yellow]{jev_percent}%[/yellow]"
+                    else:
+                        jev_cell = f"[red]{jev_percent}%[/red]"
+                row.append(jev_cell)
+            row.extend([heuristic_cell, signals])
+            tbl.add_row(*row)
 
         self._print(tbl)
 
@@ -532,7 +569,8 @@ class RichEvents(DownloaderEvents):
         tbl.add_column("Status", overflow="ellipsis")
         tbl.add_column("Duration", style="yellow", width=9)
         tbl.add_column("Fuzzy", style="magenta", width=5)
-        tbl.add_column("Score", width=6)
+        tbl.add_column("Jev", width=7)
+        tbl.add_column("Heur.", width=7)
         tbl.add_column("Fingerprint", overflow="ellipsis", ratio=2)
         tbl.add_column("Silence", width=8)
         tbl.add_column("MusicBrainz", style="blue", width=8)
@@ -549,13 +587,24 @@ class RichEvents(DownloaderEvents):
             else:
                 status_cell = "[red] failed[/red]"
 
-            sc = r.composite_score
-            if sc >= 70:
-                score_cell = f"[green]{sc}[/green]"
-            elif sc >= 30:
-                score_cell = f"[yellow]{sc}[/yellow]"
+            if r.jev_probability is not None:
+                jev_value = int(round(r.jev_probability * 100))
+                if r.jev_probability >= self.jev_threshold:
+                    jev_cell = f"[green]{jev_value}%[/green]"
+                elif r.jev_probability >= self.jev_threshold - 0.15:
+                    jev_cell = f"[yellow]{jev_value}%[/yellow]"
+                else:
+                    jev_cell = f"[red]{jev_value}%[/red]"
             else:
-                score_cell = f"[red]{sc}[/red]" if sc > 0 else "--"
+                jev_cell = "--"
+
+            heuristic_score = r.heuristic_score or r.composite_score
+            if heuristic_score >= 70:
+                heuristic_cell = f"[green]{heuristic_score}[/green]"
+            elif heuristic_score >= 30:
+                heuristic_cell = f"[yellow]{heuristic_score}[/yellow]"
+            else:
+                heuristic_cell = f"[red]{heuristic_score}[/red]" if heuristic_score > 0 else "--"
 
             fl = r.fingerprint_label
             if r.fingerprint_verified:
@@ -591,7 +640,8 @@ class RichEvents(DownloaderEvents):
                 status_cell,
                 format_duration(int(dur)) if dur else "--",
                 str(r.fuzzy_score),
-                score_cell,
+                jev_cell,
+                heuristic_cell,
                 fp_cell,
                 sil_cell,
                 mb,
