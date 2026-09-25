@@ -41,9 +41,7 @@ def parse_args() -> argparse.Namespace:
         help="Download a playlist, channel, or video directly by URL",
     )
 
-    p.add_argument(
-        "--output", metavar="DIR", type=Path, default=Path(_CONFIG.DEFAULT_OUTPUT_DIR)
-    )
+    p.add_argument("--output", metavar="DIR", type=Path, default=Path(_CONFIG.DEFAULT_OUTPUT_DIR))
     p.add_argument(
         "--format",
         metavar="FORMAT",

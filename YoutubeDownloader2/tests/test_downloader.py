@@ -13,12 +13,20 @@ class TestExecuteDownload:
         with patch("ytdl_core.downloader.yt_dlp.YoutubeDL") as MockYDL:
             instance = MockYDL.return_value.__enter__.return_value
             from yt_dlp.utils import DownloadError
+
             instance.extract_info.side_effect = DownloadError("network error")
 
             stop = threading.Event()
             file, err = execute_download(
-                "http://example.com/video", tmp_path, "mp3", "192",
-                "Artist", "Song", spy_events, config, stop,
+                "http://example.com/video",
+                tmp_path,
+                "mp3",
+                "192",
+                "Artist",
+                "Song",
+                spy_events,
+                config,
+                stop,
             )
             assert file is None
             assert "DownloadError" in err
@@ -38,8 +46,15 @@ class TestExecuteDownload:
 
             stop = threading.Event()
             file, err = execute_download(
-                "http://example.com/video", tmp_path, "mp3", "192",
-                "Artist", "Song", spy_events, config, stop,
+                "http://example.com/video",
+                tmp_path,
+                "mp3",
+                "192",
+                "Artist",
+                "Song",
+                spy_events,
+                config,
+                stop,
             )
             assert file is not None
             assert file.exists()
@@ -50,8 +65,15 @@ class TestExecuteDownload:
         stop.set()  # pre-set
 
         file, err = execute_download(
-            "http://example.com/video", tmp_path, "mp3", "192",
-            "Artist", "Song", spy_events, config, stop,
+            "http://example.com/video",
+            tmp_path,
+            "mp3",
+            "192",
+            "Artist",
+            "Song",
+            spy_events,
+            config,
+            stop,
         )
         assert file is None
 
@@ -69,6 +91,7 @@ class TestExecuteDownload:
             call_count += 1
             if call_count == 1:
                 from yt_dlp.utils import DownloadError
+
                 raise DownloadError("first attempt fails")
             return {"title": "Song"}
 
@@ -80,8 +103,15 @@ class TestExecuteDownload:
             with patch("ytdl_core.downloader.time.sleep"):
                 stop = threading.Event()
                 file, err = execute_download(
-                    "http://example.com/video", tmp_path, "mp3", "192",
-                    "Artist", "Song", spy_events, config, stop,
+                    "http://example.com/video",
+                    tmp_path,
+                    "mp3",
+                    "192",
+                    "Artist",
+                    "Song",
+                    spy_events,
+                    config,
+                    stop,
                 )
             assert file is not None
             assert call_count == 2
@@ -97,14 +127,59 @@ class TestExecuteDownload:
             state = {"downloads": {}}
             lock = threading.Lock()
             file, err = execute_download(
-                "http://example.com/video", tmp_path, "mp3", "192",
-                "Artist", "Song", spy_events, config, stop,
-                state=state, state_lock=lock,
+                "http://example.com/video",
+                tmp_path,
+                "mp3",
+                "192",
+                "Artist",
+                "Song",
+                spy_events,
+                config,
+                stop,
+                state=state,
+                state_lock=lock,
             )
             assert file is None
             assert "Disk full" in err
             assert stop.is_set()
             assert any(c[0] == "on_disk_full" for c in spy_events.calls)
+
+    def test_disk_full_persists_while_holding_state_lock(self, tmp_path, spy_events, config):
+        class ObservableLock:
+            def __init__(self):
+                self.entered = False
+
+            def __enter__(self):
+                self.entered = True
+                return self
+
+            def __exit__(self, *_args):
+                self.entered = False
+
+        observed = []
+        lock = ObservableLock()
+        with patch("ytdl_core.downloader.yt_dlp.YoutubeDL") as MockYDL:
+            instance = MockYDL.return_value.__enter__.return_value
+            instance.extract_info.side_effect = OSError(28, "No space left on device")
+            with patch(
+                "ytdl_core.downloader.save_state",
+                side_effect=lambda *_args: observed.append(lock.entered),
+            ):
+                execute_download(
+                    "http://example.com/video",
+                    tmp_path,
+                    "mp3",
+                    "192",
+                    "Artist",
+                    "Song",
+                    spy_events,
+                    config,
+                    threading.Event(),
+                    state={"downloads": {}},
+                    state_lock=lock,
+                )
+
+        assert observed == [True]
 
 
 class TestDownloadPartial:
@@ -125,15 +200,26 @@ class TestDownloadPartial:
             assert result is None
 
     def test_returns_file_on_success(self, tmp_path, spy_events):
-        # The partial download creates a file matching _partial_{token}.*
-        fake = tmp_path / "_partial_abc12345.mp3"
-        fake.write_bytes(b"fake partial")
+        partial = tmp_path / "_partial_abc12345.mp3"
+        partial.write_bytes(b"fake partial")
 
-        with patch("ytdl_core.downloader.yt_dlp.YoutubeDL") as MockYDL:
-            instance = MockYDL.return_value.__enter__.return_value
-            instance.extract_info.return_value = {"title": "Test"}
-            instance.prepare_filename.return_value = str(tmp_path / "_partial_abc12345.webm")
+        class FixedUUID:
+            hex = "abc12345"
 
-            result = download_partial("http://example.com/video", tmp_path, spy_events)
-            # The function looks for the mp3 or glob matches
-            assert result is None or result.exists()
+        with patch("ytdl_core.downloader.uuid4", return_value=FixedUUID()):
+            with patch("ytdl_core.downloader.yt_dlp.YoutubeDL") as MockYDL:
+                instance = MockYDL.return_value.__enter__.return_value
+                instance.extract_info.return_value = {"title": "Test"}
+                instance.prepare_filename.return_value = str(tmp_path / "_partial_abc12345.webm")
+
+                result = download_partial(
+                    "http://example.com/video",
+                    tmp_path,
+                    spy_events,
+                )
+
+        options = MockYDL.call_args.args[0]
+        assert result == partial
+        assert options["download_ranges"]({}, MockYDL) == ({"start_time": 0.0, "end_time": 90.0},)
+        assert options["force_keyframes_at_cuts"] is True
+        assert options["postprocessor_args"] == {"ExtractAudio+ffmpeg": ["-t", "90"]}

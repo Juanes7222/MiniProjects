@@ -128,9 +128,7 @@ def _play_clip(path: Path, seconds: int) -> Any:
         kwargs: dict[str, Any] = {}
         if sys.platform == "win32":
             kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
-        return subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs
-        )
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
     except Exception:
         return None
 
@@ -147,12 +145,16 @@ def _stop_player(player: Any) -> None:
         pass
 
 
-def _update_state(output_dir: Path, key: str, **fields: Any) -> None:
-    """Reload the state from disk, apply *fields* to the entry, and save."""
-    state = load_state(output_dir)
+def _update_state(
+    output_dir: Path,
+    key: str,
+    state_filename: str | None = None,
+    **fields: Any,
+) -> None:
+    state = load_state(output_dir, state_filename)
     entry = state.setdefault("downloads", {}).setdefault(key, {})
     entry.update(fields)
-    save_state(state, output_dir)
+    save_state(state, output_dir, state_filename)
 
 
 def _run_fingerprint(dl: Any, path: Path, artist: str, song: str) -> tuple[bool, float, str]:
@@ -162,8 +164,14 @@ def _run_fingerprint(dl: Any, path: Path, artist: str, song: str) -> tuple[bool,
 
     with dl._fp_semaphore:
         return verify_fingerprint(
-            path, artist, song, dl.acoustid_key, dl.config, dl._circuit_breaker,
-            on_warn=dl.events.on_warn, on_info=dl.events.on_info,
+            path,
+            artist,
+            song,
+            dl.acoustid_key,
+            dl.config,
+            dl._circuit_breaker,
+            on_warn=dl.events.on_warn,
+            on_info=dl.events.on_info,
             on_fingerprint_error=dl.events.on_fingerprint_error,
         )
 
@@ -213,7 +221,7 @@ def _render(
         title = title[: width - 1] + "\u2026"
     pstr = str(path)
     if len(pstr) > width:
-        pstr = "\u2026" + pstr[-(width - 1):]
+        pstr = "\u2026" + pstr[-(width - 1) :]
     console.print(
         f"[bold cyan]{idx + 1}/{total}[/bold cyan]  [bold]{title}[/bold]{flag}  "
         f"[dim]{format_duration(dur)} | {size}[/dim]"
@@ -244,7 +252,7 @@ def run_interactive_review(
     clip_seconds: int = 12,
 ) -> None:
     output_dir = Path(output_dir)
-    state = load_state(output_dir)
+    state = load_state(output_dir, dl.config.STATE_FILE)
     candidates = _build_candidates(state, output_dir, fmt, songs, only_suspects)
 
     if not candidates:
@@ -288,7 +296,12 @@ def run_interactive_review(
                 key = b"s"
         else:
             try:
-                key = input("  [a]ccept [d]elete [r]edownload [f]ingerprint [l]isten [s]kip [q]uit: ").strip().lower()[:1].encode()
+                key = (
+                    input("  [a]ccept [d]elete [r]edownload [f]ingerprint [l]isten [s]kip [q]uit: ")
+                    .strip()
+                    .lower()[:1]
+                    .encode()
+                )
             except (EOFError, KeyboardInterrupt):
                 key = b"q"
 
@@ -298,7 +311,9 @@ def run_interactive_review(
 
         if key == b"a":
             _update_state(
-                output_dir, cand["key"],
+                output_dir,
+                cand["key"],
+                state_filename=dl.config.STATE_FILE,
                 status="verified",
                 fingerprint_verified=True,
                 fingerprint_label="manual verify (listened)",
@@ -307,7 +322,15 @@ def run_interactive_review(
             last_action = f"[green]Accepted: {cand['song']}[/green]"
             i += 1
         elif key == b"d":
-            _render(console, cand, i, len(candidates), stats, "[yellow]press \\[y] to confirm delete, any other key to cancel[/yellow]", first)
+            _render(
+                console,
+                cand,
+                i,
+                len(candidates),
+                stats,
+                "[yellow]press \\[y] to confirm delete, any other key to cancel[/yellow]",
+                first,
+            )
             if use_keyboard:
                 confirm = msvcrt.getch().lower() == b"y"
             else:
@@ -321,7 +344,9 @@ def run_interactive_review(
                 except OSError:
                     pass
                 _update_state(
-                    output_dir, cand["key"],
+                    output_dir,
+                    cand["key"],
+                    state_filename=dl.config.STATE_FILE,
                     status="deleted",
                     file_path=None,
                     md5=None,
@@ -337,7 +362,7 @@ def run_interactive_review(
             last_action = f"[cyan]Re-downloading {cand['song']} (strict)...[/cyan]"
             _render(console, cand, i, len(candidates), stats, last_action, first)
             _redownload(dl, cand["artist"], cand["song"], output_dir, fmt, quality)
-            state = load_state(output_dir)
+            state = load_state(output_dir, dl.config.STATE_FILE)
             refreshed = _build_candidates(state, output_dir, fmt, songs, only_suspects)
             try:
                 ni = next(k for k, c in enumerate(refreshed) if c["key"] == cand["key"])
@@ -354,7 +379,9 @@ def run_interactive_review(
             ok, conf, title = _run_fingerprint(dl, cand["path"], cand["artist"], cand["song"])
             if ok:
                 _update_state(
-                    output_dir, cand["key"],
+                    output_dir,
+                    cand["key"],
+                    state_filename=dl.config.STATE_FILE,
                     status="verified",
                     fingerprint_verified=True,
                     fingerprint_confidence=conf,
@@ -366,7 +393,9 @@ def run_interactive_review(
             else:
                 label = title if conf <= 0 else f"no match ({title or 'unknown'})"
                 _update_state(
-                    output_dir, cand["key"],
+                    output_dir,
+                    cand["key"],
+                    state_filename=dl.config.STATE_FILE,
                     fingerprint_confidence=conf,
                     fingerprint_label=label,
                 )
@@ -378,7 +407,9 @@ def run_interactive_review(
             if player is None:
                 last_action = "[red]clip failed (ffplay missing or unreadable file)[/red]"
             else:
-                last_action = "[cyan]playing in background -- continue reviewing with any key[/cyan]"
+                last_action = (
+                    "[cyan]playing in background -- continue reviewing with any key[/cyan]"
+                )
         elif key == b"s":
             stats["skip"] += 1
             last_action = f"[dim]skipped: {cand['song']}[/dim]"
@@ -389,7 +420,7 @@ def run_interactive_review(
             last_action = "[dim]unknown key -- a/d/r/f/l/s/q[/dim]"
 
     _stop_player(player)
-    _regenerate_not_verified(output_dir, songs)
+    _regenerate_not_verified(output_dir, songs, dl.config.STATE_FILE)
     console.print(
         Panel(
             f"[bold]Accepted:[/bold] {stats['accept']}\n"
@@ -405,10 +436,15 @@ def run_interactive_review(
     )
 
 
-def _regenerate_not_verified(output_dir: Path, songs: dict[str, list[str]]) -> None:
-    """Rebuild not_verified.json from state (scoped to *songs*)."""
-    scope = {f"{a}::{s}" for a, lst in songs.items() for s in (lst or [])}
-    state = load_state(output_dir)
+def _regenerate_not_verified(
+    output_dir: Path,
+    songs: dict[str, list[str]],
+    state_filename: str | None = None,
+) -> None:
+    scope = {
+        f"{artist}::{song}" for artist, artist_songs in songs.items() for song in artist_songs or []
+    }
+    state = load_state(output_dir, state_filename)
     rows = []
     for key, entry in state.get("downloads", {}).items():
         if scope and key not in scope:

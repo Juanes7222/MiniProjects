@@ -18,6 +18,7 @@ from ytdl_core.fingerprint import (
 # AcoustIDCircuitBreaker
 # ---------------------------------------------------------------------------
 
+
 class TestAcoustIDCircuitBreaker:
     def test_starts_closed(self):
         cb = AcoustIDCircuitBreaker(cooldown_seconds=60)
@@ -45,6 +46,7 @@ class TestAcoustIDCircuitBreaker:
 # ---------------------------------------------------------------------------
 # verify_duration
 # ---------------------------------------------------------------------------
+
 
 class TestVerifyDuration:
     def test_returns_false_for_nonexistent_file(self, tmp_path):
@@ -80,13 +82,13 @@ class TestVerifyDuration:
 # verify_fingerprint (unit-level, mocked acoustid)
 # ---------------------------------------------------------------------------
 
+
 class TestVerifyFingerprint:
     def test_returns_no_key_when_no_key(self, tmp_path, config):
         from ytdl_core.fingerprint import AcoustIDCircuitBreaker
+
         cb = AcoustIDCircuitBreaker()
-        ok, conf, title = verify_fingerprint(
-            tmp_path / "x.mp3", "Artist", "Song", "", config, cb
-        )
+        ok, conf, title = verify_fingerprint(tmp_path / "x.mp3", "Artist", "Song", "", config, cb)
         assert ok is False
         assert conf == 0.0
         assert title == "no_key"
@@ -105,7 +107,12 @@ class TestVerifyFingerprint:
         cb = AcoustIDCircuitBreaker()
         with patch("ytdl_core.fingerprint.acoustid.match", side_effect=RuntimeError("boom")):
             ok, conf, title = verify_fingerprint(
-                tmp_path / "x.mp3", "Artist", "Song", "KEY", config, cb,
+                tmp_path / "x.mp3",
+                "Artist",
+                "Song",
+                "KEY",
+                config,
+                cb,
                 on_fingerprint_error=lambda a, s, e: None,
             )
         assert ok is False
@@ -114,10 +121,17 @@ class TestVerifyFingerprint:
 
     def test_rate_limit_trips_breaker(self, tmp_path, config):
         cb = AcoustIDCircuitBreaker(cooldown_seconds=60)
-        with patch("ytdl_core.fingerprint.acoustid.match", side_effect=Exception("error 429 rate limit")):
+        with patch(
+            "ytdl_core.fingerprint.acoustid.match", side_effect=Exception("error 429 rate limit")
+        ):
             with patch("ytdl_core.fingerprint.time.sleep"):
                 ok, conf, title = verify_fingerprint(
-                    tmp_path / "x.mp3", "Artist", "Song", "KEY", config, cb,
+                    tmp_path / "x.mp3",
+                    "Artist",
+                    "Song",
+                    "KEY",
+                    config,
+                    cb,
                     on_warn=lambda m: None,
                 )
         assert ok is False
@@ -128,6 +142,7 @@ class TestVerifyFingerprint:
 # ---------------------------------------------------------------------------
 # _artist_stem
 # ---------------------------------------------------------------------------
+
 
 class TestArtistStem:
     def test_plain_artist_unchanged(self):
@@ -152,6 +167,7 @@ class TestArtistStem:
 # verify_fingerprint with featured artists (mocked acoustid)
 # ---------------------------------------------------------------------------
 
+
 class TestVerifyFingerprintFeaturing:
     def test_matches_when_artist_has_feat_credit(self, tmp_path, config):
         """A recording credited 'Barak feat. Marcos Yaroide' must still match
@@ -159,9 +175,12 @@ class TestVerifyFingerprintFeaturing:
         cb = AcoustIDCircuitBreaker()
         fake = tmp_path / "fake.mp3"
         fake.write_bytes(b"x")
-        with patch("ytdl_core.fingerprint.acoustid.match", return_value=[
-            (0.95, "rec1", "Sumérgeme en tu gloria", "Barak feat. Marcos Yaroide"),
-        ]):
+        with patch(
+            "ytdl_core.fingerprint.acoustid.match",
+            return_value=[
+                (0.95, "rec1", "Sumérgeme en tu gloria", "Barak feat. Marcos Yaroide"),
+            ],
+        ):
             ok, conf, title = verify_fingerprint(
                 fake, "Barak", "Sumérgeme en Tu Gloria", "KEY", config, cb
             )
@@ -173,9 +192,12 @@ class TestVerifyFingerprintFeaturing:
         cb = AcoustIDCircuitBreaker()
         fake = tmp_path / "fake.mp3"
         fake.write_bytes(b"x")
-        with patch("ytdl_core.fingerprint.acoustid.match", return_value=[
-            (0.96, "rec1", "Levántate y resplandece", "Marco Barrientos"),
-        ]):
+        with patch(
+            "ytdl_core.fingerprint.acoustid.match",
+            return_value=[
+                (0.96, "rec1", "Levántate y resplandece", "Marco Barrientos"),
+            ],
+        ):
             ok, conf, title = verify_fingerprint(
                 fake, "Barak", "Levántate y Resplandece", "KEY", config, cb
             )
@@ -186,6 +208,7 @@ class TestVerifyFingerprintFeaturing:
 # ---------------------------------------------------------------------------
 # has_excessive_silence (integration with ffmpeg)
 # ---------------------------------------------------------------------------
+
 
 class TestHasExcessiveSilence:
     def test_returns_false_for_missing_file(self, tmp_path, config):

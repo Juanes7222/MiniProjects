@@ -1,42 +1,11 @@
-"""
-Report export (JSON / CSV / M3U8) and --update-json rewriter.
-"""
-
 from __future__ import annotations
 
 import csv
-import json
-import shutil
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List
+from typing import Any
 
-
-def export_report(results: List[dict], output_dir: Path, formats: List[str]) -> None:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    for fmt in formats:
-        if fmt == "json":
-            _write_json(results, output_dir, ts)
-        elif fmt == "csv":
-            _write_csv(results, output_dir, ts)
-        elif fmt == "m3u":
-            _write_m3u(results, output_dir, ts)
-
-
-def update_json_file(path: Path, results: List[dict]) -> None:
-    annotated: dict = {}
-    for r in results:
-        artist, song = r.get("artist", ""), r.get("song", "")
-        annotated.setdefault(artist, {})
-        entry = {"status": r.get("status", "unknown")}
-        if r.get("status") in ("downloaded", "verified"):
-            entry["file"] = r.get("file_path", "")
-        elif r.get("status") == "failed":
-            entry["reason"] = r.get("reason", "Unknown error")
-        annotated[artist][song] = entry
-    _atomic_write(path, annotated)
-
+from .json_io import write_json_atomic
 
 _CSV_FIELDS = [
     "artist",
@@ -68,51 +37,92 @@ _CSV_FIELDS = [
 ]
 
 
-def _write_json(results, output_dir, ts):
-    dl = sum(1 for r in results if r.get("status") in ("downloaded", "verified"))
-    fail = sum(1 for r in results if r.get("status") == "failed")
-    skip = sum(1 for r in results if r.get("status") == "skipped")
+def export_report(
+    results: list[dict[str, Any]],
+    output_dir: Path,
+    formats: list[str],
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    writers = {
+        "json": _write_json,
+        "csv": _write_csv,
+        "m3u": _write_m3u,
+    }
+    for output_format in formats:
+        writer = writers.get(output_format)
+        if writer:
+            writer(results, output_dir, timestamp)
+
+
+def update_json_file(path: Path, results: list[dict[str, Any]]) -> None:
+    annotated: dict[str, dict[str, dict[str, str]]] = {}
+    for result in results:
+        artist = result.get("artist", "")
+        song = result.get("song", "")
+        entry: dict[str, str] = {"status": result.get("status", "unknown")}
+        if result.get("status") in ("downloaded", "verified"):
+            entry["file"] = result.get("file_path", "")
+        elif result.get("status") == "failed":
+            entry["reason"] = result.get("reason", "Unknown error")
+        annotated.setdefault(artist, {})[song] = entry
+    write_json_atomic(path, annotated)
+
+
+def _write_json(
+    results: list[dict[str, Any]],
+    output_dir: Path,
+    timestamp: str,
+) -> None:
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "summary": {"total": len(results), "downloaded": dl, "failed": fail, "skipped": skip},
+        "summary": {
+            "total": len(results),
+            "downloaded": sum(
+                result.get("status") in ("downloaded", "verified") for result in results
+            ),
+            "failed": sum(result.get("status") == "failed" for result in results),
+            "skipped": sum(result.get("status") == "skipped" for result in results),
+        },
         "tracks": results,
     }
-    dest = output_dir / f"download_report_{ts}.json"
-    with dest.open("w", encoding="utf-8") as fh:
-        json.dump(report, fh, indent=2, ensure_ascii=False)
+    write_json_atomic(output_dir / f"download_report_{timestamp}.json", report)
 
 
-def _write_csv(results, output_dir, ts):
-    dest = output_dir / f"download_report_{ts}.csv"
-    with dest.open("w", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.DictWriter(fh, fieldnames=_CSV_FIELDS, extrasaction="ignore")
+def _write_csv(
+    results: list[dict[str, Any]],
+    output_dir: Path,
+    timestamp: str,
+) -> None:
+    destination = output_dir / f"download_report_{timestamp}.csv"
+    with destination.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=_CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(results)
 
 
-def _write_m3u(results, output_dir, ts):
-    dest = output_dir / f"playlist_{ts}.m3u8"
-    with dest.open("w", encoding="utf-8") as fh:
-        fh.write("#EXTM3U\n")
-        for r in results:
-            if r.get("status") not in ("downloaded", "verified") or not r.get("file_path"):
+def _write_m3u(
+    results: list[dict[str, Any]],
+    output_dir: Path,
+    timestamp: str,
+) -> None:
+    destination = output_dir / f"playlist_{timestamp}.m3u8"
+    with destination.open("w", encoding="utf-8") as file:
+        file.write("#EXTM3U\n")
+        for result in results:
+            if result.get("status") not in ("downloaded", "verified"):
                 continue
-            fp = r["file_path"]
-            duration = r.get("duration_seconds", -1)
+            file_path = result.get("file_path")
+            if not file_path:
+                continue
             try:
-                rel = "./" + str(Path(fp).relative_to(output_dir)).replace("\\", "/")
+                relative_path = "./" + str(Path(file_path).relative_to(output_dir)).replace(
+                    "\\", "/"
+                )
             except ValueError:
-                rel = fp
-            fh.write(f"#EXTINF:{duration},{r.get('artist', '')} - {r.get('song', '')}\n")
-            fh.write(f"{rel}\n")
-
-
-def _atomic_write(path: Path, data: dict) -> None:
-    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-    try:
-        with open(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False)
-        shutil.move(tmp, str(path))
-    except Exception:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+                relative_path = file_path
+            file.write(
+                f"#EXTINF:{result.get('duration_seconds', -1)},"
+                f"{result.get('artist', '')} - {result.get('song', '')}\n"
+            )
+            file.write(f"{relative_path}\n")

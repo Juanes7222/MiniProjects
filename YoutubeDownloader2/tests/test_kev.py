@@ -30,13 +30,15 @@ def test_kev_uses_local_systemone_api(monkeypatch):
     selected, ranked = classifier.select(
         "Artist",
         "Song",
-        [{
-            "title": "Artist - Song",
-            "channel": "Official Artist",
-            "duration": 200,
-            "_composite_score": 100,
-            "_score_breakdown": {"base_match": 100},
-        }],
+        [
+            {
+                "title": "Artist - Song",
+                "channel": "Official Artist",
+                "duration": 200,
+                "_composite_score": 100,
+                "_score_breakdown": {"base_match": 100},
+            }
+        ],
     )
 
     assert selected is not None
@@ -57,10 +59,16 @@ def test_kev_connection_error_is_actionable(monkeypatch):
     monkeypatch.setattr(requests, "post", fake_post)
 
     with pytest.raises(JevEvaluationError, match="server is unavailable"):
-        classifier.select("Artist", "Song", [{
-            "title": "Artist - Song",
-            "channel": "Official Artist",
-            "duration": 200,
-            "_composite_score": 100,
-            "_score_breakdown": {},
-        }])
+        classifier.select(
+            "Artist",
+            "Song",
+            [
+                {
+                    "title": "Artist - Song",
+                    "channel": "Official Artist",
+                    "duration": 200,
+                    "_composite_score": 100,
+                    "_score_breakdown": {},
+                }
+            ],
+        )

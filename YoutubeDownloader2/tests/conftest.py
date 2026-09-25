@@ -72,7 +72,9 @@ class SpyEvents(DownloaderEvents):
         self._record("on_download_start", artist, song, url)
 
     def on_download_progress(self, artist, song, percent, speed_bps, downloaded_bytes, total_bytes):
-        self._record("on_download_progress", artist, song, percent, speed_bps, downloaded_bytes, total_bytes)
+        self._record(
+            "on_download_progress", artist, song, percent, speed_bps, downloaded_bytes, total_bytes
+        )
 
     def on_download_retry(self, artist, song, attempt, max_attempts, error, wait_seconds):
         self._record("on_download_retry", artist, song, attempt, max_attempts, error, wait_seconds)
@@ -92,9 +94,17 @@ class SpyEvents(DownloaderEvents):
     def on_silence_rejected(self, artist, song, silence_ratio):
         self._record("on_silence_rejected", artist, song, silence_ratio)
 
-    def on_post_check_summary(self, artist, song, dur_ok, actual_dur, silence_ratio, silence_checked=True):
+    def on_post_check_summary(
+        self, artist, song, dur_ok, actual_dur, silence_ratio, silence_checked=True
+    ):
         self._record(
-            "on_post_check_summary", artist, song, dur_ok, actual_dur, silence_ratio, silence_checked
+            "on_post_check_summary",
+            artist,
+            song,
+            dur_ok,
+            actual_dur,
+            silence_ratio,
+            silence_checked,
         )
 
     def on_musicbrainz_result(self, artist, song, enriched, data):

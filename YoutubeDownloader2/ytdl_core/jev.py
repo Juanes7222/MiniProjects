@@ -14,6 +14,7 @@ class JevEvaluationError(RuntimeError):
 
 class JevClassifier:
     provider_name = "Jev"
+
     def __init__(
         self,
         project_root: Path | None = None,
@@ -21,7 +22,12 @@ class JevClassifier:
         threshold: float = 0.60,
         timeout_seconds: int = 60,
     ) -> None:
-        self.project_root = project_root or Path(__file__).resolve().parents[1]
+        package_root = Path(__file__).resolve().parent
+        source_root = package_root.parent
+        default_root = (
+            source_root if (source_root / "tools" / "jev.mts").is_file() else package_root
+        )
+        self.project_root = project_root or default_root
         self.node_command = node_command
         self.threshold = threshold
         self.timeout_seconds = timeout_seconds
@@ -40,8 +46,7 @@ class JevClassifier:
             raise JevEvaluationError(f"{self.provider_name} runs must be at least 1")
 
         candidate_payloads = [
-            self._candidate_payload(candidate, index)
-            for index, candidate in enumerate(candidates)
+            self._candidate_payload(candidate, index) for index, candidate in enumerate(candidates)
         ]
         payload = {
             "state": {
@@ -95,9 +100,7 @@ class JevClassifier:
             }
             evaluated.append((entry, decision_score, entry["_score_breakdown"]))
 
-        evaluated.sort(
-            key=lambda item: (item[1], item[0].get("_heuristic_score", 0)), reverse=True
-        )
+        evaluated.sort(key=lambda item: (item[1], item[0].get("_heuristic_score", 0)), reverse=True)
         if not evaluated or evaluated[0][0]["_decision_probability"] < self.threshold:
             return None, evaluated
 
@@ -249,7 +252,5 @@ class JevClassifier:
                 f"{self.provider_name} returned an invalid probability"
             ) from exc
         if not math.isfinite(probability) or not 0 <= probability <= 1:
-            raise JevEvaluationError(
-                f"{self.provider_name} returned an invalid probability"
-            )
+            raise JevEvaluationError(f"{self.provider_name} returned an invalid probability")
         return probability

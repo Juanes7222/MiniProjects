@@ -2,6 +2,8 @@
 .env.*
 !.env.example
 node_modules/
+graphify-out/
+dist/
 __pycache__/
 .pytest_cache/
 .ruff_cache/

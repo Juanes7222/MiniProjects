@@ -209,9 +209,7 @@ def download_audio(
             "extractor_retries": int(opts.get("extractor_retries", 10)),
             "file_access_retries": int(opts.get("file_access_retries", 5)),
             "socket_timeout": int(opts.get("socket_timeout", 30)),
-            "concurrent_fragment_downloads": int(
-                opts.get("concurrent_fragment_downloads", 4)
-            ),
+            "concurrent_fragment_downloads": int(opts.get("concurrent_fragment_downloads", 4)),
             "ffmpeg_location": str(ffmpeg_location),
             "final_ext": fmt,
         }

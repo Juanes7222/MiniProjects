@@ -13,7 +13,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from uuid import uuid4
 
 import yt_dlp
@@ -23,7 +23,14 @@ from .config import Config
 from .events import DownloaderEvents
 from .state import save_state
 from .utils import sanitize_filename
-from .ytdlp_options import make_progress_hook, resolve_downloaded_file
+from .ytdlp_options import build_ytdlp_base_opts, make_progress_hook, resolve_downloaded_file
+
+
+def _download_section(seconds: int) -> Callable[[dict, Any], tuple[dict[str, float], ...]]:
+    def resolve_section(_info: dict, _downloader: Any) -> tuple[dict[str, float], ...]:
+        return ({"start_time": 0.0, "end_time": float(seconds)},)
+
+    return resolve_section
 
 
 def execute_download(
@@ -56,64 +63,24 @@ def execute_download(
     """
     safe_artist = sanitize_filename(artist)
     safe_song = sanitize_filename(song)
-    is_video = fmt == "mp4"
-    if is_video:
-        output_template = str(output_dir / safe_artist / f"{safe_song}.mp4")
-    else:
-        output_template = str(output_dir / safe_artist / f"{safe_song}.%(ext)s")
-
+    output_template = output_dir / safe_artist / f"{safe_song}.{fmt}"
     progress_hook = make_progress_hook(events, artist, song)
-
-    ydl_opts: Any
-    if is_video:
-        ydl_opts = {
-            "format": f"bestvideo[height<={quality}]+bestaudio/bestvideo[height<={quality}]/best",
-            "outtmpl": output_template,
-            "merge_output_format": "mp4",
-            "quiet": True,
-            "no_warnings": True,
-            "progress_hooks": [progress_hook],
-            "postprocessors": [
-                {"key": "FFmpegMetadata"},
-                {"key": "EmbedThumbnail", "already_have_thumbnail": False},
-            ],
-            "noplaylist": True,
-            "writethumbnail": True,
-            "extractor_args": {
-                "youtube": {"player_client": list(config.YOUTUBE_PLAYER_CLIENTS)}
-            },
-        }
-    else:
-        ydl_opts = {
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-            "outtmpl": output_template,
-            "quiet": True,
-            "no_warnings": True,
-            "progress_hooks": [progress_hook],
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": fmt, "preferredquality": quality},
-                {"key": "FFmpegMetadata"},
-                {"key": "EmbedThumbnail", "already_have_thumbnail": False},
-            ],
-            "noplaylist": True,
-            "writethumbnail": True,
-            "extractor_args": {
-                "youtube": {"player_client": list(config.YOUTUBE_PLAYER_CLIENTS)}
-            },
-        }
-
-    node_path = shutil.which("node")
-    if node_path:
-        ydl_opts["js_runtimes"] = {"node": {"path": node_path}}
-
-    ydl_opts["remote_components"] = ["ejs:github"]
-
-    if cookies_browser:
-        ydl_opts["cookiesfrombrowser"] = (cookies_browser,)
-    if cookies_file:
-        ydl_opts["cookiefile"] = str(cookies_file)
-    if proxy:
-        ydl_opts["proxy"] = proxy
+    ydl_opts = build_ytdlp_base_opts(
+        output_dir=output_dir,
+        fmt=fmt,
+        quality=quality,
+        quiet=True,
+        no_warnings=True,
+        progress_hook=progress_hook,
+        cookies_browser=cookies_browser,
+        cookies_file=cookies_file,
+        proxy=proxy,
+        enable_remote_components=True,
+        youtube_player_clients=list(config.YOUTUBE_PLAYER_CLIENTS),
+        noplaylist=True,
+        output_template=output_template,
+        embed_thumbnail=False,
+    )
 
     downloaded_file: Optional[Path] = None
     last_error = ""
@@ -140,7 +107,8 @@ def execute_download(
                 events.on_disk_full()
                 stop_event.set()
                 if state is not None and state_lock is not None:
-                    save_state(state, output_dir)
+                    with state_lock:
+                        save_state(state, output_dir, config.STATE_FILE)
                 last_error = "Disk full"
                 return None, last_error
             last_error = f"OSError: {exc}"
@@ -192,6 +160,11 @@ def download_partial(
         "retries": 5,
         "fragment_retries": 5,
         "extractor_retries": 5,
+        "download_ranges": _download_section(config.PARTIAL_DOWNLOAD_SECONDS),
+        "force_keyframes_at_cuts": True,
+        "postprocessor_args": {
+            "ExtractAudio+ffmpeg": ["-t", str(config.PARTIAL_DOWNLOAD_SECONDS)],
+        },
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -199,9 +172,7 @@ def download_partial(
                 "preferredquality": "128",
             }
         ],
-        "extractor_args": {
-            "youtube": {"player_client": list(config.YOUTUBE_PLAYER_CLIENTS)}
-        },
+        "extractor_args": {"youtube": {"player_client": list(config.YOUTUBE_PLAYER_CLIENTS)}},
         "remote_components": ["ejs:github"],
     }
 

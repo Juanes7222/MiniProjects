@@ -1,5 +1,3 @@
-"""Allow ``python -m ytdl_core.cli`` to invoke the CLI."""
-
-from . import main
+from ..cli_entry import main
 
 main()

@@ -1,56 +1,37 @@
-"""
-Persistent state cache: load, save (atomically), and update download records.
-
-State file structure:
-{
-  "downloads": {
-    "{artist}::{song}": {
-      "status": "downloaded" | "failed" | "skipped",
-      "url": "https://...",
-      "file_path": "...",
-      "md5": "...",
-      "timestamp": "ISO8601"
-    }
-  }
-}
-"""
-
 from __future__ import annotations
 
 import json
-import shutil
-import tempfile
 from pathlib import Path
+from typing import Any
 
 from .config import Config
+from .json_io import write_json_atomic
 
-_CFG = Config()
-
-
-def load_state(output_dir: Path) -> dict:
-    """Load the state JSON from *output_dir*, or return an empty skeleton."""
-    path = output_dir / _CFG.STATE_FILE
-    if path.exists():
-        try:
-            with path.open("r", encoding="utf-8") as fh:
-                return json.load(fh)
-        except (json.JSONDecodeError, OSError):
-            return {"downloads": {}}
-    return {"downloads": {}}
+_DEFAULT_STATE_FILENAME = Config().STATE_FILE
 
 
-def save_state(state: dict, output_dir: Path) -> None:
-    """Write *state* to disk atomically (temp-file + rename)."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    dest = output_dir / _CFG.STATE_FILE
-    fd, tmp = tempfile.mkstemp(dir=output_dir, suffix=".tmp")
+def load_state(
+    output_dir: Path,
+    state_filename: str | None = None,
+) -> dict[str, Any]:
+    path = Path(output_dir) / (state_filename or _DEFAULT_STATE_FILENAME)
     try:
-        with open(fd, "w", encoding="utf-8") as fh:
-            json.dump(state, fh, indent=2, ensure_ascii=False)
-        shutil.move(tmp, str(dest))
-    except Exception:
-        try:
-            Path(tmp).unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+        with path.open("r", encoding="utf-8") as file:
+            state = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"downloads": {}}
+    if not isinstance(state, dict) or not isinstance(state.get("downloads"), dict):
+        return {"downloads": {}}
+    state["downloads"] = {
+        key: entry for key, entry in state["downloads"].items() if isinstance(entry, dict)
+    }
+    return state
+
+
+def save_state(
+    state: dict[str, Any],
+    output_dir: Path,
+    state_filename: str | None = None,
+) -> None:
+    path = Path(output_dir) / (state_filename or _DEFAULT_STATE_FILENAME)
+    write_json_atomic(path, state)

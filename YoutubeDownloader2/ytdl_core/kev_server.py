@@ -49,9 +49,7 @@ class KevServerManager:
         if self._healthy():
             info = self._server_info()
             if not self._server_uses_cuda(info):
-                raise KevServerError(
-                    "A Kev server is already running, but it is not using CUDA"
-                )
+                raise KevServerError("A Kev server is already running, but it is not using CUDA")
             self._step("Kev: CUDA server is already available; reusing it")
             return self.url
 
@@ -153,8 +151,8 @@ class KevServerManager:
     def _install_cuda_torch(self) -> None:
         if "CUDA=True" in self._cuda_probe():
             return
-        python_path = self.root / ".venv" / (
-            "Scripts/python.exe" if os.name == "nt" else "bin/python"
+        python_path = (
+            self.root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         )
         self._step("Kev: installing CUDA-enabled PyTorch")
         self._run(
@@ -237,9 +235,8 @@ class KevServerManager:
         log_path = self.root / "ytdl-kev.log"
         self.log_file = log_path.open("a", encoding="utf-8")
         if os.name == "nt":
-            creationflags = (
-                getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
             )
             start_new_session = False
         else:
@@ -319,8 +316,10 @@ class KevServerManager:
                 job, 9, ctypes.byref(info), ctypes.sizeof(info)
             )
             process_handle = getattr(self.process, "_handle", None)
-            assigned = configured and process_handle is not None and kernel32.AssignProcessToJobObject(
-                job, process_handle
+            assigned = (
+                configured
+                and process_handle is not None
+                and kernel32.AssignProcessToJobObject(job, process_handle)
             )
             if not assigned:
                 kernel32.CloseHandle(job)

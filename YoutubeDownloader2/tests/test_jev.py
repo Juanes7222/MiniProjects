@@ -18,6 +18,14 @@ def _candidate(title: str, score: int) -> dict:
     }
 
 
+def test_default_project_root_contains_bridge():
+    classifier = JevClassifier()
+    script = (classifier.project_root / "tools" / "jev.mts").read_text(encoding="utf-8")
+
+    assert script.count("fetch(") == 1
+    assert "from 'ai'" not in script
+
+
 def test_selects_candidate_with_highest_probability(monkeypatch):
     classifier = JevClassifier(threshold=0.75)
     monkeypatch.setattr(

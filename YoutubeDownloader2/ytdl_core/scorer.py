@@ -16,7 +16,12 @@ from typing import Optional
 from rapidfuzz import fuzz
 
 from .config import Config
-from .utils import contains_forbidden_phrase, normalize_title, remove_matching_noise, strip_featuring
+from .utils import (
+    contains_forbidden_phrase,
+    normalize_title,
+    remove_matching_noise,
+    strip_featuring,
+)
 
 
 def score_youtube_result(
@@ -42,13 +47,13 @@ def score_youtube_result(
     view_count: int = int(entry.get("view_count") or 0)
     result_duration: int = int(entry.get("duration") or 0)
     breakdown: dict[str, int] = {}
-
     artist_clean = normalize_title(strip_featuring(artist.lower()))
     song_clean = normalize_title(strip_featuring(song.lower()))
+    forbidden_match = contains_forbidden_phrase(raw_title, config.FORBIDEN_TERMS)
+    forbidden_in_query = contains_forbidden_phrase(f"{artist} {song}", config.FORBIDEN_TERMS)
+    if forbidden_match and not forbidden_in_query:
+        return -9999, {f"hard_reject_{forbidden_match}": -9999}
 
-    # ------------------------------------------------------------------
-    # Fast-path: YouTube Music API catalog entries
-    # ------------------------------------------------------------------
     if entry.get("_source") == "ytmusic_api":
         title_clean = normalize_title(strip_featuring(raw_title.lower()))
         song_match = int(
@@ -57,9 +62,7 @@ def score_youtube_result(
             + fuzz.ratio(song_clean, title_clean) * 0.4
         )
 
-        ytmusic_artist_names = [
-            normalize_title(a) for a in (entry.get("artists") or []) if a
-        ]
+        ytmusic_artist_names = [normalize_title(a) for a in (entry.get("artists") or []) if a]
         ytmusic_artist_names.append(normalize_title(channel))
         artist_match = max(
             (
@@ -97,18 +100,8 @@ def score_youtube_result(
 
             return sum(breakdown.values()), breakdown
 
-    # ------------------------------------------------------------------
-    # Standard yt-dlp scraping path
-    # ------------------------------------------------------------------
     title_tokens = set(title.split())
     query_song_tokens = set(song_clean.split())
-
-    bad_found = contains_forbidden_phrase(raw_title, config.FORBIDEN_TERMS)
-    query_text = f"{artist} {song}"
-    bad_in_query = contains_forbidden_phrase(query_text, config.FORBIDEN_TERMS)
-
-    if bad_found and not bad_in_query:
-        return -9999, {f"hard_reject_{bad_found}": -9999}
 
     if "album" in title_tokens and "album" not in query_song_tokens:
         return -9999, {"hard_reject_full_album": -9999}

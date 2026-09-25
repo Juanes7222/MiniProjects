@@ -63,17 +63,13 @@ def preview_candidate(
                 candidates = [
                     f
                     for f in info.get("formats", [])
-                    if f.get("vcodec") == "none"
-                    and f.get("acodec") != "none"
-                    and f.get("url")
+                    if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url")
                 ]
             else:
                 candidates = [
                     f
                     for f in info.get("formats", [])
-                    if f.get("vcodec") != "none"
-                    and f.get("acodec") != "none"
-                    and f.get("url")
+                    if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url")
                 ]
 
             if candidates:
@@ -333,9 +329,7 @@ def make_interactive_selector(
                 if idx < 0 or idx >= len(ranked):
                     with interactive_lock:
                         with console_lock:
-                            console.print(
-                                f"  [red]Invalid index. Must be 1-{len(ranked)}.[/red]"
-                            )
+                            console.print(f"  [red]Invalid index. Must be 1-{len(ranked)}.[/red]")
                     continue
 
                 preview_type = "video" if choice.startswith("v") else "audio"
@@ -369,9 +363,7 @@ def make_interactive_selector(
             if idx < 0 or idx >= len(ranked):
                 with interactive_lock:
                     with console_lock:
-                        console.print(
-                            f"  [red]Invalid index. Must be 1-{len(ranked)}.[/red]"
-                        )
+                        console.print(f"  [red]Invalid index. Must be 1-{len(ranked)}.[/red]")
                 continue
 
             entry, sc, _bd = ranked[idx]

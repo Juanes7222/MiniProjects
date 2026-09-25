@@ -80,9 +80,7 @@ def _artist_stem(name: str) -> str:
     """
     if not name:
         return ""
-    return re.split(
-        r"\s+(?:feat\.?|ft\.?|featuring|con)\s+", name, flags=re.IGNORECASE
-    )[0].strip()
+    return re.split(r"\s+(?:feat\.?|ft\.?|featuring|con)\s+", name, flags=re.IGNORECASE)[0].strip()
 
 
 def verify_fingerprint(
@@ -125,8 +123,7 @@ def verify_fingerprint(
             for score, _rec_id, title, a in results:
                 if score < config.FINGERPRINT_MIN_CONFIDENCE:
                     continue
-                a_sim = fuzz.token_sort_ratio(
-                    _artist_stem(artist).lower(), _artist_stem(a).lower())
+                a_sim = fuzz.token_sort_ratio(_artist_stem(artist).lower(), _artist_stem(a).lower())
                 t_sim = fuzz.token_sort_ratio(song.lower(), (title or "").lower())
                 if a_sim > 75 and t_sim > 75:
                     if on_info:
@@ -226,9 +223,7 @@ def has_excessive_silence(file_path: Path, config: Config) -> tuple[bool, float]
         return False, 0.0
 
 
-def verify_duration(
-    path: Path, expected: int, tolerance: float = 0.20
-) -> tuple[bool, int]:
+def verify_duration(path: Path, expected: int, tolerance: float = 0.20) -> tuple[bool, int]:
     """
     Compare the actual audio duration against the expected value.
 

@@ -8,7 +8,7 @@ into formatted terminal output, then wires everything together in main().
 Entry point (after ``pip install ytdl-core[cli]``):
 
     ytdl --file songs.json --quality 320 --musicbrainz
-    python -m ytdl_core.cli --file songs.json --acoustid-key KEY
+    python -m ytdl_core.cli_entry --file songs.json --acoustid-key KEY
 
 Submodules
 ----------
@@ -27,9 +27,7 @@ import shutil
 import sys
 import threading
 from pathlib import Path
-
-from rich.console import Console
-from rich.panel import Panel
+from typing import TYPE_CHECKING
 
 from ..config import Config
 from ..core import MusicDownloader
@@ -37,23 +35,30 @@ from ..kev_server import KevServerError, KevServerManager
 from ..result import DownloadResult
 from ..utils import check_ffmpeg
 
-# Re-export the submodules so ``from .cli import parse_args`` still works.
-from .arg_parser import parse_args  # noqa: F401
-from .dry_run import dry_run_table
-from .interactive import make_interactive_confirm, make_interactive_selector
-from .rich_ui import RichEvents  # noqa: F401
+if TYPE_CHECKING:
+    from rich.console import Console
 
 
-def report_unverified(
-    console: Console, results: list[DownloadResult], output_dir: Path
-) -> None:
+def __getattr__(name: str):
+    if name == "parse_args":
+        from .arg_parser import parse_args
+
+        return parse_args
+    if name == "RichEvents":
+        from .rich_ui import RichEvents
+
+        return RichEvents
+    raise AttributeError(name)
+
+
+def report_unverified(console: "Console", results: list[DownloadResult], output_dir: Path) -> None:
     """Merge into not_verified.json the downloaded songs that AcoustID could
     not confirm (keyed by artist::song), and show a block listing them so the
     user can review them manually. Never clobbers previous runs."""
+    from rich.panel import Panel
+
     unverified = [
-        r
-        for r in results
-        if r.status in ("downloaded", "verified") and not r.fingerprint_verified
+        r for r in results if r.status in ("downloaded", "verified") and not r.fingerprint_verified
     ]
     if not unverified:
         return
@@ -99,6 +104,14 @@ def report_unverified(
 
 
 def main() -> None:
+    from rich.console import Console
+    from rich.panel import Panel
+
+    from .arg_parser import parse_args
+    from .dry_run import dry_run_table
+    from .interactive import make_interactive_confirm, make_interactive_selector
+    from .rich_ui import RichEvents
+
     # Force UTF-8 output so non-ASCII metadata (emoji, accented titles, etc.)
     # never raises UnicodeEncodeError when stdout is redirected or codepage-limited.
     for stream in (sys.stdout, sys.stderr):
@@ -146,18 +159,14 @@ def main() -> None:
                 str(artist): [str(song) for song in (lst or [])]
                 for artist, lst in file_songs.items()
             }
-            pairs = [
-                (artist, song) for artist, lst in songs.items() for song in (lst or [])
-            ]
+            pairs = [(artist, song) for artist, lst in songs.items() for song in (lst or [])]
         else:
             data_songs: dict[str, list[str]] = json.loads(args.data)
             songs = {
                 str(artist): [str(song) for song in (lst or [])]
                 for artist, lst in data_songs.items()
             }
-            pairs = [
-                (artist, song) for artist, lst in songs.items() for song in (lst or [])
-            ]
+            pairs = [(artist, song) for artist, lst in songs.items() for song in (lst or [])]
     except (json.JSONDecodeError, OSError) as exc:
         console.print(
             Panel(
@@ -285,40 +294,42 @@ def main() -> None:
 
     require_fingerprint = args.fingerprint_mode == "strict"
     force_fingerprint = args.force_fingerprint or (
-        args.fingerprint_mode == "lenient"
-        and bool(args.acoustid_key)
-        and not args.skip_fingerprint
+        args.fingerprint_mode == "lenient" and bool(args.acoustid_key) and not args.skip_fingerprint
     )
 
-    dl = MusicDownloader(
-        config=config,
-        events=events,
-        acoustid_key=args.acoustid_key,
-        force_fingerprint=force_fingerprint,
-        skip_fingerprint=args.skip_fingerprint,
-        require_fingerprint=require_fingerprint,
-        no_silence_check=args.no_silence_check,
-        score_threshold=args.score_threshold,
-        sources=args.sources,
-        workers=args.workers,
-        delay=tuple(args.delay),
-        max_results=args.max_results,
-        fuzzy_threshold=args.fuzzy_threshold,
-        max_duration=args.max_duration,
-        min_duration=args.min_duration,
-        musicbrainz=args.musicbrainz,
-        cookies_browser=args.cookies_browser,
-        cookies_file=str(args.cookies) if args.cookies else None,
-        proxy=args.proxy,
-        use_jev=args.jev,
-        use_kev=args.kev,
-        jev_threshold=args.jev_threshold,
-        jev_runs=args.jev_runs,
-        kev_threshold=args.kev_threshold,
-        kev_runs=args.kev_runs,
-        kev_url=args.kev_url,
-        kev_model=args.kev_model,
-    )
+    try:
+        dl = MusicDownloader(
+            config=config,
+            events=events,
+            acoustid_key=args.acoustid_key,
+            force_fingerprint=force_fingerprint,
+            skip_fingerprint=args.skip_fingerprint,
+            require_fingerprint=require_fingerprint,
+            no_silence_check=args.no_silence_check,
+            score_threshold=args.score_threshold,
+            sources=args.sources,
+            workers=args.workers,
+            delay=tuple(args.delay),
+            max_results=args.max_results,
+            fuzzy_threshold=args.fuzzy_threshold,
+            max_duration=args.max_duration,
+            min_duration=args.min_duration,
+            musicbrainz=args.musicbrainz,
+            cookies_browser=args.cookies_browser,
+            cookies_file=str(args.cookies) if args.cookies else None,
+            proxy=args.proxy,
+            use_jev=args.jev,
+            use_kev=args.kev,
+            jev_threshold=args.jev_threshold,
+            jev_runs=args.jev_runs,
+            kev_threshold=args.kev_threshold,
+            kev_runs=args.kev_runs,
+            kev_url=args.kev_url,
+            kev_model=args.kev_model,
+        )
+    except (RuntimeError, ValueError) as error:
+        console.print(f"[red]{error}[/red]")
+        raise SystemExit(1) from error
 
     if getattr(args, "verify", False) or getattr(args, "repair", False):
         if getattr(args, "repair", False):
@@ -358,9 +369,7 @@ def main() -> None:
             out_missing = args.output / "missing_songs.json"
             with out_missing.open("w", encoding="utf-8") as f:
                 _json.dump(missing_songs, f, indent=2, ensure_ascii=False)
-            console.print(
-                f"[yellow]  Generated missing/failed songs to: {out_missing}[/yellow]"
-            )
+            console.print(f"[yellow]  Generated missing/failed songs to: {out_missing}[/yellow]")
 
             if getattr(args, "repair", False):
                 total_missing = sum(len(lst) for lst in missing_songs.values())

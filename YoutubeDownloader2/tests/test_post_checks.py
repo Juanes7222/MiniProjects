@@ -16,6 +16,7 @@ from ytdl_core.post_checks import (
 # check_duration
 # ---------------------------------------------------------------------------
 
+
 class TestCheckDuration:
     def test_ok_when_duration_matches(self, real_mp3, spy_events):
         ok, actual, fail = check_duration(real_mp3, 3, "Artist", "Song", spy_events)
@@ -41,6 +42,7 @@ class TestCheckDuration:
 # ---------------------------------------------------------------------------
 # check_silence
 # ---------------------------------------------------------------------------
+
 
 class TestCheckSilence:
     def test_returns_normal_for_real_audio(self, real_mp3, config, spy_events):
@@ -68,6 +70,7 @@ class TestCheckSilence:
 # enrich_musicbrainz
 # ---------------------------------------------------------------------------
 
+
 class TestEnrichMusicBrainz:
     def test_returns_none_when_disabled(self, spy_events):
         data, enriched = enrich_musicbrainz("Artist", "Song", False, spy_events)
@@ -94,18 +97,33 @@ class TestEnrichMusicBrainz:
 # embed_and_verify
 # ---------------------------------------------------------------------------
 
+
 class TestEmbedAndVerify:
     def test_returns_true_on_success(self, real_mp3, spy_events):
         with patch("ytdl_core.post_checks.embed_metadata", return_value=True):
             result = embed_and_verify(
-                real_mp3, "Song", "Artist", "http://url", None, "mp3", None, spy_events,
+                real_mp3,
+                "Song",
+                "Artist",
+                "http://url",
+                None,
+                "mp3",
+                None,
+                spy_events,
             )
             assert result is True
 
     def test_deletes_file_on_failure(self, real_mp3, spy_events):
         with patch("ytdl_core.post_checks.embed_metadata", return_value=False):
             result = embed_and_verify(
-                real_mp3, "Song", "Artist", "http://url", None, "mp3", None, spy_events,
+                real_mp3,
+                "Song",
+                "Artist",
+                "http://url",
+                None,
+                "mp3",
+                None,
+                spy_events,
             )
             assert result is False
             assert not real_mp3.exists()
@@ -114,7 +132,9 @@ class TestEmbedAndVerify:
     def test_passes_mb_data_correctly(self, real_mp3, spy_events):
         mb = {"album": "MB Album", "year": "2023", "genre": "Rock"}
         with patch("ytdl_core.post_checks.embed_metadata", return_value=True) as mock_embed:
-            embed_and_verify(real_mp3, "Song", "Artist", "http://url", "http://thumb", "mp3", mb, spy_events)
+            embed_and_verify(
+                real_mp3, "Song", "Artist", "http://url", "http://thumb", "mp3", mb, spy_events
+            )
             args = mock_embed.call_args
             assert args[0][4] == "http://thumb"  # thumbnail_url
             extra = args[0][3]

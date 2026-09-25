@@ -17,6 +17,7 @@ def config():
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _yt(title, channel="Official Artist", duration=200, **kwargs):
     """Build a minimal yt-dlp-style candidate dict."""
     d = {"title": title, "channel": channel, "uploader": channel, "duration": duration}
@@ -42,47 +43,76 @@ def _api(title, artists=None, channel="Artist Topic", duration=200, **kwargs):
 # Hard rejection gates (standard yt-dlp path)
 # ===================================================================
 
+
 class TestHardRejection:
     def test_rejects_cover(self, config):
         score, bd = score_youtube_result(
-            _yt("Artist - Song (Cover)"), "Artist", "Song", None, config,
+            _yt("Artist - Song (Cover)"),
+            "Artist",
+            "Song",
+            None,
+            config,
         )
         assert score == -9999
         assert "hard_reject_cover" in bd
 
     def test_rejects_karaoke(self, config):
         score, bd = score_youtube_result(
-            _yt("Artist - Song Karaoke Version"), "Artist", "Song", None, config,
+            _yt("Artist - Song Karaoke Version"),
+            "Artist",
+            "Song",
+            None,
+            config,
         )
         assert score == -9999
 
     def test_rejects_remix(self, config):
         score, bd = score_youtube_result(
-            _yt("Artist - Song (Official Remix)"), "Artist", "Song", None, config,
+            _yt("Artist - Song (Official Remix)"),
+            "Artist",
+            "Song",
+            None,
+            config,
         )
         assert score == -9999
 
     def test_rejects_live(self, config):
         score, bd = score_youtube_result(
-            _yt("Artist - Song Live at Concert"), "Artist", "Song", None, config,
+            _yt("Artist - Song Live at Concert"),
+            "Artist",
+            "Song",
+            None,
+            config,
         )
         assert score == -9999
 
     def test_rejects_nightcore(self, config):
         score, bd = score_youtube_result(
-            _yt("Artist - Song (Nightcore)"), "Artist", "Song", None, config,
+            _yt("Artist - Song (Nightcore)"),
+            "Artist",
+            "Song",
+            None,
+            config,
         )
         assert score == -9999
 
     def test_rejects_sped_up(self, config):
         score, bd = score_youtube_result(
-            _yt("Artist - Song (Sped Up)"), "Artist", "Song", None, config,
+            _yt("Artist - Song (Sped Up)"),
+            "Artist",
+            "Song",
+            None,
+            config,
         )
         assert score == -9999
 
     def test_rejects_full_album(self, config):
         score, bd = score_youtube_result(
-            _yt("Artist - Full Album 2024"), "Artist", "Song", None, config,
+            _yt("Artist - Full Album 2024"),
+            "Artist",
+            "Song",
+            None,
+            config,
         )
         assert score == -9999
         # The key uses the normalized phrase (space preserved)
@@ -90,14 +120,22 @@ class TestHardRejection:
 
     def test_rejects_low_song_match(self, config):
         score, bd = score_youtube_result(
-            _yt("Completely Different Title Here"), "Artist", "Song", None, config,
+            _yt("Completely Different Title Here"),
+            "Artist",
+            "Song",
+            None,
+            config,
         )
         assert score == -9999
         assert "hard_reject_song_absent" in bd
 
     def test_rejects_low_artist_match(self, config):
         score, bd = score_youtube_result(
-            _yt("Some Random Channel - Song", channel="Unknown Channel"), "Artist", "Song", None, config,
+            _yt("Some Random Channel - Song", channel="Unknown Channel"),
+            "Artist",
+            "Song",
+            None,
+            config,
         )
         assert score == -9999
         assert "hard_reject_artist_absent" in bd
@@ -105,20 +143,32 @@ class TestHardRejection:
     def test_does_not_reject_when_forbidden_in_query(self, config):
         """If the query itself contains a forbidden term, don't reject."""
         score, bd = score_youtube_result(
-            _yt("Artist - Cover Art Design"), "Artist", "Cover Art", None, config,
+            _yt("Artist - Cover Art Design"),
+            "Artist",
+            "Cover Art",
+            None,
+            config,
         )
         # Should NOT be hard-rejected since "cover" is in the query
         assert score != -9999 or "hard_reject_cover" not in bd
 
     def test_rejects_tribute(self, config):
         score, bd = score_youtube_result(
-            _yt("Tribute to Artist - Song"), "Artist", "Song", None, config,
+            _yt("Tribute to Artist - Song"),
+            "Artist",
+            "Song",
+            None,
+            config,
         )
         assert score == -9999
 
     def test_rejects_mashup(self, config):
         score, bd = score_youtube_result(
-            _yt("Artist - Song Mashup"), "Artist", "Song", None, config,
+            _yt("Artist - Song Mashup"),
+            "Artist",
+            "Song",
+            None,
+            config,
         )
         assert score == -9999
 
@@ -126,6 +176,7 @@ class TestHardRejection:
 # ===================================================================
 # YouTube Music API fast-path
 # ===================================================================
+
 
 class TestYTMusicAPI:
     def test_exact_match_scores_high(self, config):
@@ -147,6 +198,20 @@ class TestYTMusicAPI:
         r = _api("Dios Es Amor", artists=["Different Artist"])
         score, bd = score_youtube_result(r, "Wiso Aponte", "Dios Es Amor", None, config)
         assert "official_ytmusic_api" not in bd
+
+    def test_forbidden_title_is_rejected(self, config):
+        result = _api("Artist - Song (Live)", artists=["Artist"])
+
+        score, breakdown = score_youtube_result(
+            result,
+            "Artist",
+            "Song",
+            None,
+            config,
+        )
+
+        assert score == -9999
+        assert "hard_reject_live" in breakdown
 
     def test_duration_perfect(self, config):
         r = _api("Dios Es Amor", artists=["Wiso Aponte"], duration=200)
@@ -187,6 +252,7 @@ class TestYTMusicAPI:
 # ===================================================================
 # Standard yt-dlp scoring signals
 # ===================================================================
+
 
 class TestStandardScoring:
     def test_good_match_scores_positive(self, config):
@@ -266,6 +332,7 @@ class TestStandardScoring:
 # Duration matching (standard path)
 # ===================================================================
 
+
 class TestDurationMatching:
     def test_duration_exact(self, config):
         r = _yt("Artist - Song", duration=200)
@@ -306,6 +373,7 @@ class TestDurationMatching:
 # ===================================================================
 # Edge cases
 # ===================================================================
+
 
 class TestEdgeCases:
     def test_empty_title(self, config):
@@ -351,6 +419,7 @@ class TestEdgeCases:
 # rank_results
 # ===================================================================
 
+
 class TestRankResults:
     def test_returns_empty_for_no_results(self, config):
         ranked = rank_results([], "Artist", "Song", None, config)
@@ -358,7 +427,7 @@ class TestRankResults:
 
     def test_filters_by_min_duration(self, config):
         results = [
-            _yt("Artist - Song 1", duration=30),   # too short
+            _yt("Artist - Song 1", duration=30),  # too short
             _yt("Artist - Song 2", duration=200),  # ok
         ]
         ranked = rank_results(results, "Artist", "Song", None, config)
@@ -367,7 +436,7 @@ class TestRankResults:
 
     def test_filters_by_max_duration(self, config):
         results = [
-            _yt("Artist - Song 1", duration=200),   # ok
+            _yt("Artist - Song 1", duration=200),  # ok
             _yt("Artist - Song 2", duration=5000),  # too long
         ]
         ranked = rank_results(results, "Artist", "Song", None, config)
@@ -379,7 +448,9 @@ class TestRankResults:
             _yt("Artist - Song 2", duration=300),
             _yt("Artist - Song 3", duration=500),
         ]
-        ranked = rank_results(results, "Artist", "Song", None, config, min_duration=150, max_duration=400)
+        ranked = rank_results(
+            results, "Artist", "Song", None, config, min_duration=150, max_duration=400
+        )
         assert len(ranked) == 1
         assert ranked[0][0]["title"] == "Artist - Song 2"
 

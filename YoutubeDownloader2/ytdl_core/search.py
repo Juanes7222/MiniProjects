@@ -5,16 +5,15 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import yt_dlp
-from rich import box
-from rich.console import Console
-from rich.table import Table
 
 from .config import Config
 from .scorer import rank_results, score_youtube_result  # noqa: F401 — re-exported
-from .utils import format_duration
+
+if TYPE_CHECKING:
+    from rich.console import Console
 
 
 def build_search_query(artist: str, song: str, source: str) -> str:
@@ -51,6 +50,7 @@ def search_ytmusic_official(artist: str, song: str, opts: dict) -> list[dict]:
     """
     try:
         from ytmusicapi import YTMusic
+
         ytmusic = YTMusic()
         max_r = min(opts.get("max_results", 5), 5)
         query = f"{artist} {song}"
@@ -74,19 +74,23 @@ def search_ytmusic_official(artist: str, song: str, opts: dict) -> list[dict]:
         artists = [a.get("name", "") for a in track.get("artists", []) if a.get("name")]
         channel_name = artists[0] if artists else "YouTube Music"
 
-        structured_results.append({
-            "id": video_id,
-            "url": f"https://www.youtube.com/watch?v={video_id}",
-            "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
-            "title": track.get("title", ""),
-            "channel": channel_name,
-            "uploader": channel_name,
-            "artists": artists,                  # nuevo
-            "duration": track.get("duration_seconds") or 0,
-            "thumbnail": track.get("thumbnails", [{}])[0].get("url") if track.get("thumbnails") else None,
-            "view_count": 0,
-            "_source": "ytmusic_api",
-        })
+        structured_results.append(
+            {
+                "id": video_id,
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
+                "title": track.get("title", ""),
+                "channel": channel_name,
+                "uploader": channel_name,
+                "artists": artists,
+                "duration": track.get("duration_seconds") or 0,
+                "thumbnail": track.get("thumbnails", [{}])[0].get("url")
+                if track.get("thumbnails")
+                else None,
+                "view_count": 0,
+                "_source": "ytmusic_api",
+            }
+        )
     return structured_results
 
 
@@ -113,7 +117,7 @@ def search_source(query: str, source: str, opts: dict) -> list[dict]:
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "extract_flat": False,
+        "extract_flat": True,
         "noplaylist": True,
     }
     if opts.get("cookies_browser"):
@@ -154,9 +158,7 @@ def build_query_variants(artist: str, song: str, source: str) -> list[str]:
     ]
 
 
-def search_with_variants(
-    artist: str, song: str, source: str, opts: dict
-) -> list[dict]:
+def search_with_variants(artist: str, song: str, source: str, opts: dict) -> list[dict]:
     """
     Iterates over multiple query permutations to gather candidate tracks.
 
@@ -172,12 +174,19 @@ def search_with_variants(
     seen_ids: set[str] = set()
     all_results: list[dict] = []
 
-    for query in build_query_variants(artist, song, source):
-        for result in search_source(query, source, opts):
+    max_results = max(1, int(opts.get("max_results", 5)))
+    queries = build_query_variants(artist, song, source)
+    per_query_limit = max(1, (max_results + len(queries) - 1) // len(queries))
+    variant_options = {**opts, "max_results": per_query_limit}
+
+    for query in queries:
+        for result in search_source(query, source, variant_options):
             video_id = result.get("id") or result.get("url")
             if video_id and video_id not in seen_ids:
                 seen_ids.add(video_id)
                 all_results.append(result)
+            if len(all_results) >= max_results:
+                return all_results
 
     return all_results
 
@@ -226,7 +235,7 @@ def search_all_sources(artist: str, song: str, sources: list[str], opts: dict) -
     """
     Executes concurrent cross-platform lookups across all requested streams.
 
-    Automatically injects the official YouTube Music API catalog query if 
+    Automatically injects the official YouTube Music API catalog query if
     the standard YouTube search source is listed in the parameters.
 
     Args:
@@ -250,69 +259,30 @@ def search_all_sources(artist: str, song: str, sources: list[str], opts: dict) -
                 futures[executor.submit(search_ytmusic_official, artist, song, opts)] = src
             else:
                 futures[executor.submit(search_with_variants, artist, song, src, opts)] = src
-            
+
         for future in as_completed(futures):
-            src = futures[future]
-            res = future.result()
-            for r in res:
-                if '_source' not in r:
-                    r['_source'] = src
-            all_results.extend(res)
-            
+            source = futures[future]
+            try:
+                source_results = future.result()
+            except Exception:
+                continue
+            for result in source_results:
+                result.setdefault("_source", source)
+            all_results.extend(source_results)
+
     return _dedup_results(all_results)
-
-
-
 
 
 def print_candidates_table(
     scored: list[tuple[dict, int, dict]],
     artist: str,
     song: str,
-    console: Console,
+    console: "Console",
     reject_threshold: int,
 ) -> None:
-    """
-    Renders a formatted table summarizing all evaluated candidates to the output terminal.
+    from .cli.candidate_table import print_candidate_table
 
-    Args:
-        scored: Sorted tracks dataset containing scores and metrics evaluation maps.
-        artist: Reference artist name.
-        song: Reference song title.
-        console: Targeted rich display rendering context.
-        reject_threshold: Minimum score required to avoid rejection highlighting.
-    """
-    tbl = Table(title=f"Candidates for: {artist} -- {song}", box=box.SIMPLE)
-    tbl.add_column("#", width=3, style="dim")
-    tbl.add_column("Title", max_width=55)
-    tbl.add_column("Channel", max_width=30)
-    tbl.add_column("Duration", width=10, style="yellow")
-    tbl.add_column("Score", width=7)
-    tbl.add_column("Top signals", min_width=30, style="dim")
-
-    best_idx = 0 if scored and scored[0][1] >= reject_threshold else None
-
-    for i, (entry, sc, bd) in enumerate(scored):
-        dur = int(entry.get("duration") or 0)
-        top = sorted(bd.items(), key=lambda kv: abs(kv[1]), reverse=True)[:3]
-        signals = ", ".join(f"{'+' if v >= 0 else ''}{v} {k}" for k, v in top)
-        score_markup = (
-            f"[green]{sc}[/green]"
-            if sc >= 70
-            else f"[yellow]{sc}[/yellow]"
-            if sc >= 30
-            else f"[red]{sc}[/red]"
-        )
-        tbl.add_row(
-            f"{'>' if i == best_idx else ' '}{i + 1}",
-            (entry.get("title") or "")[:55],
-            (entry.get("channel") or entry.get("uploader") or "")[:30],
-            format_duration(dur),
-            score_markup,
-            signals,
-        )
-
-    console.print(tbl)
+    print_candidate_table(scored, artist, song, console, reject_threshold)
 
 
 def select_best_result(

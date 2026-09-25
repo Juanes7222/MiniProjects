@@ -99,14 +99,18 @@ class TestFingerprintText:
         assert _fingerprint_text({"fingerprint_label": "no match"}) == "no match"
 
     def test_label_with_confidence(self):
-        assert _fingerprint_text(
-            {"fingerprint_confidence": 0.94, "fingerprint_label": "verified 94%"}
-        ) == "verified 94% (94%)"
+        assert (
+            _fingerprint_text({"fingerprint_confidence": 0.94, "fingerprint_label": "verified 94%"})
+            == "verified 94% (94%)"
+        )
 
     def test_no_conf_does_not_append(self):
-        assert _fingerprint_text(
-            {"fingerprint_confidence": 0, "fingerprint_label": "verified (stored)"}
-        ) == "verified (stored)"
+        assert (
+            _fingerprint_text(
+                {"fingerprint_confidence": 0, "fingerprint_label": "verified (stored)"}
+            )
+            == "verified (stored)"
+        )
 
     def test_missing_label(self):
         assert _fingerprint_text({}) == "not attempted"

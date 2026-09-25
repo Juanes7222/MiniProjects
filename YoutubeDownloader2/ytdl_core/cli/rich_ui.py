@@ -128,7 +128,9 @@ class RichEvents(DownloaderEvents):
 
         self._progress = Progress(*columns, console=self.console, transient=False)
         self._overall_task = self._progress.add_task(
-            "[cyan]Verifying Library...[/cyan]" if is_verify else "[cyan]Processing Batch...[/cyan]",
+            "[cyan]Verifying Library...[/cyan]"
+            if is_verify
+            else "[cyan]Processing Batch...[/cyan]",
             total=total,
             visible=True,
         )
@@ -159,10 +161,7 @@ class RichEvents(DownloaderEvents):
         from rich.markup import escape
 
         self._print(
-            Rule(
-                f"[bold cyan]{escape(str(artist))}[/bold cyan] "
-                f"[dim]({song_count} songs)[/dim]"
-            )
+            Rule(f"[bold cyan]{escape(str(artist))}[/bold cyan] [dim]({song_count} songs)[/dim]")
         )
 
     def on_search_start(self, artist: str, song: str, source: str) -> None:
@@ -172,8 +171,7 @@ class RichEvents(DownloaderEvents):
         from rich.markup import escape
 
         self._print(
-            f"[dim]  [{escape(str(source))}] {escape(str(song))} -- "
-            f"{escape(str(artist))}[/dim]"
+            f"[dim]  [{escape(str(source))}] {escape(str(song))} -- {escape(str(artist))}[/dim]"
         )
 
     def on_no_results(self, artist: str, song: str, source: str) -> None:
@@ -228,9 +226,7 @@ class RichEvents(DownloaderEvents):
                 key=lambda kv: abs(kv[1]),
                 reverse=True,
             )[:3]
-            signals = ", ".join(
-                f"{'+' if value >= 0 else ''}{value} {key}" for key, value in top
-            )
+            signals = ", ".join(f"{'+' if value >= 0 else ''}{value} {key}" for key, value in top)
             if has_decision and "_decision_min" in entry and "_decision_max" in entry:
                 range_label = (
                     f"{decision_provider} range {float(entry['_decision_min']):.0%}-"
@@ -357,9 +353,7 @@ class RichEvents(DownloaderEvents):
 
     def on_download_start(self, artist: str, song: str, url: str) -> None:
         if self._progress:
-            task_id = self._progress.add_task(
-                f"[cyan]{song[:45]}[/cyan]", total=100, visible=True
-            )
+            task_id = self._progress.add_task(f"[cyan]{song[:45]}[/cyan]", total=100, visible=True)
             with self._tasks_lock:
                 self._tasks[self._k(artist, song)] = task_id
 
@@ -541,9 +535,7 @@ class RichEvents(DownloaderEvents):
                 f"{format_size(result.file_size_bytes or 0)})[/green]"
             )
         elif result.status == "failed":
-            self._print(
-                f"[red]  Failed: {safe_artist} -- {safe_song} | {safe_reason}[/red]"
-            )
+            self._print(f"[red]  Failed: {safe_artist} -- {safe_song} | {safe_reason}[/red]")
         elif result.status == "skipped":
             if "exists" not in str(result.reason).lower():
                 self._print(
@@ -612,7 +604,9 @@ class RichEvents(DownloaderEvents):
                 if r.decision_probability >= self.decision_threshold:
                     decision_cell = f"[green]{provider} {decision_value}% x{decision_runs}[/green]"
                 elif r.decision_probability >= self.decision_threshold - 0.15:
-                    decision_cell = f"[yellow]{provider} {decision_value}% x{decision_runs}[/yellow]"
+                    decision_cell = (
+                        f"[yellow]{provider} {decision_value}% x{decision_runs}[/yellow]"
+                    )
                 else:
                     decision_cell = f"[red]{provider} {decision_value}% x{decision_runs}[/red]"
             else:

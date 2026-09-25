@@ -87,13 +87,7 @@ def fetch_musicbrainz(artist: str, song: str) -> Optional[dict]:
         mb_id = best.get("id")
 
         if release_id:
-            caa = f"https://coverartarchive.org/release/{release_id}/front"
-            try:
-                r = requests.head(caa, timeout=5, allow_redirects=True)
-                if r.status_code == 200:
-                    cover_url = caa
-            except requests.exceptions.RequestException:
-                pass
+            cover_url = f"https://coverartarchive.org/release/{release_id}/front"
 
         return {
             "album": album,
@@ -154,6 +148,7 @@ def _embed_mp3(
     if mb_id:
         tags.add(TXXX(encoding=3, desc="MusicBrainz Track Id", text=mb_id))
     if image:
+        tags.delall("APIC")
         tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=image))
     tags.save(str(path), v2_version=3)
 

@@ -31,13 +31,15 @@ def build_ytdlp_base_opts(
     skip_existing: bool = False,
     max_downloads: Optional[int] = None,
     cookies_browser: Optional[Any] = None,
-    cookies_file: Optional[Path] = None,
+    cookies_file: str | Path | None = None,
     proxy: Optional[str] = None,
     download_archive: Optional[Path] = None,
     enable_remote_components: bool = True,
     youtube_player_clients: Optional[list[str]] = None,
     noplaylist: bool = False,
     for_scan: bool = False,
+    output_template: str | Path | None = None,
+    embed_thumbnail: bool = True,
 ) -> dict[str, Any]:
     """
     Build the base yt-dlp options dictionary used by both scan and download passes.
@@ -80,7 +82,9 @@ def build_ytdlp_base_opts(
             if is_video
             else "bestaudio/best"
         ),
-        "outtmpl": str(
+        "outtmpl": str(output_template)
+        if output_template
+        else str(
             output_dir
             / "%(uploader)s"
             / ("%(title)s [%(id)s].mp4" if is_video else "%(title)s [%(id)s].%(ext)s")
@@ -102,12 +106,12 @@ def build_ytdlp_base_opts(
     }
 
     if not for_scan:
-        ydl_opts["writethumbnail"] = True
+        if embed_thumbnail:
+            ydl_opts["writethumbnail"] = True
         if is_video:
             ydl_opts["merge_output_format"] = "mp4"
             ydl_opts["postprocessors"] = [
                 {"key": "FFmpegMetadata"},
-                {"key": "EmbedThumbnail", "already_have_thumbnail": False},
             ]
         else:
             ydl_opts["postprocessors"] = [
@@ -117,8 +121,11 @@ def build_ytdlp_base_opts(
                     "preferredquality": quality,
                 },
                 {"key": "FFmpegMetadata"},
-                {"key": "EmbedThumbnail", "already_have_thumbnail": False},
             ]
+        if embed_thumbnail:
+            ydl_opts["postprocessors"].append(
+                {"key": "EmbedThumbnail", "already_have_thumbnail": False}
+            )
 
     if skip_existing:
         ydl_opts["nooverwrites"] = True

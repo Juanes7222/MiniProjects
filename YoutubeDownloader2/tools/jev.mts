@@ -1,20 +1,27 @@
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { loadEnvFile } from 'node:process';
-import { experimental_evaluate } from 'ai';
 
 const envPath = fileURLToPath(new URL('../.env.local', import.meta.url));
 if (existsSync(envPath)) {
   loadEnvFile(envPath);
 }
 
-async function main() {
+async function readStdin(): Promise<string> {
   let input = '';
   for await (const chunk of process.stdin) {
     input += chunk;
   }
+  return input;
+}
 
-  const payload = JSON.parse(input);
+async function main(): Promise<void> {
+  const apiKey = process.env.AI_GATEWAY_API_KEY;
+  if (!apiKey) {
+    throw new Error('AI_GATEWAY_API_KEY is required for Jev');
+  }
+
+  const payload = JSON.parse(await readStdin());
   const questions = Object.fromEntries(
     payload.candidates.map((candidate: { key: string; label: string }) => [
       candidate.key,
@@ -25,12 +32,25 @@ async function main() {
     ]),
   );
 
-  const result = await experimental_evaluate({
-    model: 'typesafe-ai/jev',
-    state: payload.state,
-    questions,
+  const response = await fetch('https://ai-gateway.vercel.sh/v4/ai/evaluation-model', {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      'ai-evaluation-model-specification-version': '4',
+      'ai-gateway-auth-method': 'api-key',
+      'ai-gateway-protocol-version': '0.0.1',
+      'ai-model-id': 'typesafe-ai/jev',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ state: payload.state, questions }),
   });
 
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`AI Gateway returned ${response.status}: ${detail}`);
+  }
+
+  const result = await response.json();
   process.stdout.write(JSON.stringify({ answers: result.answers }));
 }
 

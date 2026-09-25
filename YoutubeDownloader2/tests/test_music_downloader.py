@@ -10,6 +10,7 @@ import pytest
 
 from ytdl_core.config import Config
 from ytdl_core.core import MusicDownloader
+from ytdl_core.events import DownloaderEvents
 from ytdl_core.result import DownloadResult
 from tests.conftest import SpyEvents
 
@@ -17,6 +18,7 @@ from tests.conftest import SpyEvents
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def spy():
@@ -32,8 +34,12 @@ def config():
 def dl(spy, config):
     """MusicDownloader wired to SpyEvents with no delays."""
     return MusicDownloader(
-        config=config, events=spy, delay=(0, 0), workers=1,
-        no_silence_check=True, skip_fingerprint=True,
+        config=config,
+        events=spy,
+        delay=(0, 0),
+        workers=1,
+        no_silence_check=True,
+        skip_fingerprint=True,
     )
 
 
@@ -47,10 +53,15 @@ def output_dir(tmp_path):
 def _fake_search_result(title="Artist - Song", duration=200, channel="Artist Topic", score=80):
     """Build a fake ranked candidate as select_best_result would return."""
     return {
-        "title": title, "channel": channel, "uploader": channel,
-        "duration": duration, "url": "http://example.com/video",
-        "webpage_url": "http://example.com/video", "thumbnail": None,
-        "_source": "youtube", "_composite_score": score,
+        "title": title,
+        "channel": channel,
+        "uploader": channel,
+        "duration": duration,
+        "url": "http://example.com/video",
+        "webpage_url": "http://example.com/video",
+        "thumbnail": None,
+        "_source": "youtube",
+        "_composite_score": score,
         "_score_breakdown": {"base_match": score},
     }
 
@@ -62,8 +73,7 @@ def _mock_search_returns_one():
     def fake_search(artist, song, sources, opts):
         return [result]
 
-    def fake_select(results, artist, song, mb_dur, config, console, lock,
-                    min_d, max_d, threshold):
+    def fake_select(results, artist, song, mb_dur, config, console, lock, min_d, max_d, threshold):
         scored = [(result, result["_composite_score"], result["_score_breakdown"])]
         return result, scored
 
@@ -73,6 +83,7 @@ def _mock_search_returns_one():
 # ===================================================================
 # Initialization
 # ===================================================================
+
 
 class TestInitialization:
     def test_defaults(self):
@@ -86,9 +97,14 @@ class TestInitialization:
 
     def test_custom_params(self, config, spy):
         dl = MusicDownloader(
-            config=config, events=spy, acoustid_key="KEY",
-            force_fingerprint=True, workers=4, delay=(1, 2),
-            musicbrainz=True, proxy="http://proxy:8080",
+            config=config,
+            events=spy,
+            acoustid_key="KEY",
+            force_fingerprint=True,
+            workers=4,
+            delay=(1, 2),
+            musicbrainz=True,
+            proxy="http://proxy:8080",
         )
         assert dl.acoustid_key == "KEY"
         assert dl.force_fingerprint is True
@@ -96,6 +112,23 @@ class TestInitialization:
         assert dl.delay == (1, 2)
         assert dl.musicbrainz is True
         assert dl.proxy == "http://proxy:8080"
+
+    def test_strict_fingerprint_requires_key(self):
+        with pytest.raises(ValueError, match="requires an AcoustID key"):
+            MusicDownloader(require_fingerprint=True)
+
+    def test_strict_fingerprint_cannot_be_skipped(self):
+        with pytest.raises(ValueError, match="cannot be skipped"):
+            MusicDownloader(
+                acoustid_key="KEY",
+                require_fingerprint=True,
+                skip_fingerprint=True,
+            )
+
+    def test_strict_fingerprint_requires_fpcalc(self):
+        with patch("ytdl_core.core.shutil.which", return_value=None):
+            with pytest.raises(RuntimeError, match="requires fpcalc"):
+                MusicDownloader(acoustid_key="KEY", require_fingerprint=True)
 
     def test_workers_capped(self):
         dl = MusicDownloader(workers=999)
@@ -118,6 +151,7 @@ class TestInitialization:
 # _iter_entries (static, no mocks needed)
 # ===================================================================
 
+
 class TestIterEntries:
     def test_flat_entry(self):
         data = {"title": "Song", "entries": None}
@@ -129,10 +163,12 @@ class TestIterEntries:
         data = {
             "entries": [
                 {"title": "Song1", "entries": None},
-                {"entries": [
-                    {"title": "Song2", "entries": None},
-                    {"title": "Song3", "entries": None},
-                ]},
+                {
+                    "entries": [
+                        {"title": "Song2", "entries": None},
+                        {"title": "Song3", "entries": None},
+                    ]
+                },
             ]
         }
         entries = list(MusicDownloader._iter_entries(data))
@@ -156,13 +192,20 @@ class TestIterEntries:
 # _persist (static)
 # ===================================================================
 
+
 class TestPersist:
     def test_creates_state_entry(self, tmp_path):
         state = {"downloads": {}}
         lock = threading.Lock()
         MusicDownloader._persist(
-            state, lock, "Artist::Song", "downloaded",
-            "http://url", "/path/file.mp3", "abc123", tmp_path,
+            state,
+            lock,
+            "Artist::Song",
+            "downloaded",
+            "http://url",
+            "/path/file.mp3",
+            "abc123",
+            tmp_path,
         )
         entry = state["downloads"]["Artist::Song"]
         assert entry["status"] == "downloaded"
@@ -171,15 +214,44 @@ class TestPersist:
         assert "timestamp" in entry
 
     def test_preserves_timestamp(self, tmp_path):
-        state = {"downloads": {
-            "Artist::Song": {"timestamp": "2024-01-01T00:00:00", "status": "downloaded"},
-        }}
+        state = {
+            "downloads": {
+                "Artist::Song": {"timestamp": "2024-01-01T00:00:00", "status": "downloaded"},
+            }
+        }
         lock = threading.Lock()
         MusicDownloader._persist(
-            state, lock, "Artist::Song", "verified",
-            None, None, None, tmp_path, preserve_timestamp=True,
+            state,
+            lock,
+            "Artist::Song",
+            "verified",
+            None,
+            None,
+            None,
+            tmp_path,
+            preserve_timestamp=True,
         )
         assert state["downloads"]["Artist::Song"]["timestamp"] == "2024-01-01T00:00:00"
+
+    def test_writes_custom_state_file(self, config, tmp_path):
+        config.STATE_FILE = "custom-state.json"
+        downloader = MusicDownloader(config=config, events=DownloaderEvents())
+        state = {"downloads": {}}
+        lock = threading.Lock()
+
+        downloader._persist(
+            state,
+            lock,
+            "Artist::Song",
+            "downloaded",
+            None,
+            None,
+            None,
+            tmp_path,
+            state_filename=config.STATE_FILE,
+        )
+
+        assert (tmp_path / config.STATE_FILE).exists()
 
     def test_writes_state_file(self, tmp_path):
         state = {"downloads": {}}
@@ -195,6 +267,7 @@ class TestPersist:
 # download() — single song
 # ===================================================================
 
+
 class TestDownload:
     def test_successful_download(self, dl, output_dir, spy):
         fake_file = output_dir / "Artist" / "Song.mp3"
@@ -203,15 +276,15 @@ class TestDownload:
 
         fake_search, fake_select = _mock_search_returns_one()
 
-        with patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.execute_download", return_value=(fake_file, "")), \
-             patch("ytdl_core.core.check_duration", return_value=(True, 200, None)), \
-             patch("ytdl_core.core.check_silence", return_value=(0.0, False, None)), \
-             patch("ytdl_core.core.enrich_musicbrainz", return_value=(None, False)), \
-             patch("ytdl_core.core.embed_and_verify", return_value=True), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.execute_download", return_value=(fake_file, "")),
+            patch("ytdl_core.core.check_duration", return_value=(True, 200, None)),
+            patch("ytdl_core.core.check_silence", return_value=(0.0, False, None)),
+            patch("ytdl_core.core.embed_and_verify", return_value=True),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             result = dl.download("Artist", "Song", output_dir)
 
         assert result.status == "downloaded"
@@ -221,6 +294,67 @@ class TestDownload:
         assert result.duration_seconds == 200
         assert any(c[0] == "on_download_start" for c in spy.calls)
 
+    def test_musicbrainz_is_fetched_once(self, config, spy, output_dir):
+        downloader = MusicDownloader(
+            config=config,
+            events=spy,
+            delay=(0, 0),
+            workers=1,
+            no_silence_check=True,
+            skip_fingerprint=True,
+            musicbrainz=True,
+        )
+        downloaded_file = output_dir / "Artist" / "Song.mp3"
+        downloaded_file.parent.mkdir(parents=True)
+        downloaded_file.write_bytes(b"\x00" * 60000)
+        fake_search, fake_select = _mock_search_returns_one()
+        metadata = {"album": "Album", "year": "2026", "genre": "Rock"}
+
+        with (
+            patch("ytdl_core.core.fetch_musicbrainz", return_value=metadata) as fetch,
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.execute_download", return_value=(downloaded_file, "")),
+            patch("ytdl_core.core.check_duration", return_value=(True, 200, None)),
+            patch("ytdl_core.core.embed_and_verify", return_value=True),
+            patch("ytdl_core.core.apply_delay"),
+        ):
+            result = downloader.download("Artist", "Song", output_dir)
+
+        assert result.status == "downloaded"
+        assert result.musicbrainz_enriched is True
+        fetch.assert_called_once_with("Artist", "Song")
+
+    def test_musicbrainz_no_match_emits_event(self, config, spy, output_dir):
+        downloader = MusicDownloader(
+            config=config,
+            events=spy,
+            delay=(0, 0),
+            workers=1,
+            no_silence_check=True,
+            skip_fingerprint=True,
+            musicbrainz=True,
+        )
+        downloaded_file = output_dir / "Artist" / "Song.mp3"
+        downloaded_file.parent.mkdir(parents=True)
+        downloaded_file.write_bytes(b"\x00" * 60000)
+        fake_search, fake_select = _mock_search_returns_one()
+
+        with (
+            patch("ytdl_core.core.fetch_musicbrainz", return_value=None),
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.execute_download", return_value=(downloaded_file, "")),
+            patch("ytdl_core.core.check_duration", return_value=(True, 200, None)),
+            patch("ytdl_core.core.embed_and_verify", return_value=True),
+            patch("ytdl_core.core.apply_delay"),
+        ):
+            result = downloader.download("Artist", "Song", output_dir)
+
+        result_events = [call for call in spy.calls if call[0] == "on_musicbrainz_result"]
+        assert result.status == "downloaded"
+        assert result_events[0][1][2] is False
+
     def test_search_failure(self, dl, output_dir, spy):
         def fake_search(artist, song, sources, opts):
             return []
@@ -228,10 +362,11 @@ class TestDownload:
         def fake_select(results, *args, **kwargs):
             return None, []
 
-        with patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             result = dl.download("Artist", "Song", output_dir)
 
         assert result.status == "failed"
@@ -256,10 +391,11 @@ class TestDownload:
         )
         fake_search, fake_select = _mock_search_returns_one()
 
-        with patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             result = jev_dl.download("Artist", "Song", output_dir)
 
         assert result.status == "failed"
@@ -273,15 +409,19 @@ class TestDownload:
         fake_file.write_bytes(b"\x00" * 60000)
 
         from ytdl_core.utils import compute_md5
+
         md5 = compute_md5(fake_file)
 
-        state = {"downloads": {
-            "Artist::Song": {"status": "downloaded", "md5": md5},
-        }}
+        state = {
+            "downloads": {
+                "Artist::Song": {"status": "downloaded", "md5": md5},
+            }
+        }
 
-        with patch("ytdl_core.core.load_state", return_value=state), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.load_state", return_value=state),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             result = dl.download("Artist", "Song", output_dir, skip_existing=True)
 
         assert result.status == "skipped"
@@ -293,23 +433,25 @@ class TestDownload:
         fake_file.parent.mkdir(parents=True, exist_ok=True)
         fake_file.write_bytes(b"\x00" * 60000)
 
-        state = {"downloads": {
-            "Artist::Song": {"status": "downloaded", "md5": "wrong_md5"},
-        }}
+        state = {
+            "downloads": {
+                "Artist::Song": {"status": "downloaded", "md5": "wrong_md5"},
+            }
+        }
 
         new_file = output_dir / "Artist" / "Song.mp3"
         fake_search, fake_select = _mock_search_returns_one()
 
-        with patch("ytdl_core.core.load_state", return_value=state), \
-             patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.execute_download", return_value=(new_file, "")), \
-             patch("ytdl_core.core.check_duration", return_value=(True, 200, None)), \
-             patch("ytdl_core.core.check_silence", return_value=(0.0, False, None)), \
-             patch("ytdl_core.core.enrich_musicbrainz", return_value=(None, False)), \
-             patch("ytdl_core.core.embed_and_verify", return_value=True), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.load_state", return_value=state),
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.execute_download", return_value=(new_file, "")),
+            patch("ytdl_core.core.check_duration", return_value=(True, 200, None)),
+            patch("ytdl_core.core.check_silence", return_value=(0.0, False, None)),
+            patch("ytdl_core.core.embed_and_verify", return_value=True),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             result = dl.download("Artist", "Song", output_dir, skip_existing=True)
 
         assert result.status == "downloaded"
@@ -318,11 +460,12 @@ class TestDownload:
     def test_download_failure_propagates_error(self, dl, output_dir, spy):
         fake_search, fake_select = _mock_search_returns_one()
 
-        with patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.execute_download", return_value=(None, "network error")), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.execute_download", return_value=(None, "network error")),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             result = dl.download("Artist", "Song", output_dir)
 
         assert result.status == "failed"
@@ -334,10 +477,11 @@ class TestDownload:
 
         fake_search, fake_select = _mock_search_returns_one()
 
-        with patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             result = dl.download("Artist", "Song", output_dir)
 
         assert result.status == "skipped"
@@ -348,10 +492,11 @@ class TestDownload:
 
         fake_search, fake_select = _mock_search_returns_one()
 
-        with patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             result = dl.download("Artist", "Song", output_dir)
 
         assert result.status == "skipped"
@@ -366,15 +511,15 @@ class TestDownload:
 
         fake_search, fake_select = _mock_search_returns_one()
 
-        with patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.execute_download", return_value=(fake_file, "")), \
-             patch("ytdl_core.core.check_duration", return_value=(True, 200, None)), \
-             patch("ytdl_core.core.check_silence", return_value=(0.0, False, None)), \
-             patch("ytdl_core.core.enrich_musicbrainz", return_value=(None, False)), \
-             patch("ytdl_core.core.embed_and_verify", return_value=True), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.execute_download", return_value=(fake_file, "")),
+            patch("ytdl_core.core.check_duration", return_value=(True, 200, None)),
+            patch("ytdl_core.core.check_silence", return_value=(0.0, False, None)),
+            patch("ytdl_core.core.embed_and_verify", return_value=True),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             result = dl.download("Artist", "Song", output_dir)
 
         assert result.status == "downloaded"
@@ -385,12 +530,16 @@ class TestDownload:
         fake_dl_file.parent.mkdir(parents=True, exist_ok=True)
         fake_dl_file.write_bytes(b"\x00" * 60000)
 
-        with patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.execute_download", return_value=(fake_dl_file, "")), \
-             patch("ytdl_core.core.check_duration", return_value=(False, 50, "Duration discrepancy 80%")), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.execute_download", return_value=(fake_dl_file, "")),
+            patch(
+                "ytdl_core.core.check_duration",
+                return_value=(False, 50, "Duration discrepancy 80%"),
+            ),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             result = dl.download("Artist", "Song", output_dir)
 
         assert result.status == "failed"
@@ -399,8 +548,12 @@ class TestDownload:
     def test_silence_check_failure(self, tmp_path, spy, config):
         """Silence check triggers when no_silence_check=False."""
         dl_no_silence = MusicDownloader(
-            config=config, events=spy, delay=(0, 0), workers=1,
-            no_silence_check=False, skip_fingerprint=True,
+            config=config,
+            events=spy,
+            delay=(0, 0),
+            workers=1,
+            no_silence_check=False,
+            skip_fingerprint=True,
         )
         out = tmp_path / "dl"
         out.mkdir()
@@ -410,13 +563,17 @@ class TestDownload:
         fake_dl_file.parent.mkdir(parents=True, exist_ok=True)
         fake_dl_file.write_bytes(b"\x00" * 60000)
 
-        with patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.execute_download", return_value=(fake_dl_file, "")), \
-             patch("ytdl_core.core.check_duration", return_value=(True, 200, None)), \
-             patch("ytdl_core.core.check_silence", return_value=(0.5, True, "Excessive silence (50.0%)")), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.execute_download", return_value=(fake_dl_file, "")),
+            patch("ytdl_core.core.check_duration", return_value=(True, 200, None)),
+            patch(
+                "ytdl_core.core.check_silence",
+                return_value=(0.5, True, "Excessive silence (50.0%)"),
+            ),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             result = dl_no_silence.download("Artist", "Song", out)
 
         assert result.status == "failed"
@@ -429,15 +586,15 @@ class TestDownload:
         fake_dl_file.parent.mkdir(parents=True, exist_ok=True)
         fake_dl_file.write_bytes(b"\x00" * 60000)
 
-        with patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.execute_download", return_value=(fake_dl_file, "")), \
-             patch("ytdl_core.core.check_duration", return_value=(True, 200, None)), \
-             patch("ytdl_core.core.check_silence") as mock_silence, \
-             patch("ytdl_core.core.enrich_musicbrainz", return_value=(None, False)), \
-             patch("ytdl_core.core.embed_and_verify", return_value=True), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.execute_download", return_value=(fake_dl_file, "")),
+            patch("ytdl_core.core.check_duration", return_value=(True, 200, None)),
+            patch("ytdl_core.core.check_silence") as mock_silence,
+            patch("ytdl_core.core.embed_and_verify", return_value=True),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             result = dl.download("Artist", "Song", output_dir)
 
         mock_silence.assert_not_called()
@@ -449,15 +606,15 @@ class TestDownload:
         fake_dl_file.parent.mkdir(parents=True, exist_ok=True)
         fake_dl_file.write_bytes(b"\x00" * 60000)
 
-        with patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.execute_download", return_value=(fake_dl_file, "")), \
-             patch("ytdl_core.core.check_duration", return_value=(True, 200, None)), \
-             patch("ytdl_core.core.check_silence", return_value=(0.0, False, None)), \
-             patch("ytdl_core.core.enrich_musicbrainz", return_value=(None, False)), \
-             patch("ytdl_core.core.embed_and_verify", return_value=False), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.execute_download", return_value=(fake_dl_file, "")),
+            patch("ytdl_core.core.check_duration", return_value=(True, 200, None)),
+            patch("ytdl_core.core.check_silence", return_value=(0.0, False, None)),
+            patch("ytdl_core.core.embed_and_verify", return_value=False),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             result = dl.download("Artist", "Song", output_dir)
 
         assert result.status == "failed"
@@ -470,8 +627,18 @@ class TestDownload:
         stop.set()
 
         result = dl._process_song(
-            "Artist", "Song", output_dir, "mp3", "192", False,
-            state, threading.Lock(), stop, set(), threading.Lock(), [("Artist", "Song")],
+            "Artist",
+            "Song",
+            output_dir,
+            "mp3",
+            "192",
+            False,
+            state,
+            threading.Lock(),
+            stop,
+            set(),
+            threading.Lock(),
+            {"Artist": 1},
         )
         assert result.status == "skipped"
         assert result.reason == "Interrupted"
@@ -480,6 +647,7 @@ class TestDownload:
 # ===================================================================
 # download_batch()
 # ===================================================================
+
 
 class TestDownloadBatch:
     def test_empty_songs(self, dl, output_dir, spy):
@@ -494,29 +662,46 @@ class TestDownloadBatch:
         def fake_search(artist, song, sources, opts):
             return [_fake_search_result(title=f"{artist} - {song}")]
 
-        def fake_select(results, artist, song, mb_dur, config, console, lock,
-                        min_d, max_d, threshold):
+        def fake_select(
+            results, artist, song, mb_dur, config, console, lock, min_d, max_d, threshold
+        ):
             r = results[0]
             return r, [(r, r["_composite_score"], r["_score_breakdown"])]
 
-        with patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.execute_download", side_effect=lambda *a, **k: (
-                 lambda p: (p, ""))(output_dir / "tmp.mp3")), \
-             patch("ytdl_core.core.check_duration", return_value=(True, 200, None)), \
-             patch("ytdl_core.core.check_silence", return_value=(0.0, False, None)), \
-             patch("ytdl_core.core.enrich_musicbrainz", return_value=(None, False)), \
-             patch("ytdl_core.core.embed_and_verify", return_value=True), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch(
+                "ytdl_core.core.execute_download",
+                side_effect=lambda *a, **k: (lambda p: (p, ""))(output_dir / "tmp.mp3"),
+            ),
+            patch("ytdl_core.core.check_duration", return_value=(True, 200, None)),
+            patch("ytdl_core.core.check_silence", return_value=(0.0, False, None)),
+            patch("ytdl_core.core.embed_and_verify", return_value=True),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             # Create the fake files that execute_download would return
             for s in ["Song1", "Song2"]:
                 f = output_dir / "Artist" / f"{s}.mp3"
                 f.parent.mkdir(parents=True, exist_ok=True)
                 f.write_bytes(b"\x00" * 60000)
 
-            def fake_exec(url, output_dir, fmt, quality, artist, song, events, config,
-                         stop, state, state_lock, cb, cf, proxy):
+            def fake_exec(
+                url,
+                output_dir,
+                fmt,
+                quality,
+                artist,
+                song,
+                events,
+                config,
+                stop,
+                state,
+                state_lock,
+                cb,
+                cf,
+                proxy,
+            ):
                 f = output_dir / "Artist" / f"{song}.mp3"
                 return f, ""
 
@@ -536,10 +721,11 @@ class TestDownloadBatch:
     def test_batch_state_persisted(self, dl, output_dir, spy):
         songs = {"Artist": ["Song1"]}
 
-        with patch("ytdl_core.core.search_all_sources", return_value=[]), \
-             patch("ytdl_core.core.select_best_result", return_value=(None, [])), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", return_value=[]),
+            patch("ytdl_core.core.select_best_result", return_value=(None, [])),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             results = dl.download_batch(songs, output_dir)
 
         assert results[0].status == "failed"
@@ -551,6 +737,7 @@ class TestDownloadBatch:
 # ===================================================================
 # download_url()
 # ===================================================================
+
 
 class TestDownloadUrl:
     def test_scan_failure(self, dl, output_dir, spy):
@@ -577,9 +764,13 @@ class TestDownloadUrl:
             instance = MockYDL.return_value.__enter__.return_value
             instance.extract_info.return_value = {
                 "entries": [
-                    {"title": "Live Stream", "uploader": "Channel",
-                     "is_live": True, "duration": 200,
-                     "webpage_url": "http://example.com/live"},
+                    {
+                        "title": "Live Stream",
+                        "uploader": "Channel",
+                        "is_live": True,
+                        "duration": 200,
+                        "webpage_url": "http://example.com/live",
+                    },
                 ]
             }
 
@@ -592,10 +783,18 @@ class TestDownloadUrl:
             instance = MockYDL.return_value.__enter__.return_value
             instance.extract_info.return_value = {
                 "entries": [
-                    {"title": "Artist - Song", "uploader": "Channel",
-                     "duration": 200, "webpage_url": "http://example.com/1"},
-                    {"title": "Artist - Other", "uploader": "Channel",
-                     "duration": 200, "webpage_url": "http://example.com/2"},
+                    {
+                        "title": "Artist - Song",
+                        "uploader": "Channel",
+                        "duration": 200,
+                        "webpage_url": "http://example.com/1",
+                    },
+                    {
+                        "title": "Artist - Other",
+                        "uploader": "Channel",
+                        "duration": 200,
+                        "webpage_url": "http://example.com/2",
+                    },
                 ]
             }
 
@@ -610,10 +809,18 @@ class TestDownloadUrl:
             instance = MockYDL.return_value.__enter__.return_value
             instance.extract_info.return_value = {
                 "entries": [
-                    {"title": "Artist - Song", "uploader": "Channel",
-                     "duration": 200, "webpage_url": "http://example.com/1"},
-                    {"title": "Artist - Remix", "uploader": "Channel",
-                     "duration": 200, "webpage_url": "http://example.com/2"},
+                    {
+                        "title": "Artist - Song",
+                        "uploader": "Channel",
+                        "duration": 200,
+                        "webpage_url": "http://example.com/1",
+                    },
+                    {
+                        "title": "Artist - Remix",
+                        "uploader": "Channel",
+                        "duration": 200,
+                        "webpage_url": "http://example.com/2",
+                    },
                 ]
             }
 
@@ -629,8 +836,12 @@ class TestDownloadUrl:
             instance = MockYDL.return_value.__enter__.return_value
             instance.extract_info.return_value = {
                 "entries": [
-                    {"title": "Short Song", "uploader": "Channel",
-                     "duration": 10, "webpage_url": "http://example.com/short"},
+                    {
+                        "title": "Short Song",
+                        "uploader": "Channel",
+                        "duration": 10,
+                        "webpage_url": "http://example.com/short",
+                    },
                 ]
             }
 
@@ -644,6 +855,7 @@ class TestDownloadUrl:
 # ===================================================================
 # verify_library()
 # ===================================================================
+
 
 class TestVerifyLibrary:
     def test_delegates_to_verifier(self, dl, output_dir, spy):
@@ -667,6 +879,7 @@ class TestVerifyLibrary:
 # Event callbacks coverage
 # ===================================================================
 
+
 class TestEventCallbacks:
     def test_on_session_start_fired(self, dl, output_dir, spy):
         dl.download_batch({}, output_dir)
@@ -682,16 +895,18 @@ class TestEventCallbacks:
         def fake_search(artist, song, sources, opts):
             return [_fake_search_result(title=f"{artist} - {song}")]
 
-        def fake_select(results, artist, song, mb_dur, config, console, lock,
-                        min_d, max_d, threshold):
+        def fake_select(
+            results, artist, song, mb_dur, config, console, lock, min_d, max_d, threshold
+        ):
             r = results[0]
             return r, [(r, r["_composite_score"], r["_score_breakdown"])]
 
-        with patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.execute_download", return_value=(None, "fail")), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.execute_download", return_value=(None, "fail")),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             dl.download_batch({"Artist": ["Song1", "Song2"]}, output_dir)
 
         result_calls = [c for c in spy.calls if c[0] == "on_result"]
@@ -704,10 +919,11 @@ class TestEventCallbacks:
         def fake_select(results, *a, **kw):
             return None, []
 
-        with patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             dl.download("Artist", "Song", output_dir)
 
         search_calls = [c for c in spy.calls if c[0] == "on_search_start"]
@@ -720,10 +936,11 @@ class TestEventCallbacks:
         def fake_select(results, *a, **kw):
             return None, []
 
-        with patch("ytdl_core.core.search_all_sources", fake_search), \
-             patch("ytdl_core.core.select_best_result", fake_select), \
-             patch("ytdl_core.core.apply_delay"):
-
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch("ytdl_core.core.apply_delay"),
+        ):
             dl.download("Artist", "Song", output_dir)
 
         artist_calls = [c for c in spy.calls if c[0] == "on_artist_start"]

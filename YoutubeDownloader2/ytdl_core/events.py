@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from result import DownloadResult
+    from .result import DownloadResult
 
 
 class DownloaderEvents:

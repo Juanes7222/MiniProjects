@@ -52,7 +52,7 @@ class Config:
     JEV_DEFAULT_THRESHOLD: float = 0.60
     JEV_DEFAULT_RUNS: int = 1
     JEV_MAX_RUNS: int = 20
-    
+
     FORBIDEN_TERMS = {
         "cover",
         "karaoke",
@@ -80,7 +80,6 @@ class Config:
         "1 hour",
         "hora",
         "compilation",
-
         "instrumental",
         "acoustic",
         "version",
