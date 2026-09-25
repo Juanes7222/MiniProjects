@@ -102,10 +102,9 @@ def main() -> None:
     # Force UTF-8 output so non-ASCII metadata (emoji, accented titles, etc.)
     # never raises UnicodeEncodeError when stdout is redirected or codepage-limited.
     for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
 
     args = parse_args()
     config = Config()
@@ -134,18 +133,28 @@ def main() -> None:
             )
         )
 
+    songs: dict[str, list[str]]
+    pairs: list[tuple[str, str]]
     try:
         if args.url:
             songs = {}
             pairs = []
         elif args.file:
             with args.file.open("r", encoding="utf-8") as fh:
-                songs: dict = json.load(fh)
+                file_songs: dict[str, list[str]] = json.load(fh)
+            songs = {
+                str(artist): [str(song) for song in (lst or [])]
+                for artist, lst in file_songs.items()
+            }
             pairs = [
                 (artist, song) for artist, lst in songs.items() for song in (lst or [])
             ]
         else:
-            songs = json.loads(args.data)
+            data_songs: dict[str, list[str]] = json.loads(args.data)
+            songs = {
+                str(artist): [str(song) for song in (lst or [])]
+                for artist, lst in data_songs.items()
+            }
             pairs = [
                 (artist, song) for artist, lst in songs.items() for song in (lst or [])
             ]
@@ -330,7 +339,7 @@ def main() -> None:
                 f"[green]  Verification reports saved to: {args.output.resolve()}[/green]"
             )
 
-        missing_songs = {}
+        missing_songs: dict[str, list[str]] = {}
         for r in all_results:
             if getattr(r, "status", "") not in ("downloaded", "verified"):
                 missing_songs.setdefault(r.artist, []).append(r.song)

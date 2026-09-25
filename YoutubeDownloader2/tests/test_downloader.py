@@ -3,14 +3,9 @@
 from __future__ import annotations
 
 import threading
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pytest
-
-from ytdl_core.config import Config
 from ytdl_core.downloader import download_partial, execute_download
-from ytdl_core.events import DownloaderEvents
 
 
 class TestExecuteDownload:

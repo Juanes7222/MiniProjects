@@ -3,14 +3,9 @@
 from __future__ import annotations
 
 import threading
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
-from ytdl_core.config import Config
 from ytdl_core.fingerprint import AcoustIDCircuitBreaker
-from ytdl_core.result import DownloadResult
 from ytdl_core.verifier import _verify_single, verify_library
 
 

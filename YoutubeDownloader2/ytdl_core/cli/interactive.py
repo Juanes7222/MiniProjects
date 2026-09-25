@@ -10,7 +10,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import threading
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from rich.console import Console
 
@@ -249,8 +249,8 @@ def make_interactive_selector(
     video_preview: bool,
     preview_seconds: int,
     search_opts: dict,
-    pause_progress: Optional[callable] = None,
-    resume_progress: Optional[callable] = None,
+    pause_progress: Optional[Callable[[], None]] = None,
+    resume_progress: Optional[Callable[[], None]] = None,
     events: Any = None,
 ) -> Any:
     use_keyboard = False

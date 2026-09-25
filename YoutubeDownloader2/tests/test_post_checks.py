@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pytest
-
-from ytdl_core.config import Config
 from ytdl_core.post_checks import (
     check_duration,
     check_silence,

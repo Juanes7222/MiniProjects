@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from rich import box
 from rich.console import Console
@@ -53,13 +53,15 @@ class RichEvents(DownloaderEvents):
         self.score_threshold = score_threshold
         self.config = config
         self.decision_threshold = decision_threshold
+        self.confirm_fn: Any | None = None
+        self.selector_fn: Any | None = None
         self._lock = threading.Lock()
 
         self._progress: Optional[Progress] = None
         self._tasks: dict[str, TaskID] = {}
         self._tasks_lock = threading.Lock()
 
-        self._buffer: list[str] = []
+        self._buffer: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self._buffering = False
 
     # ------------------------------------------------------------------

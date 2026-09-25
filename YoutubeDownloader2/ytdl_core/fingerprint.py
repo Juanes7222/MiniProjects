@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import acoustid
 import mutagen
@@ -92,9 +92,9 @@ def verify_fingerprint(
     acoustid_key: str,
     config: Config,
     circuit_breaker: AcoustIDCircuitBreaker,
-    on_warn: Optional[callable] = None,
-    on_info: Optional[callable] = None,
-    on_fingerprint_error: Optional[callable] = None,
+    on_warn: Optional[Callable[[str], None]] = None,
+    on_info: Optional[Callable[[str], None]] = None,
+    on_fingerprint_error: Optional[Callable[[str, str, str], None]] = None,
 ) -> tuple[bool, float, str]:
     """
     Verify an audio file's fingerprint against AcoustID.

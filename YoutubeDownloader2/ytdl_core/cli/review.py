@@ -35,7 +35,7 @@ from ..utils import format_duration
 _ACTIONS = ("accept", "delete", "redownload", "fingerprint", "listen", "skip")
 
 
-def _format_bytes(n: int) -> str:
+def _format_bytes(n: float) -> str:
     if not n:
         return "--"
     for unit in ("B", "KB", "MB", "GB"):

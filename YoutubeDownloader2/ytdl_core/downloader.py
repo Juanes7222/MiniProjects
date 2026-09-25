@@ -23,7 +23,7 @@ from .config import Config
 from .events import DownloaderEvents
 from .state import save_state
 from .utils import sanitize_filename
-from .ytdlp_options import build_ytdlp_base_opts, make_progress_hook, resolve_downloaded_file
+from .ytdlp_options import make_progress_hook, resolve_downloaded_file
 
 
 def execute_download(
@@ -64,8 +64,9 @@ def execute_download(
 
     progress_hook = make_progress_hook(events, artist, song)
 
+    ydl_opts: Any
     if is_video:
-        ydl_opts: Any = {
+        ydl_opts = {
             "format": f"bestvideo[height<={quality}]+bestaudio/bestvideo[height<={quality}]/best",
             "outtmpl": output_template,
             "merge_output_format": "mp4",
@@ -83,7 +84,7 @@ def execute_download(
             },
         }
     else:
-        ydl_opts: Any = {
+        ydl_opts = {
             "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "outtmpl": output_template,
             "quiet": True,

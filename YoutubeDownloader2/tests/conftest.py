@@ -2,16 +2,10 @@
 
 from __future__ import annotations
 
-import threading
-from pathlib import Path
-from typing import Optional
-from unittest.mock import MagicMock
-
 import pytest
 
 from ytdl_core.config import Config
 from ytdl_core.events import DownloaderEvents
-from ytdl_core.result import DownloadResult
 
 
 class SpyEvents(DownloaderEvents):
@@ -137,7 +131,6 @@ def tmp_audio(tmp_path):
 
     Uses mutagen to create a tiny but valid audio file.
     """
-    from mutagen.mp3 import MP3
     from mutagen.id3 import ID3, TIT2, TPE1
 
     mp3_path = tmp_path / "test.mp3"
@@ -155,7 +148,6 @@ def tmp_audio(tmp_path):
 def real_mp3(tmp_path):
     """Create a real playable MP3 file using pydub for testing duration checks."""
     try:
-        from pydub import AudioSegment
         from pydub.generators import Sine
 
         # Generate a 3-second sine wave

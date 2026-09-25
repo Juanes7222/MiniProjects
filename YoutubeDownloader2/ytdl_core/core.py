@@ -13,7 +13,6 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
 
 import yt_dlp
 from rapidfuzz import fuzz
@@ -261,7 +260,7 @@ class MusicDownloader:
                 for f in concurrent.futures.as_completed(fs):
                     try:
                         f.result()
-                    except:
+                    except Exception:
                         pass
         except KeyboardInterrupt:
             stop.set()

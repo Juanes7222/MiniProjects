@@ -12,14 +12,13 @@ import concurrent.futures
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .config import Config
 from .events import DownloaderEvents
 from .fingerprint import AcoustIDCircuitBreaker, verify_duration, verify_fingerprint
 from .metadata import fetch_musicbrainz
 from .result import DownloadResult
-from .state import load_state
 from .utils import apply_delay, compute_md5, sanitize_filename
 
 
@@ -145,7 +144,7 @@ def verify_library(
     fp_semaphore: threading.Semaphore,
     musicbrainz: bool,
     events: DownloaderEvents,
-    persist_fn: callable,
+    persist_fn: Callable[..., None],
     state: dict,
     state_lock: threading.Lock,
     require_fingerprint: bool = False,
