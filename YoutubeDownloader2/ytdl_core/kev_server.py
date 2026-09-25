@@ -36,8 +36,8 @@ class KevServerManager:
         self.on_step = on_step or (lambda message: None)
         self.process: subprocess.Popen | None = None
         self.log_file: TextIO | None = None
-        self._previous_signal_handlers: dict[int, Any] = {}
         self._job_handle: int | None = None
+        self._previous_sigterm_handler: Any = None
 
     def start(self) -> str:
         if not self._is_local_url():
@@ -58,7 +58,7 @@ class KevServerManager:
         self._verify_cuda()
         self._step(f"Kev: starting {self.run} on CUDA through kev.serve")
         self._start_process()
-        self._install_signal_handlers()
+        self._install_termination_handler()
         self._wait_until_ready()
         return self.url
 
@@ -98,7 +98,7 @@ class KevServerManager:
         if self._job_handle is not None:
             self._close_handle(self._job_handle)
             self._job_handle = None
-        self._restore_signal_handlers()
+        self._restore_termination_handler()
         if self.log_file is not None:
             self.log_file.close()
             self.log_file = None
@@ -211,25 +211,24 @@ class KevServerManager:
         env["KEV_FUSED"] = "0"
         return env
 
-    def _install_signal_handlers(self) -> None:
+    def _install_termination_handler(self) -> None:
         if threading.current_thread() is not threading.main_thread():
             return
+        self._previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, self._handle_termination)
 
-        def handle(signum, frame):
-            self.stop()
-            raise KeyboardInterrupt
+    def _handle_termination(self, _signum: int, _frame: Any) -> None:
+        self.stop()
+        raise KeyboardInterrupt
 
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            self._previous_signal_handlers[signum] = signal.getsignal(signum)
-            signal.signal(signum, handle)
-
-    def _restore_signal_handlers(self) -> None:
-        for signum, handler in self._previous_signal_handlers.items():
-            try:
-                signal.signal(signum, handler)
-            except ValueError:
-                pass
-        self._previous_signal_handlers.clear()
+    def _restore_termination_handler(self) -> None:
+        if self._previous_sigterm_handler is None:
+            return
+        try:
+            signal.signal(signal.SIGTERM, self._previous_sigterm_handler)
+        except ValueError:
+            pass
+        self._previous_sigterm_handler = None
 
     def _start_process(self) -> None:
         log_path = self.root / "ytdl-kev.log"

@@ -237,6 +237,45 @@ class TestVerifyLibrary:
         assert results[0].status == "failed"
         assert "does not exist" in results[0].reason
 
+    def test_migrates_legacy_cached_path(self, tmp_path, spy_events, config):
+        legacy_file = tmp_path / "Artist" / "Song.mp3.mp3"
+        legacy_file.parent.mkdir(parents=True)
+        legacy_file.write_bytes(b"\x00" * 60000)
+        target_file = tmp_path / "Artist" / "Song.mp3"
+        state = {
+            "downloads": {
+                "Artist::Song": {
+                    "status": "verified",
+                    "file_path": str(legacy_file),
+                    "md5": "abc123",
+                }
+            }
+        }
+        persist = MagicMock()
+
+        with patch("ytdl_core.verifier.verify_duration", return_value=(True, 180)):
+            with patch("ytdl_core.verifier.compute_md5", return_value="abc123"):
+                results = verify_library(
+                    {"Artist": ["Song"]},
+                    tmp_path,
+                    "mp3",
+                    1,
+                    None,
+                    config,
+                    AcoustIDCircuitBreaker(),
+                    threading.Semaphore(2),
+                    False,
+                    spy_events,
+                    persist,
+                    state,
+                    threading.Lock(),
+                )
+
+        assert results[0].status == "verified"
+        assert results[0].file_path == target_file
+        assert not legacy_file.exists()
+        assert persist.call_args.args[5] == str(target_file)
+
     def test_rechecks_cached_verification_without_md5(self, tmp_path, spy_events, config):
         file_path = tmp_path / "Artist" / "Song.mp3"
         file_path.parent.mkdir(parents=True)

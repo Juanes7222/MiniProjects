@@ -47,6 +47,9 @@ def test_kev_uses_local_systemone_api(monkeypatch):
     assert captured["url"] == "http://127.0.0.1:8009/v1/systemone"
     assert captured["json"]["model"] == "kev-4b"
     assert captured["json"]["questions"]["candidate_0"]["type"] == "noul"
+    instructions = captured["json"]["questions"]["candidate_0"]["instructions"]
+    assert "official live version" in instructions
+    assert "Prefer studio recordings" in instructions
     assert ranked[0][0]["_decision_selected"] is True
 
 

@@ -11,6 +11,7 @@ import shutil
 import sys
 import time
 import unicodedata
+from collections.abc import Collection
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,19 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r'[/\\:*?"<>|]', "", name)
     name = re.sub(r"\s+", " ", name).strip(" .")
     return name[:200]
+
+
+def migrate_legacy_audio_path(path: Path) -> Path:
+    if not path.suffix:
+        return path
+    legacy_path = path.with_name(f"{path.name}{path.suffix}")
+    if not legacy_path.is_file() or path.exists():
+        return path
+    try:
+        legacy_path.replace(path)
+    except OSError:
+        return legacy_path
+    return path
 
 
 def format_duration(seconds: int) -> str:
@@ -105,14 +119,6 @@ def strip_featuring(text: str) -> str:
     return _FEAT_PATTERN.sub("", text).strip()
 
 
-def contains_forbidden_phrase(text: str, forbidden: set[str]) -> str | None:
-    """
-    Return the forbidden phrase found in text, or None if not found.
-    """
+def find_forbidden_phrases(text: str, forbidden: Collection[str]) -> set[str]:
     normalized = f" {normalize_title(text)} "
-
-    for phrase in forbidden:
-        if f" {normalize_title(phrase)} " in normalized:
-            return phrase
-
-    return None
+    return {phrase for phrase in forbidden if f" {normalize_title(phrase)} " in normalized}

@@ -12,7 +12,7 @@ from .events import DownloaderEvents
 from .fingerprint import AcoustIDCircuitBreaker, verify_duration, verify_fingerprint
 from .metadata import fetch_musicbrainz
 from .result import DownloadResult
-from .utils import apply_delay, compute_md5, sanitize_filename
+from .utils import apply_delay, compute_md5, migrate_legacy_audio_path, sanitize_filename
 
 _MIN_FILE_SIZE = 50 * 1024
 _FINGERPRINT_ERRORS = frozenset(
@@ -47,7 +47,9 @@ def _verify_single(
     if stop_event.is_set():
         return DownloadResult(artist=artist, song=song, status="skipped", reason="Interrupted")
 
-    expected_file = output_dir / sanitize_filename(artist) / f"{sanitize_filename(song)}.{fmt}"
+    expected_file = migrate_legacy_audio_path(
+        output_dir / sanitize_filename(artist) / f"{sanitize_filename(song)}.{fmt}"
+    )
     if not expected_file.is_file():
         return _failed_result(artist, song, "File does not exist")
 
@@ -143,9 +145,13 @@ def _restore_cached_result(
     if not raw_path:
         return None
     file_path = Path(raw_path)
-    expected_file = output_dir / sanitize_filename(artist) / f"{sanitize_filename(song)}.{fmt}"
-    if file_path != expected_file or not file_path.is_file():
+    expected_file = migrate_legacy_audio_path(
+        output_dir / sanitize_filename(artist) / f"{sanitize_filename(song)}.{fmt}"
+    )
+    legacy_state_path = expected_file.with_name(f"{expected_file.name}{expected_file.suffix}")
+    if file_path not in {expected_file, legacy_state_path} or not expected_file.is_file():
         return None
+    file_path = expected_file
 
     try:
         file_size = file_path.stat().st_size
@@ -215,6 +221,26 @@ def verify_library(
             )
             if cached_result:
                 results_map[(artist, song)] = cached_result
+                if Path(entry_state.get("file_path", "")) != cached_result.file_path:
+                    cached_options: dict[str, Any] = {
+                        "fingerprint_verified": cached_result.fingerprint_verified,
+                        "fingerprint_confidence": cached_result.fingerprint_confidence,
+                        "fingerprint_label": cached_result.fingerprint_label,
+                        "preserve_timestamp": True,
+                    }
+                    if state_filename is not None:
+                        cached_options["state_filename"] = state_filename
+                    persist_fn(
+                        state,
+                        state_lock,
+                        key,
+                        "verified",
+                        entry_state.get("url"),
+                        str(cached_result.file_path),
+                        cached_result.md5,
+                        output_dir,
+                        **cached_options,
+                    )
             else:
                 results_map[(artist, song)] = DownloadResult(
                     artist=artist,

@@ -11,6 +11,7 @@ import pytest
 from ytdl_core.config import Config
 from ytdl_core.core import MusicDownloader
 from ytdl_core.events import DownloaderEvents
+from ytdl_core.jev import JevEvaluationError
 from ytdl_core.result import DownloadResult
 from tests.conftest import SpyEvents
 
@@ -373,7 +374,7 @@ class TestDownload:
         assert "No valid result" in result.reason
         assert any(c[0] == "on_search_failed" for c in spy.calls)
 
-    def test_jev_below_threshold_still_reports_candidates(self, config, spy, output_dir):
+    def test_jev_below_threshold_uses_heuristic_fallback(self, config, spy, output_dir):
         candidate = _fake_search_result()
         ranked = [(candidate, 74, {"decision_probability": 74})]
         classifier = MagicMock()
@@ -389,19 +390,149 @@ class TestDownload:
             jev_runs=3,
             jev_classifier=classifier,
         )
+        result = DownloadResult(artist="Artist", song="Song")
+        state = {"downloads": {}}
+
+        with (
+            patch("ytdl_core.core.search_all_sources", return_value=[candidate]),
+            patch(
+                "ytdl_core.core.select_best_result",
+                return_value=(candidate, [(candidate, 80, {"base_match": 80})]),
+            ),
+        ):
+            best, reported, _ = jev_dl._search_and_select(
+                "Artist",
+                "Song",
+                output_dir,
+                state,
+                threading.Lock(),
+                "Artist::Song",
+                result,
+                threading.Event(),
+                None,
+            )
+
+        assert best is candidate
+        assert reported == ranked
+        assert result.selection_method == "jev-fallback"
+        assert classifier.select.call_args.kwargs["runs"] == 3
+        assert any(call[0] == "on_warn" and "fallback" in str(call) for call in spy.calls)
+
+    def test_download_preserves_fallback_selection_method(self, config, spy, output_dir):
+        candidate = _fake_search_result(score=80)
+        decided = dict(candidate)
+        decided.update(
+            {
+                "_heuristic_score": 80,
+                "_decision_probability": 0.4,
+                "_decision_runs": 1,
+            }
+        )
+        ranked = [(decided, 40, {"decision_probability": 40})]
+        classifier = MagicMock()
+        classifier.select.return_value = (None, ranked)
+        downloader = MusicDownloader(
+            config=config,
+            events=spy,
+            delay=(0, 0),
+            workers=1,
+            no_silence_check=True,
+            skip_fingerprint=True,
+            use_jev=True,
+            jev_classifier=classifier,
+        )
+        downloaded_file = output_dir / "Artist" / "Song.mp3"
+        downloaded_file.parent.mkdir(parents=True, exist_ok=True)
+        downloaded_file.write_bytes(b"\x00" * 60000)
         fake_search, fake_select = _mock_search_returns_one()
 
         with (
             patch("ytdl_core.core.search_all_sources", fake_search),
             patch("ytdl_core.core.select_best_result", fake_select),
+            patch(
+                "ytdl_core.core.execute_download",
+                return_value=(downloaded_file, ""),
+            ),
+            patch("ytdl_core.core.check_duration", return_value=(True, 200, None)),
+            patch("ytdl_core.core.embed_and_verify", return_value=True),
             patch("ytdl_core.core.apply_delay"),
         ):
-            result = jev_dl.download("Artist", "Song", output_dir)
+            result = downloader.download("Artist", "Song", output_dir)
 
-        assert result.status == "failed"
-        assert "Jev found no candidate" in result.reason
-        assert classifier.select.call_args.kwargs["runs"] == 3
-        assert any(call[0] == "on_candidates_scored" for call in spy.calls)
+        assert result.status == "downloaded"
+        assert result.selection_method == "jev-fallback"
+
+    def test_decision_provider_error_uses_heuristic_fallback(self, config, spy, output_dir):
+        candidate = _fake_search_result()
+        classifier = MagicMock()
+        classifier.select.side_effect = JevEvaluationError("Kev server is unavailable")
+        jev_dl = MusicDownloader(
+            config=config,
+            events=spy,
+            workers=1,
+            use_jev=True,
+            jev_classifier=classifier,
+        )
+        result = DownloadResult(artist="Artist", song="Song")
+
+        with (
+            patch("ytdl_core.core.search_all_sources", return_value=[candidate]),
+            patch(
+                "ytdl_core.core.select_best_result",
+                return_value=(candidate, [(candidate, 80, {"base_match": 80})]),
+            ),
+        ):
+            best, _, _ = jev_dl._search_and_select(
+                "Artist",
+                "Song",
+                output_dir,
+                {"downloads": {}},
+                threading.Lock(),
+                "Artist::Song",
+                result,
+                threading.Event(),
+                None,
+            )
+
+        assert best is candidate
+        assert result.selection_method == "jev-fallback"
+
+    def test_low_heuristic_candidate_does_not_use_fallback(self, config, spy, output_dir):
+        candidate = _fake_search_result(score=60)
+        decided = dict(candidate)
+        decided.update({"_heuristic_score": 60, "_decision_probability": 0.1})
+        classifier = MagicMock()
+        classifier.select.return_value = (None, [(decided, 10, {})])
+        downloader = MusicDownloader(
+            config=config,
+            events=spy,
+            workers=1,
+            use_jev=True,
+            jev_classifier=classifier,
+        )
+        result = DownloadResult(artist="Artist", song="Song")
+
+        with (
+            patch("ytdl_core.core.search_all_sources", return_value=[candidate]),
+            patch(
+                "ytdl_core.core.select_best_result",
+                return_value=(None, [(candidate, 60, {})]),
+            ),
+        ):
+            best, _, _ = downloader._search_and_select(
+                "Artist",
+                "Song",
+                output_dir,
+                {"downloads": {}},
+                threading.Lock(),
+                "Artist::Song",
+                result,
+                threading.Event(),
+                None,
+            )
+
+        assert best is None
+        assert "no valid heuristic candidate" in result.reason
 
     def test_skip_existing_with_matching_md5(self, dl, output_dir, spy):
         fake_file = output_dir / "Artist" / "Song.mp3"
@@ -427,6 +558,32 @@ class TestDownload:
         assert result.status == "skipped"
         assert result.md5 == md5
         assert any(c[0] == "on_skip_existing" for c in spy.calls)
+
+    def test_skip_existing_migrates_legacy_file(self, dl, output_dir, spy):
+        from ytdl_core.utils import compute_md5
+
+        legacy_file = output_dir / "Artist" / "Song.mp3.mp3"
+        legacy_file.parent.mkdir(parents=True, exist_ok=True)
+        legacy_file.write_bytes(b"\x00" * 60000)
+        target_file = output_dir / "Artist" / "Song.mp3"
+        state = {
+            "downloads": {
+                "Artist::Song": {
+                    "status": "downloaded",
+                    "md5": compute_md5(legacy_file),
+                }
+            }
+        }
+
+        with (
+            patch("ytdl_core.core.load_state", return_value=state),
+            patch("ytdl_core.core.apply_delay"),
+        ):
+            result = dl.download("Artist", "Song", output_dir, skip_existing=True)
+
+        assert result.status == "skipped"
+        assert result.file_path == target_file
+        assert not legacy_file.exists()
 
     def test_skip_existing_md5_mismatch_triggers_redownload(self, dl, output_dir, spy):
         fake_file = output_dir / "Artist" / "Song.mp3"

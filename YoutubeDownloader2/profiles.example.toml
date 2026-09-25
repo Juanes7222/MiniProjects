@@ -7,7 +7,7 @@ delay = [1.0, 3.0]
 sources = ["youtube", "soundcloud"]
 musicbrainz = true
 skip-existing = true
-max-results = 8
+max-results = 10
 score-threshold = 30
 report = ["json"]
 

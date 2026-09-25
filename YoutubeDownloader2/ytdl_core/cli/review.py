@@ -30,7 +30,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from ..state import load_state, save_state
-from ..utils import format_duration
+from ..utils import format_duration, migrate_legacy_audio_path
 
 _ACTIONS = ("accept", "delete", "redownload", "fingerprint", "listen", "skip")
 
@@ -79,9 +79,10 @@ def _build_candidates(
         fp = entry.get("file_path")
         if not fp:
             continue
-        path = Path(fp)
+        path = migrate_legacy_audio_path(Path(fp))
         if not path.exists():
             continue
+        entry["file_path"] = str(path)
         suspect = bool(entry.get("fingerprint_confidence", 0) > 0)
         if only_suspects and not suspect:
             continue

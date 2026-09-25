@@ -216,6 +216,15 @@ class TestHasExcessiveSilence:
         assert is_exc is False
         assert ratio == 0.0
 
+    def test_decodes_ffmpeg_output_as_utf8(self, tmp_path, config):
+        with patch("ytdl_core.fingerprint.subprocess.run") as run:
+            run.return_value.stderr = "Duration: 00:03:00.00\n"
+
+            has_excessive_silence(tmp_path / "audio.mp3", config)
+
+        assert run.call_args.kwargs["encoding"] == "utf-8"
+        assert run.call_args.kwargs["errors"] == "replace"
+
     def test_returns_false_for_real_audio(self, real_mp3, config):
         """A 3-second sine wave should have very little silence."""
         is_exc, ratio = has_excessive_silence(real_mp3, config)

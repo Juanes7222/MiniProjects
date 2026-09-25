@@ -22,7 +22,7 @@ from yt_dlp.utils import DownloadError, ExtractorError
 from .config import Config
 from .events import DownloaderEvents
 from .state import save_state
-from .utils import sanitize_filename
+from .utils import migrate_legacy_audio_path, sanitize_filename
 from .ytdlp_options import build_ytdlp_base_opts, make_progress_hook, resolve_downloaded_file
 
 
@@ -63,7 +63,8 @@ def execute_download(
     """
     safe_artist = sanitize_filename(artist)
     safe_song = sanitize_filename(song)
-    output_template = output_dir / safe_artist / f"{safe_song}.{fmt}"
+    target_file = migrate_legacy_audio_path(output_dir / safe_artist / f"{safe_song}.{fmt}")
+    output_template = target_file.with_suffix(".%(ext)s")
     progress_hook = make_progress_hook(events, artist, song)
     ydl_opts = build_ytdlp_base_opts(
         output_dir=output_dir,

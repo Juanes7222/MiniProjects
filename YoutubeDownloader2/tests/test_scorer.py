@@ -76,15 +76,46 @@ class TestHardRejection:
         )
         assert score == -9999
 
-    def test_rejects_live(self, config):
-        score, bd = score_youtube_result(
+    def test_prefers_studio_over_live(self, config):
+        studio_score, _ = score_youtube_result(
+            _yt("Artist - Song", channel="Artist - Topic"),
+            "Artist",
+            "Song",
+            None,
+            config,
+        )
+        live_score, live_breakdown = score_youtube_result(
             _yt("Artist - Song Live at Concert"),
             "Artist",
             "Song",
             None,
             config,
         )
-        assert score == -9999
+
+        assert live_score != -9999
+        assert live_score < studio_score
+        assert live_breakdown["live_version"] == config.LIVE_PENALTY
+
+        version_score, version_breakdown = score_youtube_result(
+            _yt("Artist - Song (Live Version)"),
+            "Artist",
+            "Song",
+            None,
+            config,
+        )
+
+        assert version_score != -9999
+        assert version_breakdown["live_version"] == config.LIVE_PENALTY
+
+        rejected_score, _ = score_youtube_result(
+            _yt("Artist - Song (Live Version, Bass Boosted)"),
+            "Artist",
+            "Song",
+            None,
+            config,
+        )
+
+        assert rejected_score == -9999
 
     def test_rejects_nightcore(self, config):
         score, bd = score_youtube_result(
@@ -199,8 +230,8 @@ class TestYTMusicAPI:
         score, bd = score_youtube_result(r, "Wiso Aponte", "Dios Es Amor", None, config)
         assert "official_ytmusic_api" not in bd
 
-    def test_forbidden_title_is_rejected(self, config):
-        result = _api("Artist - Song (Live)", artists=["Artist"])
+    def test_live_catalog_entry_is_penalized(self, config):
+        result = _api("Artist - Song (En Vivo)", artists=["Artist"])
 
         score, breakdown = score_youtube_result(
             result,
@@ -210,8 +241,8 @@ class TestYTMusicAPI:
             config,
         )
 
-        assert score == -9999
-        assert "hard_reject_live" in breakdown
+        assert score != -9999
+        assert breakdown["live_version"] == config.LIVE_PENALTY
 
     def test_duration_perfect(self, config):
         r = _api("Dios Es Amor", artists=["Wiso Aponte"], duration=200)

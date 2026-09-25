@@ -59,6 +59,34 @@ class TestExecuteDownload:
             assert file is not None
             assert file.exists()
             assert err == ""
+            assert MockYDL.call_args.args[0]["outtmpl"].endswith("Song.%(ext)s")
+
+    def test_migrates_legacy_double_extension(self, tmp_path, spy_events, config):
+        legacy_file = tmp_path / "Artist" / "Song.mp3.mp3"
+        legacy_file.parent.mkdir(parents=True, exist_ok=True)
+        legacy_file.write_bytes(b"converted audio")
+        target_file = tmp_path / "Artist" / "Song.mp3"
+
+        with patch("ytdl_core.downloader.yt_dlp.YoutubeDL") as MockYDL:
+            instance = MockYDL.return_value.__enter__.return_value
+            instance.extract_info.return_value = {"title": "Song"}
+            instance.prepare_filename.return_value = str(target_file)
+
+            file, err = execute_download(
+                "http://example.com/video",
+                tmp_path,
+                "mp3",
+                "192",
+                "Artist",
+                "Song",
+                spy_events,
+                config,
+                threading.Event(),
+            )
+
+        assert err == ""
+        assert file == target_file
+        assert not legacy_file.exists()
 
     def test_respects_stop_event(self, tmp_path, spy_events, config):
         stop = threading.Event()

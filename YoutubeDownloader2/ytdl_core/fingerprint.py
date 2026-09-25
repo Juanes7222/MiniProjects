@@ -200,7 +200,14 @@ def has_excessive_silence(file_path: Path, config: Config) -> tuple[bool, float]
             "-",
         ]
 
-        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
 
         silences = [
             float(match) for match in re.findall(r"silence_duration: ([\d\.]+)", res.stderr)

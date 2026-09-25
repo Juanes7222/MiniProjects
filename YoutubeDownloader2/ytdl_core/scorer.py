@@ -15,9 +15,9 @@ from typing import Optional
 
 from rapidfuzz import fuzz
 
-from .config import Config
+from .config import DEFAULT_FORBIDDEN_TERMS, DEFAULT_LIVE_TERMS, Config
 from .utils import (
-    contains_forbidden_phrase,
+    find_forbidden_phrases,
     normalize_title,
     remove_matching_noise,
     strip_featuring,
@@ -35,7 +35,7 @@ def score_youtube_result(
     Score a single search candidate against the target artist + song.
 
     Uses a composite heuristic with hard-rejection gates for forbidden
-    patterns (covers, live, remix), fuzzy title/artist matching, channel
+    patterns (covers and remixes), fuzzy title/artist matching, channel
     authority signals, duration alignment, and cross-source consensus.
 
     Returns (composite_score, breakdown_dict).
@@ -49,10 +49,19 @@ def score_youtube_result(
     breakdown: dict[str, int] = {}
     artist_clean = normalize_title(strip_featuring(artist.lower()))
     song_clean = normalize_title(strip_featuring(song.lower()))
-    forbidden_match = contains_forbidden_phrase(raw_title, config.FORBIDEN_TERMS)
-    forbidden_in_query = contains_forbidden_phrase(f"{artist} {song}", config.FORBIDEN_TERMS)
-    if forbidden_match and not forbidden_in_query:
-        return -9999, {f"hard_reject_{forbidden_match}": -9999}
+    forbidden_terms = getattr(config, "FORBIDDEN_TERMS", DEFAULT_FORBIDDEN_TERMS)
+    title_forbidden = find_forbidden_phrases(raw_title, forbidden_terms)
+    query_forbidden = find_forbidden_phrases(f"{artist} {song}", forbidden_terms)
+    live_terms = getattr(config, "LIVE_TERMS", DEFAULT_LIVE_TERMS)
+    title_live = find_forbidden_phrases(raw_title, live_terms)
+    query_live = find_forbidden_phrases(f"{artist} {song}", live_terms)
+    is_live_version = bool(title_live and not query_live)
+    live_descriptor_allowed = is_live_version and title_forbidden.issubset({"version", "extended"})
+    if title_forbidden and not query_forbidden and not live_descriptor_allowed:
+        return -9999, {f"hard_reject_{min(title_forbidden)}": -9999}
+
+    if is_live_version:
+        breakdown["live_version"] = config.LIVE_PENALTY
 
     if entry.get("_source") == "ytmusic_api":
         title_clean = normalize_title(strip_featuring(raw_title.lower()))

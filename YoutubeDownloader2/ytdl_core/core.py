@@ -31,7 +31,7 @@ from .reports import export_report, update_json_file
 from .result import DownloadResult
 from .search import search_all_sources, select_best_result
 from .state import load_state, save_state
-from .utils import apply_delay, compute_md5, sanitize_filename
+from .utils import apply_delay, compute_md5, migrate_legacy_audio_path, sanitize_filename
 from .verifier import verify_library as _verify_library
 from .ytdlp_options import build_ytdlp_base_opts, make_progress_hook, resolve_downloaded_file
 
@@ -323,7 +323,9 @@ class MusicDownloader:
             if stop.is_set():
                 return
             result = DownloadResult(artist=ia, song=it)
-            target_file = output_dir / sanitize_filename(ia) / f"{sanitize_filename(it)}.{fmt}"
+            target_file = migrate_legacy_audio_path(
+                output_dir / sanitize_filename(ia) / f"{sanitize_filename(it)}.{fmt}"
+            )
             progress_hook = make_progress_hook(self.events, ia, it)
             options = build_ytdlp_base_opts(
                 output_dir=output_dir,
@@ -339,7 +341,7 @@ class MusicDownloader:
                 enable_remote_components=True,
                 youtube_player_clients=list(self.config.YOUTUBE_PLAYER_CLIENTS),
                 noplaylist=True,
-                output_template=target_file,
+                output_template=target_file.with_suffix(".%(ext)s"),
                 embed_thumbnail=True,
             )
             if skip_existing and target_file.exists():
@@ -431,7 +433,7 @@ class MusicDownloader:
             result.reason = "Interrupted"
             return result
         safe_a, safe_s = sanitize_filename(artist), sanitize_filename(song)
-        expected = output_dir / safe_a / f"{safe_s}.{fmt}"
+        expected = migrate_legacy_audio_path(output_dir / safe_a / f"{safe_s}.{fmt}")
         with state_lock:
             existing = state.get("downloads", {}).get(key)
         if skip_existing and existing and existing.get("status") == "downloaded":
@@ -480,7 +482,8 @@ class MusicDownloader:
         result.decision_probability = best.get("_decision_probability")
         result.decision_samples = list(best.get("_decision_samples") or [])
         result.decision_runs = int(best.get("_decision_runs") or 0)
-        result.selection_method = self.decision_provider
+        if result.selection_method == "heuristic":
+            result.selection_method = self.decision_provider
         fp_ok, fp_conf, fp_title, fp_label = self._fingerprint_check(
             artist, song, url, output_dir, best, ranked, result
         )
@@ -605,6 +608,9 @@ class MusicDownloader:
             if not ranked:
                 self.events.on_search_failed(artist, song, self.sources)
             elif self.decision_classifier is not None:
+                decision_best = None
+                decision_ranked = None
+                decision_error = None
                 try:
                     decision_best, decision_ranked = self.decision_classifier.select(
                         artist,
@@ -614,43 +620,69 @@ class MusicDownloader:
                         runs=self.decision_runs,
                     )
                 except JevEvaluationError as exc:
-                    result.selection_method = self.decision_provider
-                    result.reason = str(exc)
-                    self.events.on_warn(f"{self.decision_provider}: {exc}")
-                    self._persist(
-                        state,
-                        state_lock,
-                        key,
-                        "failed",
-                        None,
-                        None,
-                        None,
-                        output_dir,
-                        state_filename=self.config.STATE_FILE,
-                    )
-                    return None, ranked, None
-                ranked = decision_ranked
+                    decision_error = exc
+
+                if decision_ranked:
+                    ranked = decision_ranked
                 result.selection_method = self.decision_provider
                 self.events.on_candidates_scored(artist, song, ranked)
+
                 if decision_best is None:
-                    result.reason = (
-                        f"{self.decision_provider.capitalize()} found no candidate at or above "
-                        f"{self.decision_threshold:.2f}"
+
+                    def heuristic_score(entry: dict) -> int:
+                        value = entry.get("_heuristic_score")
+                        if value is None:
+                            value = entry.get("_composite_score")
+                        return int(value or 0)
+
+                    fallback_entry = (
+                        max(ranked, key=lambda item: heuristic_score(item[0]))[0]
+                        if ranked
+                        else None
                     )
-                    self.events.on_warn(result.reason)
-                    self._persist(
-                        state,
-                        state_lock,
-                        key,
-                        "failed",
-                        None,
-                        None,
-                        None,
-                        output_dir,
-                        state_filename=self.config.STATE_FILE,
+                    fallback_score = heuristic_score(fallback_entry) if fallback_entry else 0
+                    fallback_threshold = max(
+                        self.score_threshold,
+                        self.config.SCORE_THRESHOLD_SKIP_FINGERPRINT,
                     )
-                    return None, ranked, None
-                found = decision_best
+                    if fallback_entry and fallback_score >= fallback_threshold:
+                        found = fallback_entry
+                        result.selection_method = f"{self.decision_provider}-fallback"
+                        probability = fallback_entry.get("_decision_probability")
+                        detail = (
+                            str(decision_error)
+                            if decision_error
+                            else f"best confidence {float(probability or 0):.0%} is below "
+                            f"{self.decision_threshold:.0%}"
+                        )
+                        self.events.on_warn(
+                            f"{self.decision_provider}: {detail}; using heuristic fallback"
+                        )
+                    else:
+                        result.reason = (
+                            str(decision_error)
+                            if decision_error
+                            else (
+                                f"{self.decision_provider.capitalize()} found no candidate at "
+                                f"or above {self.decision_threshold:.2f}, and no valid "
+                                "heuristic candidate remains"
+                            )
+                        )
+                        self.events.on_warn(result.reason)
+                        self._persist(
+                            state,
+                            state_lock,
+                            key,
+                            "failed",
+                            None,
+                            None,
+                            None,
+                            output_dir,
+                            state_filename=self.config.STATE_FILE,
+                        )
+                        return None, ranked, None
+                else:
+                    found = decision_best
             else:
                 self.events.on_candidates_scored(artist, song, ranked)
             if ranked:
