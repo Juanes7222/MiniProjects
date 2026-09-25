@@ -1,0 +1,16 @@
+{
+  "name": "youtubedownloader2",
+  "version": "1.0.0",
+  "description": "Batch audio downloader with composite scoring, AcoustID fingerprint verification, and MusicBrainz enrichment.",
+  "type": "module",
+  "scripts": {
+    "example": "node index.ts",
+    "jev": "node tools/jev.mts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "ai": "^7.0.114"
+  }
+}

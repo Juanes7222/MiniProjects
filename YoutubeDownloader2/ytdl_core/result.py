@@ -25,6 +25,8 @@ class DownloadResult:
 
     composite_score: int = 0
     score_breakdown: dict[str, int] = field(default_factory=dict)
+    jev_probability: Optional[float] = None
+    selection_method: str = "heuristic"
 
     duration_seconds: int = 0
     file_path: Optional[Path] = None

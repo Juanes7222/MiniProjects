@@ -101,6 +101,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--score-threshold", metavar="INT", type=int, default=_CONFIG.SCORE_THRESHOLD_REJECT
     )
+    p.add_argument(
+        "--jev",
+        action="store_true",
+        help="Use Jev through Vercel AI Gateway to choose the candidate for each song.",
+    )
+    p.add_argument(
+        "--jev-threshold",
+        metavar="FLOAT",
+        type=float,
+        default=_CONFIG.JEV_DEFAULT_THRESHOLD,
+        help="Minimum Jev probability required to download (default: %(default)s).",
+    )
     p.add_argument("--no-silence-check", action="store_true")
 
     p.add_argument("--skip-existing", action="store_true")
@@ -198,6 +210,14 @@ def parse_args() -> argparse.Namespace:
         p.error("--review-only-suspects requires --review")
     if args.review and (args.verify or args.repair):
         p.error("--review cannot be combined with --verify or --repair")
+    if not 0 < args.jev_threshold <= 1:
+        p.error("--jev-threshold must be greater than 0 and at most 1")
+    if args.jev and args.url:
+        p.error("--jev cannot be used with --url")
+    if args.jev and (args.verify or args.repair or args.review):
+        p.error("--jev cannot be combined with --verify, --repair, or --review")
+    if args.jev and args.dry_run:
+        p.error("--jev cannot be used with --dry-run")
 
     args.workers = max(1, min(args.workers, _CONFIG.MAX_WORKERS))
     args.sources = [s.strip().lower() for s in args.sources.split(",") if s.strip()]

@@ -178,6 +178,9 @@ def main() -> None:
             f"[bold]AcoustID:[/bold] {acoustid_status}\n"
             f"[bold]Fingerprint:[/bold] "
             f"{'strict (download blocked unless confirmed)' if args.fingerprint_mode == 'strict' else 'lenient (report unverified)'}\n"
+            f"[bold]Jev:[/bold] "
+            f"{'enabled' if args.jev else 'disabled'} | "
+            f"[bold]Jev threshold:[/bold] {args.jev_threshold:.2f}\n"
             f"[bold]Silence check:[/bold] "
             f"{'disabled' if args.no_silence_check else 'enabled'} | "
             f"[bold]Score threshold:[/bold] {args.score_threshold}",
@@ -261,6 +264,8 @@ def main() -> None:
         cookies_browser=args.cookies_browser,
         cookies_file=str(args.cookies) if args.cookies else None,
         proxy=args.proxy,
+        use_jev=args.jev,
+        jev_threshold=args.jev_threshold,
     )
 
     if getattr(args, "verify", False) or getattr(args, "repair", False):

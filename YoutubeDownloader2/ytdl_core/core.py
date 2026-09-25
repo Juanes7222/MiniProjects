@@ -22,6 +22,7 @@ from .config import Config
 from .downloader import download_partial, execute_download
 from .events import DownloaderEvents
 from .fingerprint import AcoustIDCircuitBreaker, verify_fingerprint
+from .jev import JevClassifier, JevEvaluationError
 from .metadata import fetch_musicbrainz
 from .post_checks import check_duration, check_silence, embed_and_verify, enrich_musicbrainz
 from .reports import export_report, update_json_file
@@ -38,7 +39,8 @@ class MusicDownloader:
                  skip_fingerprint=False, require_fingerprint=False, no_silence_check=False,
                  score_threshold=None, sources=None, workers=2, delay=(2.0, 5.0),
                  max_results=5, fuzzy_threshold=65, max_duration=None, min_duration=None,
-                 musicbrainz=False, cookies_browser=None, cookies_file=None, proxy=None):
+                 musicbrainz=False, cookies_browser=None, cookies_file=None, proxy=None,
+                 use_jev=False, jev_threshold=None, jev_classifier=None):
         self.config = config or Config()
         self.events = events or DownloaderEvents()
         self.acoustid_key = acoustid_key
@@ -58,6 +60,13 @@ class MusicDownloader:
         self.cookies_browser = cookies_browser
         self.cookies_file = cookies_file
         self.proxy = proxy
+        self.use_jev = use_jev
+        self.jev_threshold = (
+            jev_threshold if jev_threshold is not None else self.config.JEV_DEFAULT_THRESHOLD
+        )
+        self.jev_classifier = jev_classifier or (
+            JevClassifier(threshold=self.jev_threshold) if use_jev else None
+        )
         self.fpcalc_available = shutil.which("fpcalc") is not None
         self._fp_semaphore = threading.Semaphore(3)
         self._circuit_breaker = AcoustIDCircuitBreaker(cooldown_seconds=60.0)
@@ -305,6 +314,8 @@ class MusicDownloader:
         result.duration_seconds = dur_s
         result.composite_score = best.get("_composite_score", 0)
         result.score_breakdown = best.get("_score_breakdown", {})
+        result.jev_probability = best.get("_jev_probability")
+        result.selection_method = "jev" if self.use_jev else "heuristic"
         fp_ok, fp_conf, fp_title, fp_label = self._fingerprint_check(
             artist, song, url, output_dir, best, ranked, result)
         sc = result.composite_score
@@ -358,6 +369,29 @@ class MusicDownloader:
                 self.events.confirm_fn)
             if not ranked:
                 self.events.on_search_failed(artist, song, self.sources)
+            elif self.jev_classifier is not None:
+                try:
+                    jev_best, jev_ranked = self.jev_classifier.select(
+                        artist, song, [entry for entry, _, _ in ranked]
+                    )
+                except JevEvaluationError as exc:
+                    result.selection_method = "jev"
+                    result.reason = str(exc)
+                    self.events.on_warn(f"[red]Jev: {exc}[/red]")
+                    self._persist(state, state_lock, key, "failed", None, None, None, output_dir)
+                    return None, ranked, None
+                ranked = jev_ranked
+                result.selection_method = "jev"
+                if jev_best is None:
+                    result.reason = (
+                        f"Jev found no candidate at or above "
+                        f"{self.jev_threshold:.2f}"
+                    )
+                    self.events.on_warn(f"[yellow]{result.reason}[/yellow]")
+                    self._persist(state, state_lock, key, "failed", None, None, None, output_dir)
+                    return None, ranked, None
+                found = jev_best
+                self.events.on_candidates_scored(artist, song, ranked)
             else:
                 self.events.on_candidates_scored(artist, song, ranked)
             if ranked:
