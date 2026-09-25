@@ -13,6 +13,7 @@ class JevEvaluationError(RuntimeError):
 
 
 class JevClassifier:
+    provider_name = "Jev"
     def __init__(
         self,
         project_root: Path | None = None,
@@ -36,7 +37,7 @@ class JevClassifier:
         if not candidates:
             return None, []
         if isinstance(runs, bool) or not isinstance(runs, int) or runs < 1:
-            raise JevEvaluationError("Jev runs must be at least 1")
+            raise JevEvaluationError(f"{self.provider_name} runs must be at least 1")
 
         candidate_payloads = [
             self._candidate_payload(candidate, index)
@@ -65,11 +66,8 @@ class JevClassifier:
         for _ in range(runs):
             answers = self._evaluate(payload)
             for candidate in candidate_payloads:
-                answer = answers.get(candidate["key"])
-                if not isinstance(answer, dict) or answer.get("type") != "boolean":
-                    raise JevEvaluationError("Jev returned an invalid boolean answer")
                 probabilities[candidate["key"]].append(
-                    self._probability(answer.get("probability"))
+                    self._answer_probability(answers.get(candidate["key"]))
                 )
 
         evaluated: list[tuple[dict, int, dict[str, int]]] = []
@@ -79,34 +77,44 @@ class JevClassifier:
             entry = dict(candidate)
             heuristic_score = int(entry.get("_composite_score") or 0)
             breakdown = dict(entry.get("_score_breakdown") or {})
-            jev_score = int(round(probability * 100))
+            decision_score = int(round(probability * 100))
             entry["_heuristic_score"] = heuristic_score
             entry["_heuristic_breakdown"] = breakdown
-            entry["_jev_probability"] = probability
-            entry["_jev_samples"] = samples
-            entry["_jev_runs"] = len(samples)
-            entry["_jev_min"] = min(samples)
-            entry["_jev_max"] = max(samples)
-            entry["_jev_threshold"] = self.threshold
-            entry["_jev_selected"] = False
-            entry["_composite_score"] = jev_score
+            entry["_decision_provider"] = self.provider_name
+            entry["_decision_probability"] = probability
+            entry["_decision_samples"] = samples
+            entry["_decision_runs"] = len(samples)
+            entry["_decision_min"] = min(samples)
+            entry["_decision_max"] = max(samples)
+            entry["_decision_threshold"] = self.threshold
+            entry["_decision_selected"] = False
+            entry["_composite_score"] = decision_score
             entry["_score_breakdown"] = {
                 **breakdown,
-                "jev_probability": jev_score,
+                "decision_probability": decision_score,
             }
-            evaluated.append((entry, jev_score, entry["_score_breakdown"]))
+            evaluated.append((entry, decision_score, entry["_score_breakdown"]))
 
         evaluated.sort(
             key=lambda item: (item[1], item[0].get("_heuristic_score", 0)), reverse=True
         )
-        if not evaluated or evaluated[0][0]["_jev_probability"] < self.threshold:
+        if not evaluated or evaluated[0][0]["_decision_probability"] < self.threshold:
             return None, evaluated
 
         selected = dict(evaluated[0][0])
-        selected["_jev_selected"] = True
+        selected["_decision_selected"] = True
         selected_score, selected_breakdown = evaluated[0][1], evaluated[0][2]
         evaluated[0] = (selected, selected_score, selected_breakdown)
         return selected, evaluated
+
+    def _answer_probability(self, answer: Any) -> float:
+        if not isinstance(answer, dict):
+            raise JevEvaluationError(f"{self.provider_name} returned an invalid answer")
+        if "probability" in answer:
+            return self._probability(answer.get("probability"))
+        if "noul" in answer:
+            return self._probability(answer.get("noul"))
+        raise JevEvaluationError(f"{self.provider_name} returned an invalid probability answer")
 
     def _evaluate(self, payload: dict[str, Any]) -> dict[str, Any]:
         script = self.project_root / "tools" / "jev.mts"
@@ -233,12 +241,15 @@ class JevClassifier:
         channel = str(candidate.get("channel") or candidate.get("uploader") or "unknown channel")
         return f'candidate "{title}" uploaded by "{channel}"'
 
-    @staticmethod
-    def _probability(value: Any) -> float:
+    def _probability(self, value: Any) -> float:
         try:
             probability = float(value)
         except (TypeError, ValueError) as exc:
-            raise JevEvaluationError("Jev returned an invalid probability") from exc
+            raise JevEvaluationError(
+                f"{self.provider_name} returned an invalid probability"
+            ) from exc
         if not math.isfinite(probability) or not 0 <= probability <= 1:
-            raise JevEvaluationError("Jev returned an invalid probability")
+            raise JevEvaluationError(
+                f"{self.provider_name} returned an invalid probability"
+            )
         return probability

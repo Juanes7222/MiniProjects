@@ -21,6 +21,7 @@ review       – interactive manual review of unverified files
 
 from __future__ import annotations
 
+import atexit
 import json
 import shutil
 import sys
@@ -32,6 +33,7 @@ from rich.panel import Panel
 
 from ..config import Config
 from ..core import MusicDownloader
+from ..kev_server import KevServerError, KevServerManager
 from ..result import DownloadResult
 from ..utils import check_ffmpeg
 
@@ -178,10 +180,12 @@ def main() -> None:
             f"[bold]AcoustID:[/bold] {acoustid_status}\n"
             f"[bold]Fingerprint:[/bold] "
             f"{'strict (download blocked unless confirmed)' if args.fingerprint_mode == 'strict' else 'lenient (report unverified)'}\n"
-            f"[bold]Jev:[/bold] "
-            f"{'enabled' if args.jev else 'disabled'} | "
-            f"[bold]Jev threshold:[/bold] {args.jev_threshold:.2f} | "
-            f"[bold]Jev runs:[/bold] {args.jev_runs}\n"
+            f"[bold]Decision provider:[/bold] "
+            f"{'Kev' if args.kev else 'Jev' if args.jev else 'heuristic'} | "
+            f"[bold]Threshold:[/bold] "
+            f"{(args.kev_threshold if args.kev else args.jev_threshold):.2f} | "
+            f"[bold]Runs:[/bold] "
+            f"{(args.kev_runs if args.kev else args.jev_runs)}\n"
             f"[bold]Silence check:[/bold] "
             f"{'disabled' if args.no_silence_check else 'enabled'} | "
             f"[bold]Score threshold:[/bold] {args.score_threshold}",
@@ -200,8 +204,35 @@ def main() -> None:
         console,
         args.score_threshold,
         config,
-        jev_threshold=args.jev_threshold,
+        decision_threshold=args.kev_threshold if args.kev else args.jev_threshold,
     )
+
+    kev_manager = None
+    if args.kev:
+        kev_manager = KevServerManager(
+            root=args.kev_dir,
+            run=args.kev_run,
+            url=args.kev_url,
+            port=args.kev_port,
+            startup_timeout=args.kev_startup_timeout,
+            update=not args.kev_skip_update,
+            on_step=events.on_info,
+        )
+        try:
+            kev_manager.start()
+        except KevServerError as exc:
+            kev_manager.stop()
+            console.print(
+                Panel(
+                    f"[red]{exc}[/red]",
+                    title="[bold red] Kev Setup Failed[/bold red]",
+                    border_style="red",
+                )
+            )
+            if log_fh:
+                log_fh.close()
+            sys.exit(1)
+        atexit.register(kev_manager.stop)
 
     if args.interactive:
         stop_event = threading.Event()
@@ -271,8 +302,13 @@ def main() -> None:
         cookies_file=str(args.cookies) if args.cookies else None,
         proxy=args.proxy,
         use_jev=args.jev,
+        use_kev=args.kev,
         jev_threshold=args.jev_threshold,
         jev_runs=args.jev_runs,
+        kev_threshold=args.kev_threshold,
+        kev_runs=args.kev_runs,
+        kev_url=args.kev_url,
+        kev_model=args.kev_model,
     )
 
     if getattr(args, "verify", False) or getattr(args, "repair", False):

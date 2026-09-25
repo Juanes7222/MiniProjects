@@ -101,10 +101,74 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--score-threshold", metavar="INT", type=int, default=_CONFIG.SCORE_THRESHOLD_REJECT
     )
-    p.add_argument(
+    decision = p.add_mutually_exclusive_group()
+    decision.add_argument(
         "--jev",
         action="store_true",
         help="Use Jev through Vercel AI Gateway to choose the candidate for each song.",
+    )
+    decision.add_argument(
+        "--kev",
+        action="store_true",
+        help="Use a local Kev server to choose the candidate for each song.",
+    )
+    p.add_argument(
+        "--kev-url",
+        metavar="URL",
+        default="http://127.0.0.1:8009",
+        help="Kev server URL (default: %(default)s).",
+    )
+    p.add_argument(
+        "--kev-model",
+        metavar="MODEL",
+        default="kev-latest",
+        help="Kev API model name; the server's --run option selects the checkpoint (default: %(default)s).",
+    )
+    p.add_argument(
+        "--kev-run",
+        metavar="CHECKPOINT",
+        default="jaredpalmer/kev-4b",
+        help="Checkpoint to download and serve (default: %(default)s).",
+    )
+    p.add_argument(
+        "--kev-dir",
+        metavar="PATH",
+        type=Path,
+        default=Path.home() / ".cache" / "ytdl" / "kev",
+        help="Kev repository directory (default: %(default)s).",
+    )
+    p.add_argument(
+        "--kev-port",
+        metavar="INT",
+        type=int,
+        default=8009,
+        help="Local Kev server port (default: %(default)s).",
+    )
+    p.add_argument(
+        "--kev-startup-timeout",
+        metavar="INT",
+        type=int,
+        default=900,
+        help="Seconds to wait for Kev startup (default: %(default)s).",
+    )
+    p.add_argument(
+        "--kev-skip-update",
+        action="store_true",
+        help="Do not pull the latest Kev repository changes.",
+    )
+    p.add_argument(
+        "--kev-threshold",
+        metavar="FLOAT",
+        type=float,
+        default=_CONFIG.JEV_DEFAULT_THRESHOLD,
+        help="Minimum average Kev probability required to download (default: %(default)s).",
+    )
+    p.add_argument(
+        "--kev-runs",
+        metavar="INT",
+        type=int,
+        default=_CONFIG.JEV_DEFAULT_RUNS,
+        help="Number of Kev evaluations per song (default: %(default)s).",
     )
     p.add_argument(
         "--jev-threshold",
@@ -217,16 +281,30 @@ def parse_args() -> argparse.Namespace:
         p.error("--review-only-suspects requires --review")
     if args.review and (args.verify or args.repair):
         p.error("--review cannot be combined with --verify or --repair")
+    if not 1 <= args.kev_port <= 65535:
+        p.error("--kev-port must be between 1 and 65535")
+    if args.kev_startup_timeout < 1:
+        p.error("--kev-startup-timeout must be greater than 0")
     if not 0 < args.jev_threshold <= 1:
         p.error("--jev-threshold must be greater than 0 and at most 1")
+    if not 0 < args.kev_threshold <= 1:
+        p.error("--kev-threshold must be greater than 0 and at most 1")
     if not 1 <= args.jev_runs <= _CONFIG.JEV_MAX_RUNS:
         p.error(f"--jev-runs must be between 1 and {_CONFIG.JEV_MAX_RUNS}")
+    if not 1 <= args.kev_runs <= _CONFIG.JEV_MAX_RUNS:
+        p.error(f"--kev-runs must be between 1 and {_CONFIG.JEV_MAX_RUNS}")
     if args.jev and args.url:
         p.error("--jev cannot be used with --url")
     if args.jev and (args.verify or args.repair or args.review):
         p.error("--jev cannot be combined with --verify, --repair, or --review")
     if args.jev and args.dry_run:
         p.error("--jev cannot be used with --dry-run")
+    if args.kev and args.url:
+        p.error("--kev cannot be used with --url")
+    if args.kev and (args.verify or args.repair or args.review):
+        p.error("--kev cannot be combined with --verify, --repair, or --review")
+    if args.kev and args.dry_run:
+        p.error("--kev cannot be used with --dry-run")
 
     args.workers = max(1, min(args.workers, _CONFIG.MAX_WORKERS))
     args.sources = [s.strip().lower() for s in args.sources.split(",") if s.strip()]

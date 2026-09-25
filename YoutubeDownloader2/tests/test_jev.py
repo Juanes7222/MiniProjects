@@ -37,8 +37,8 @@ def test_selects_candidate_with_highest_probability(monkeypatch):
 
     assert selected is not None
     assert selected["title"] == "Artist - Song"
-    assert selected["_jev_selected"] is True
-    assert selected["_jev_probability"] == 0.93
+    assert selected["_decision_selected"] is True
+    assert selected["_decision_probability"] == 0.93
     assert selected["_composite_score"] == 93
     assert ranked[0][0]["_heuristic_score"] == 110
 
@@ -62,11 +62,11 @@ def test_repeated_runs_average_probabilities(monkeypatch):
     )
 
     assert selected is not None
-    assert selected["_jev_probability"] == pytest.approx(0.70)
-    assert selected["_jev_samples"] == [0.50, 0.70, 0.90]
-    assert selected["_jev_runs"] == 3
-    assert selected["_jev_min"] == 0.50
-    assert selected["_jev_max"] == 0.90
+    assert selected["_decision_probability"] == pytest.approx(0.70)
+    assert selected["_decision_samples"] == [0.50, 0.70, 0.90]
+    assert selected["_decision_runs"] == 3
+    assert selected["_decision_min"] == 0.50
+    assert selected["_decision_max"] == 0.90
     assert ranked[0][0]["_composite_score"] == 70
 
 
@@ -134,7 +134,7 @@ def test_rejects_when_probability_is_below_threshold(monkeypatch):
     selected, ranked = classifier.select("Artist", "Song", [_candidate("Artist - Song", 120)])
 
     assert selected is None
-    assert ranked[0][0]["_jev_probability"] == 0.74
+    assert ranked[0][0]["_decision_probability"] == 0.74
 
 
 def test_rejects_invalid_probability(monkeypatch):

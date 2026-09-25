@@ -241,7 +241,7 @@ class TestDownload:
 
     def test_jev_below_threshold_still_reports_candidates(self, config, spy, output_dir):
         candidate = _fake_search_result()
-        ranked = [(candidate, 74, {"jev_probability": 74})]
+        ranked = [(candidate, 74, {"decision_probability": 74})]
         classifier = MagicMock()
         classifier.select.return_value = (None, ranked)
         jev_dl = MusicDownloader(

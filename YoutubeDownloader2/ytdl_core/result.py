@@ -26,9 +26,10 @@ class DownloadResult:
     heuristic_score: int = 0
     composite_score: int = 0
     score_breakdown: dict[str, int] = field(default_factory=dict)
-    jev_probability: Optional[float] = None
-    jev_samples: list[float] = field(default_factory=list)
-    jev_runs: int = 0
+    decision_provider: str = "heuristic"
+    decision_probability: Optional[float] = None
+    decision_samples: list[float] = field(default_factory=list)
+    decision_runs: int = 0
     selection_method: str = "heuristic"
 
     duration_seconds: int = 0

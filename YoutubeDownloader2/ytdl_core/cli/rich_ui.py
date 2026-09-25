@@ -47,12 +47,12 @@ class RichEvents(DownloaderEvents):
         console: Console,
         score_threshold: int,
         config: Config,
-        jev_threshold: float = 0.60,
+        decision_threshold: float = 0.60,
     ) -> None:
         self.console = console
         self.score_threshold = score_threshold
         self.config = config
-        self.jev_threshold = jev_threshold
+        self.decision_threshold = decision_threshold
         self._lock = threading.Lock()
 
         self._progress: Optional[Progress] = None
@@ -196,16 +196,21 @@ class RichEvents(DownloaderEvents):
         tbl.add_column("Title", max_width=55)
         tbl.add_column("Channel", max_width=30)
         tbl.add_column("Duration", width=10, style="yellow")
-        has_jev = any("_jev_probability" in entry for entry, _, _ in ranked)
-        if has_jev:
-            tbl.add_column("Jev", width=12)
+        has_decision = any("_decision_probability" in entry for entry, _, _ in ranked)
+        decision_provider = (
+            str(ranked[0][0].get("_decision_provider") or "Decision")
+            if has_decision
+            else "Decision"
+        )
+        if has_decision:
+            tbl.add_column(decision_provider, width=12)
         tbl.add_column("Heur.", width=8)
         tbl.add_column("Top signals", min_width=30, style="dim")
 
-        if has_jev:
+        if has_decision:
             best_idx = (
                 0
-                if float(ranked[0][0].get("_jev_probability") or 0) >= self.jev_threshold
+                if float(ranked[0][0].get("_decision_probability") or 0) >= self.decision_threshold
                 else None
             )
         else:
@@ -217,17 +222,17 @@ class RichEvents(DownloaderEvents):
             channel_str = (entry.get("channel") or entry.get("uploader") or "")[:30]
             heuristic_score = int(entry.get("_heuristic_score", sc))
             top = sorted(
-                ((key, value) for key, value in bd.items() if key != "jev_probability"),
+                ((key, value) for key, value in bd.items() if key != "decision_probability"),
                 key=lambda kv: abs(kv[1]),
                 reverse=True,
             )[:3]
             signals = ", ".join(
                 f"{'+' if value >= 0 else ''}{value} {key}" for key, value in top
             )
-            if has_jev and "_jev_min" in entry and "_jev_max" in entry:
+            if has_decision and "_decision_min" in entry and "_decision_max" in entry:
                 range_label = (
-                    f"Jev range {float(entry['_jev_min']):.0%}-"
-                    f"{float(entry['_jev_max']):.0%}"
+                    f"{decision_provider} range {float(entry['_decision_min']):.0%}-"
+                    f"{float(entry['_decision_max']):.0%}"
                 )
                 signals = f"{range_label}, {signals}" if signals else range_label
             if heuristic_score >= 70:
@@ -243,25 +248,25 @@ class RichEvents(DownloaderEvents):
                 channel_str,
                 format_duration(dur),
             ]
-            if has_jev:
-                probability = entry.get("_jev_probability")
+            if has_decision:
+                probability = entry.get("_decision_probability")
                 if probability is None:
-                    jev_cell = "--"
+                    decision_cell = "--"
                 else:
                     probability = float(probability)
-                    jev_percent = int(round(probability * 100))
-                    jev_runs = int(
-                        entry.get("_jev_runs")
-                        or len(entry.get("_jev_samples") or [])
+                    decision_percent = int(round(probability * 100))
+                    decision_runs = int(
+                        entry.get("_decision_runs")
+                        or len(entry.get("_decision_samples") or [])
                         or 1
                     )
-                    if probability >= self.jev_threshold:
-                        jev_cell = f"[green]{jev_percent}% x{jev_runs}[/green]"
-                    elif probability >= self.jev_threshold - 0.15:
-                        jev_cell = f"[yellow]{jev_percent}% x{jev_runs}[/yellow]"
+                    if probability >= self.decision_threshold:
+                        decision_cell = f"[green]{decision_percent}% x{decision_runs}[/green]"
+                    elif probability >= self.decision_threshold - 0.15:
+                        decision_cell = f"[yellow]{decision_percent}% x{decision_runs}[/yellow]"
                     else:
-                        jev_cell = f"[red]{jev_percent}% x{jev_runs}[/red]"
-                row.append(jev_cell)
+                        decision_cell = f"[red]{decision_percent}% x{decision_runs}[/red]"
+                row.append(decision_cell)
             row.extend([heuristic_cell, signals])
             tbl.add_row(*row)
 
@@ -580,7 +585,7 @@ class RichEvents(DownloaderEvents):
         tbl.add_column("Status", overflow="ellipsis")
         tbl.add_column("Duration", style="yellow", width=9)
         tbl.add_column("Fuzzy", style="magenta", width=5)
-        tbl.add_column("Jev", width=10)
+        tbl.add_column("Decision", width=12)
         tbl.add_column("Heur.", width=7)
         tbl.add_column("Fingerprint", overflow="ellipsis", ratio=2)
         tbl.add_column("Silence", width=8)
@@ -598,17 +603,18 @@ class RichEvents(DownloaderEvents):
             else:
                 status_cell = "[red] failed[/red]"
 
-            if r.jev_probability is not None:
-                jev_value = int(round(r.jev_probability * 100))
-                jev_runs = r.jev_runs or len(r.jev_samples) or 1
-                if r.jev_probability >= self.jev_threshold:
-                    jev_cell = f"[green]{jev_value}% x{jev_runs}[/green]"
-                elif r.jev_probability >= self.jev_threshold - 0.15:
-                    jev_cell = f"[yellow]{jev_value}% x{jev_runs}[/yellow]"
+            if r.decision_probability is not None:
+                decision_value = int(round(r.decision_probability * 100))
+                decision_runs = r.decision_runs or len(r.decision_samples) or 1
+                provider = r.decision_provider or "AI"
+                if r.decision_probability >= self.decision_threshold:
+                    decision_cell = f"[green]{provider} {decision_value}% x{decision_runs}[/green]"
+                elif r.decision_probability >= self.decision_threshold - 0.15:
+                    decision_cell = f"[yellow]{provider} {decision_value}% x{decision_runs}[/yellow]"
                 else:
-                    jev_cell = f"[red]{jev_value}% x{jev_runs}[/red]"
+                    decision_cell = f"[red]{provider} {decision_value}% x{decision_runs}[/red]"
             else:
-                jev_cell = "--"
+                decision_cell = "--"
 
             heuristic_score = r.heuristic_score or r.composite_score
             if heuristic_score >= 70:
@@ -652,7 +658,7 @@ class RichEvents(DownloaderEvents):
                 status_cell,
                 format_duration(int(dur)) if dur else "--",
                 str(r.fuzzy_score),
-                jev_cell,
+                decision_cell,
                 heuristic_cell,
                 fp_cell,
                 sil_cell,

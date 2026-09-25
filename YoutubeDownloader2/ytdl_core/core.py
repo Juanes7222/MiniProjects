@@ -23,6 +23,7 @@ from .downloader import download_partial, execute_download
 from .events import DownloaderEvents
 from .fingerprint import AcoustIDCircuitBreaker, verify_fingerprint
 from .jev import JevClassifier, JevEvaluationError
+from .kev import KevClassifier
 from .metadata import fetch_musicbrainz
 from .post_checks import check_duration, check_silence, embed_and_verify, enrich_musicbrainz
 from .reports import export_report, update_json_file
@@ -40,7 +41,10 @@ class MusicDownloader:
                  score_threshold=None, sources=None, workers=2, delay=(2.0, 5.0),
                  max_results=5, fuzzy_threshold=65, max_duration=None, min_duration=None,
                  musicbrainz=False, cookies_browser=None, cookies_file=None, proxy=None,
-                 use_jev=False, jev_threshold=None, jev_runs=None, jev_classifier=None):
+                 use_jev=False, use_kev=False, jev_threshold=None, jev_runs=None,
+                 jev_classifier=None, kev_threshold=None, kev_runs=None,
+                 kev_url="http://127.0.0.1:8009", kev_model="kev-latest",
+                 kev_classifier=None):
         self.config = config or Config()
         self.events = events or DownloaderEvents()
         self.acoustid_key = acoustid_key
@@ -60,13 +64,30 @@ class MusicDownloader:
         self.cookies_browser = cookies_browser
         self.cookies_file = cookies_file
         self.proxy = proxy
+        if use_jev and use_kev:
+            raise ValueError("Jev and Kev cannot be enabled at the same time")
         self.use_jev = use_jev
+        self.use_kev = use_kev
+        self.decision_provider = "kev" if use_kev else "jev" if use_jev else "heuristic"
         self.jev_threshold = (
             jev_threshold if jev_threshold is not None else self.config.JEV_DEFAULT_THRESHOLD
         )
+        self.kev_threshold = (
+            kev_threshold if kev_threshold is not None else self.config.JEV_DEFAULT_THRESHOLD
+        )
         self.jev_runs = jev_runs if jev_runs is not None else self.config.JEV_DEFAULT_RUNS
-        self.jev_classifier = jev_classifier or (
-            JevClassifier(threshold=self.jev_threshold) if use_jev else None
+        self.kev_runs = kev_runs if kev_runs is not None else self.config.JEV_DEFAULT_RUNS
+        self.decision_threshold = self.kev_threshold if use_kev else self.jev_threshold
+        self.decision_runs = self.kev_runs if use_kev else self.jev_runs
+        self.decision_classifier = kev_classifier or (
+            KevClassifier(
+                url=kev_url,
+                model=kev_model,
+                threshold=self.decision_threshold,
+            )
+            if use_kev
+            else jev_classifier
+            or (JevClassifier(threshold=self.decision_threshold) if use_jev else None)
         )
         self.fpcalc_available = shutil.which("fpcalc") is not None
         self._fp_semaphore = threading.Semaphore(3)
@@ -317,10 +338,11 @@ class MusicDownloader:
         )
         result.composite_score = best.get("_composite_score", 0)
         result.score_breakdown = best.get("_score_breakdown", {})
-        result.jev_probability = best.get("_jev_probability")
-        result.jev_samples = list(best.get("_jev_samples") or [])
-        result.jev_runs = int(best.get("_jev_runs") or 0)
-        result.selection_method = "jev" if self.use_jev else "heuristic"
+        result.decision_provider = self.decision_provider
+        result.decision_probability = best.get("_decision_probability")
+        result.decision_samples = list(best.get("_decision_samples") or [])
+        result.decision_runs = int(best.get("_decision_runs") or 0)
+        result.selection_method = self.decision_provider
         fp_ok, fp_conf, fp_title, fp_label = self._fingerprint_check(
             artist, song, url, output_dir, best, ranked, result)
         sc = result.composite_score
@@ -375,33 +397,33 @@ class MusicDownloader:
                 self.events.confirm_fn)
             if not ranked:
                 self.events.on_search_failed(artist, song, self.sources)
-            elif self.jev_classifier is not None:
+            elif self.decision_classifier is not None:
                 try:
-                    jev_best, jev_ranked = self.jev_classifier.select(
+                    decision_best, decision_ranked = self.decision_classifier.select(
                         artist,
                         song,
                         [entry for entry, _, _ in ranked],
                         reference_metadata=mb_data,
-                        runs=self.jev_runs,
+                        runs=self.decision_runs,
                     )
                 except JevEvaluationError as exc:
-                    result.selection_method = "jev"
+                    result.selection_method = self.decision_provider
                     result.reason = str(exc)
-                    self.events.on_warn(f"[red]Jev: {exc}[/red]")
+                    self.events.on_warn(f"[red]{self.decision_provider}: {exc}[/red]")
                     self._persist(state, state_lock, key, "failed", None, None, None, output_dir)
                     return None, ranked, None
-                ranked = jev_ranked
-                result.selection_method = "jev"
+                ranked = decision_ranked
+                result.selection_method = self.decision_provider
                 self.events.on_candidates_scored(artist, song, ranked)
-                if jev_best is None:
+                if decision_best is None:
                     result.reason = (
-                        f"Jev found no candidate at or above "
-                        f"{self.jev_threshold:.2f}"
+                        f"{self.decision_provider.capitalize()} found no candidate at or above "
+                        f"{self.decision_threshold:.2f}"
                     )
                     self.events.on_warn(f"[yellow]{result.reason}[/yellow]")
                     self._persist(state, state_lock, key, "failed", None, None, None, output_dir)
                     return None, ranked, None
-                found = jev_best
+                found = decision_best
             else:
                 self.events.on_candidates_scored(artist, song, ranked)
             if ranked:
