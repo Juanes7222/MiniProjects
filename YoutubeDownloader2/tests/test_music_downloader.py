@@ -239,6 +239,33 @@ class TestDownload:
         assert "No valid result" in result.reason
         assert any(c[0] == "on_search_failed" for c in spy.calls)
 
+    def test_jev_below_threshold_still_reports_candidates(self, config, spy, output_dir):
+        candidate = _fake_search_result()
+        ranked = [(candidate, 74, {"jev_probability": 74})]
+        classifier = MagicMock()
+        classifier.select.return_value = (None, ranked)
+        jev_dl = MusicDownloader(
+            config=config,
+            events=spy,
+            delay=(0, 0),
+            workers=1,
+            no_silence_check=True,
+            skip_fingerprint=True,
+            use_jev=True,
+            jev_classifier=classifier,
+        )
+        fake_search, fake_select = _mock_search_returns_one()
+
+        with patch("ytdl_core.core.search_all_sources", fake_search), \
+             patch("ytdl_core.core.select_best_result", fake_select), \
+             patch("ytdl_core.core.apply_delay"):
+
+            result = jev_dl.download("Artist", "Song", output_dir)
+
+        assert result.status == "failed"
+        assert "Jev found no candidate" in result.reason
+        assert any(call[0] == "on_candidates_scored" for call in spy.calls)
+
     def test_skip_existing_with_matching_md5(self, dl, output_dir, spy):
         fake_file = output_dir / "Artist" / "Song.mp3"
         fake_file.parent.mkdir(parents=True, exist_ok=True)

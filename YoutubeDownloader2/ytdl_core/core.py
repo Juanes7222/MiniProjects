@@ -382,6 +382,7 @@ class MusicDownloader:
                     return None, ranked, None
                 ranked = jev_ranked
                 result.selection_method = "jev"
+                self.events.on_candidates_scored(artist, song, ranked)
                 if jev_best is None:
                     result.reason = (
                         f"Jev found no candidate at or above "
@@ -391,7 +392,6 @@ class MusicDownloader:
                     self._persist(state, state_lock, key, "failed", None, None, None, output_dir)
                     return None, ranked, None
                 found = jev_best
-                self.events.on_candidates_scored(artist, song, ranked)
             else:
                 self.events.on_candidates_scored(artist, song, ranked)
             if ranked:
