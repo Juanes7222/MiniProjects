@@ -252,6 +252,7 @@ class TestDownload:
             no_silence_check=True,
             skip_fingerprint=True,
             use_jev=True,
+            jev_runs=3,
             jev_classifier=classifier,
         )
         fake_search, fake_select = _mock_search_returns_one()
@@ -264,6 +265,7 @@ class TestDownload:
 
         assert result.status == "failed"
         assert "Jev found no candidate" in result.reason
+        assert classifier.select.call_args.kwargs["runs"] == 3
         assert any(call[0] == "on_candidates_scored" for call in spy.calls)
 
     def test_skip_existing_with_matching_md5(self, dl, output_dir, spy):

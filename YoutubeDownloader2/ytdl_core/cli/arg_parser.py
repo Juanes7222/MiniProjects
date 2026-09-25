@@ -111,7 +111,14 @@ def parse_args() -> argparse.Namespace:
         metavar="FLOAT",
         type=float,
         default=_CONFIG.JEV_DEFAULT_THRESHOLD,
-        help="Minimum Jev probability required to download (default: %(default)s).",
+        help="Minimum average Jev probability required to download (default: %(default)s).",
+    )
+    p.add_argument(
+        "--jev-runs",
+        metavar="INT",
+        type=int,
+        default=_CONFIG.JEV_DEFAULT_RUNS,
+        help="Number of Jev evaluations per song (default: %(default)s).",
     )
     p.add_argument("--no-silence-check", action="store_true")
 
@@ -212,6 +219,8 @@ def parse_args() -> argparse.Namespace:
         p.error("--review cannot be combined with --verify or --repair")
     if not 0 < args.jev_threshold <= 1:
         p.error("--jev-threshold must be greater than 0 and at most 1")
+    if not 1 <= args.jev_runs <= _CONFIG.JEV_MAX_RUNS:
+        p.error(f"--jev-runs must be between 1 and {_CONFIG.JEV_MAX_RUNS}")
     if args.jev and args.url:
         p.error("--jev cannot be used with --url")
     if args.jev and (args.verify or args.repair or args.review):

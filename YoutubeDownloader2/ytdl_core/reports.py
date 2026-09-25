@@ -57,6 +57,7 @@ _CSV_FIELDS = [
     "composite_score",
     "heuristic_score",
     "jev_probability",
+    "jev_runs",
     "selection_method",
     "fingerprint_verified",
     "fingerprint_confidence",

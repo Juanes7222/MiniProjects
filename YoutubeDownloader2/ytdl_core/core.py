@@ -40,7 +40,7 @@ class MusicDownloader:
                  score_threshold=None, sources=None, workers=2, delay=(2.0, 5.0),
                  max_results=5, fuzzy_threshold=65, max_duration=None, min_duration=None,
                  musicbrainz=False, cookies_browser=None, cookies_file=None, proxy=None,
-                 use_jev=False, jev_threshold=None, jev_classifier=None):
+                 use_jev=False, jev_threshold=None, jev_runs=None, jev_classifier=None):
         self.config = config or Config()
         self.events = events or DownloaderEvents()
         self.acoustid_key = acoustid_key
@@ -64,6 +64,7 @@ class MusicDownloader:
         self.jev_threshold = (
             jev_threshold if jev_threshold is not None else self.config.JEV_DEFAULT_THRESHOLD
         )
+        self.jev_runs = jev_runs if jev_runs is not None else self.config.JEV_DEFAULT_RUNS
         self.jev_classifier = jev_classifier or (
             JevClassifier(threshold=self.jev_threshold) if use_jev else None
         )
@@ -317,6 +318,8 @@ class MusicDownloader:
         result.composite_score = best.get("_composite_score", 0)
         result.score_breakdown = best.get("_score_breakdown", {})
         result.jev_probability = best.get("_jev_probability")
+        result.jev_samples = list(best.get("_jev_samples") or [])
+        result.jev_runs = int(best.get("_jev_runs") or 0)
         result.selection_method = "jev" if self.use_jev else "heuristic"
         fp_ok, fp_conf, fp_title, fp_label = self._fingerprint_check(
             artist, song, url, output_dir, best, ranked, result)
@@ -379,6 +382,7 @@ class MusicDownloader:
                         song,
                         [entry for entry, _, _ in ranked],
                         reference_metadata=mb_data,
+                        runs=self.jev_runs,
                     )
                 except JevEvaluationError as exc:
                     result.selection_method = "jev"

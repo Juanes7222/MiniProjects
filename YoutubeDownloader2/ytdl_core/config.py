@@ -50,6 +50,8 @@ class Config:
     REACTION_REMIX_PENALTY: int = -50
     IDENTITY_OVERRIDE_THRESHOLD = 40
     JEV_DEFAULT_THRESHOLD: float = 0.60
+    JEV_DEFAULT_RUNS: int = 1
+    JEV_MAX_RUNS: int = 20
     
     FORBIDEN_TERMS = {
         "cover",

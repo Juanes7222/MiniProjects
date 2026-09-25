@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -30,11 +31,17 @@ class JevClassifier:
         song: str,
         candidates: list[dict],
         reference_metadata: dict | None = None,
+        runs: int = 1,
     ) -> tuple[dict | None, list[tuple[dict, int, dict[str, int]]]]:
         if not candidates:
             return None, []
+        if isinstance(runs, bool) or not isinstance(runs, int) or runs < 1:
+            raise JevEvaluationError("Jev runs must be at least 1")
 
-        candidate_payloads = [self._candidate_payload(candidate, index) for index, candidate in enumerate(candidates)]
+        candidate_payloads = [
+            self._candidate_payload(candidate, index)
+            for index, candidate in enumerate(candidates)
+        ]
         payload = {
             "state": {
                 "target": {
@@ -52,14 +59,23 @@ class JevClassifier:
                 for candidate in candidate_payloads
             ],
         }
-        answers = self._evaluate(payload)
-        evaluated: list[tuple[dict, int, dict[str, int]]] = []
+        probabilities: dict[str, list[float]] = {
+            candidate["key"]: [] for candidate in candidate_payloads
+        }
+        for _ in range(runs):
+            answers = self._evaluate(payload)
+            for candidate in candidate_payloads:
+                answer = answers.get(candidate["key"])
+                if not isinstance(answer, dict) or answer.get("type") != "boolean":
+                    raise JevEvaluationError("Jev returned an invalid boolean answer")
+                probabilities[candidate["key"]].append(
+                    self._probability(answer.get("probability"))
+                )
 
+        evaluated: list[tuple[dict, int, dict[str, int]]] = []
         for candidate_payload, candidate in zip(candidate_payloads, candidates, strict=True):
-            answer = answers.get(candidate_payload["key"])
-            if not isinstance(answer, dict) or answer.get("type") != "boolean":
-                raise JevEvaluationError("Jev returned an invalid boolean answer")
-            probability = self._probability(answer.get("probability"))
+            samples = probabilities[candidate_payload["key"]]
+            probability = sum(samples) / len(samples)
             entry = dict(candidate)
             heuristic_score = int(entry.get("_composite_score") or 0)
             breakdown = dict(entry.get("_score_breakdown") or {})
@@ -67,6 +83,10 @@ class JevClassifier:
             entry["_heuristic_score"] = heuristic_score
             entry["_heuristic_breakdown"] = breakdown
             entry["_jev_probability"] = probability
+            entry["_jev_samples"] = samples
+            entry["_jev_runs"] = len(samples)
+            entry["_jev_min"] = min(samples)
+            entry["_jev_max"] = max(samples)
             entry["_jev_threshold"] = self.threshold
             entry["_jev_selected"] = False
             entry["_composite_score"] = jev_score
@@ -93,32 +113,36 @@ class JevClassifier:
         if not script.is_file():
             raise JevEvaluationError("Jev bridge script was not found")
 
-        try:
-            completed = subprocess.run(
-                [self.node_command, str(script)],
-                cwd=self.project_root,
-                input=json.dumps(payload, ensure_ascii=False),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.timeout_seconds,
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            raise JevEvaluationError("Node.js is required for --jev") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise JevEvaluationError("Jev evaluation timed out") from exc
-
-        if completed.returncode != 0:
-            stderr = completed.stderr.lower()
-            if "valid credit card" in stderr:
-                raise JevEvaluationError(
-                    "AI Gateway requires a valid credit card before it can service Jev requests"
+        for attempt in range(3):
+            try:
+                completed = subprocess.run(
+                    [self.node_command, str(script)],
+                    cwd=self.project_root,
+                    input=json.dumps(payload, ensure_ascii=False),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=self.timeout_seconds,
+                    check=False,
                 )
-            if "unauthenticated" in stderr or "api key" in stderr:
-                raise JevEvaluationError("AI Gateway authentication failed")
-            raise JevEvaluationError("Jev bridge failed; verify gateway access and model availability")
+            except FileNotFoundError as exc:
+                raise JevEvaluationError("Node.js is required for --jev") from exc
+            except subprocess.TimeoutExpired:
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise JevEvaluationError("Jev evaluation timed out after 3 attempts")
+
+            if completed.returncode == 0:
+                break
+
+            stderr = completed.stderr
+            if self._is_retryable_error(stderr) and attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            raise JevEvaluationError(self._bridge_error(stderr))
+
         try:
             response = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
@@ -127,6 +151,46 @@ class JevClassifier:
         if not isinstance(answers, dict):
             raise JevEvaluationError("Jev bridge returned no answers")
         return answers
+
+    @staticmethod
+    def _bridge_error(stderr: str) -> str:
+        lower = stderr.lower()
+        if "valid credit card" in lower:
+            return "AI Gateway requires a valid credit card before it can service Jev requests"
+        if "unauthenticated" in lower or "api key" in lower:
+            return "AI Gateway authentication failed"
+        if "no such model" in lower or "model not found" in lower:
+            return "Jev model is not available for this AI Gateway team"
+        if "rate limit" in lower or "429" in lower:
+            return "AI Gateway rate limit reached while evaluating Jev"
+        if "timed out" in lower or "timeout" in lower:
+            return "Jev evaluation timed out"
+        if "502" in lower or "503" in lower or "504" in lower or "internal server error" in lower:
+            return "AI Gateway temporarily failed while evaluating Jev"
+        first_line = next((line.strip() for line in stderr.splitlines() if line.strip()), "")
+        if first_line:
+            return f"Jev bridge failed: {first_line[:180]}"
+        return "Jev bridge failed with an unknown error"
+
+    @staticmethod
+    def _is_retryable_error(stderr: str) -> bool:
+        lower = stderr.lower()
+        return any(
+            marker in lower
+            for marker in (
+                "rate limit",
+                "429",
+                "502",
+                "503",
+                "504",
+                "internal server error",
+                "temporarily",
+                "timeout",
+                "timed out",
+                "econnreset",
+                "socket hang up",
+            )
+        )
 
     @staticmethod
     def _reference_metadata(metadata: dict | None) -> dict[str, Any]:

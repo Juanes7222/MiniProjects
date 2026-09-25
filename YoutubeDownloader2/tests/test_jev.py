@@ -43,6 +43,40 @@ def test_selects_candidate_with_highest_probability(monkeypatch):
     assert ranked[0][0]["_heuristic_score"] == 110
 
 
+def test_repeated_runs_average_probabilities(monkeypatch):
+    classifier = JevClassifier(threshold=0.65)
+    responses = iter(
+        [
+            {"candidate_0": {"type": "boolean", "probability": 0.50}},
+            {"candidate_0": {"type": "boolean", "probability": 0.70}},
+            {"candidate_0": {"type": "boolean", "probability": 0.90}},
+        ]
+    )
+    monkeypatch.setattr(classifier, "_evaluate", lambda payload: next(responses))
+
+    selected, ranked = classifier.select(
+        "Artist",
+        "Song",
+        [_candidate("Artist - Song", 120)],
+        runs=3,
+    )
+
+    assert selected is not None
+    assert selected["_jev_probability"] == pytest.approx(0.70)
+    assert selected["_jev_samples"] == [0.50, 0.70, 0.90]
+    assert selected["_jev_runs"] == 3
+    assert selected["_jev_min"] == 0.50
+    assert selected["_jev_max"] == 0.90
+    assert ranked[0][0]["_composite_score"] == 70
+
+
+def test_rejects_invalid_run_count():
+    classifier = JevClassifier()
+
+    with pytest.raises(JevEvaluationError, match="at least 1"):
+        classifier.select("Artist", "Song", [_candidate("Artist - Song", 120)], runs=0)
+
+
 def test_candidate_payload_includes_release_metadata():
     candidate = _candidate("Artist - Song", 120)
     candidate.update(
@@ -115,6 +149,13 @@ def test_rejects_invalid_probability(monkeypatch):
 
     with pytest.raises(JevEvaluationError, match="invalid probability"):
         classifier.select("Artist", "Song", [_candidate("Artist - Song", 120)])
+
+
+def test_bridge_error_identifies_gateway_cause():
+    assert "credit card" in JevClassifier._bridge_error("valid credit card required")
+    assert "authentication" in JevClassifier._bridge_error("Unauthenticated request")
+    assert "rate limit" in JevClassifier._bridge_error("HTTP 429 rate limit")
+    assert "temporarily failed" in JevClassifier._bridge_error("HTTP 503 internal server error")
 
 
 def test_evaluate_uses_utf8_for_candidate_text(monkeypatch):

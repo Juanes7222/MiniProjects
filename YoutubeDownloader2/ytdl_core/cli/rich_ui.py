@@ -198,7 +198,7 @@ class RichEvents(DownloaderEvents):
         tbl.add_column("Duration", width=10, style="yellow")
         has_jev = any("_jev_probability" in entry for entry, _, _ in ranked)
         if has_jev:
-            tbl.add_column("Jev", width=8)
+            tbl.add_column("Jev", width=12)
         tbl.add_column("Heur.", width=8)
         tbl.add_column("Top signals", min_width=30, style="dim")
 
@@ -224,6 +224,12 @@ class RichEvents(DownloaderEvents):
             signals = ", ".join(
                 f"{'+' if value >= 0 else ''}{value} {key}" for key, value in top
             )
+            if has_jev and "_jev_min" in entry and "_jev_max" in entry:
+                range_label = (
+                    f"Jev range {float(entry['_jev_min']):.0%}-"
+                    f"{float(entry['_jev_max']):.0%}"
+                )
+                signals = f"{range_label}, {signals}" if signals else range_label
             if heuristic_score >= 70:
                 heuristic_cell = f"[green]{heuristic_score}[/green]"
             elif heuristic_score >= 30:
@@ -244,12 +250,17 @@ class RichEvents(DownloaderEvents):
                 else:
                     probability = float(probability)
                     jev_percent = int(round(probability * 100))
+                    jev_runs = int(
+                        entry.get("_jev_runs")
+                        or len(entry.get("_jev_samples") or [])
+                        or 1
+                    )
                     if probability >= self.jev_threshold:
-                        jev_cell = f"[green]{jev_percent}%[/green]"
+                        jev_cell = f"[green]{jev_percent}% x{jev_runs}[/green]"
                     elif probability >= self.jev_threshold - 0.15:
-                        jev_cell = f"[yellow]{jev_percent}%[/yellow]"
+                        jev_cell = f"[yellow]{jev_percent}% x{jev_runs}[/yellow]"
                     else:
-                        jev_cell = f"[red]{jev_percent}%[/red]"
+                        jev_cell = f"[red]{jev_percent}% x{jev_runs}[/red]"
                 row.append(jev_cell)
             row.extend([heuristic_cell, signals])
             tbl.add_row(*row)
@@ -569,7 +580,7 @@ class RichEvents(DownloaderEvents):
         tbl.add_column("Status", overflow="ellipsis")
         tbl.add_column("Duration", style="yellow", width=9)
         tbl.add_column("Fuzzy", style="magenta", width=5)
-        tbl.add_column("Jev", width=7)
+        tbl.add_column("Jev", width=10)
         tbl.add_column("Heur.", width=7)
         tbl.add_column("Fingerprint", overflow="ellipsis", ratio=2)
         tbl.add_column("Silence", width=8)
@@ -589,12 +600,13 @@ class RichEvents(DownloaderEvents):
 
             if r.jev_probability is not None:
                 jev_value = int(round(r.jev_probability * 100))
+                jev_runs = r.jev_runs or len(r.jev_samples) or 1
                 if r.jev_probability >= self.jev_threshold:
-                    jev_cell = f"[green]{jev_value}%[/green]"
+                    jev_cell = f"[green]{jev_value}% x{jev_runs}[/green]"
                 elif r.jev_probability >= self.jev_threshold - 0.15:
-                    jev_cell = f"[yellow]{jev_value}%[/yellow]"
+                    jev_cell = f"[yellow]{jev_value}% x{jev_runs}[/yellow]"
                 else:
-                    jev_cell = f"[red]{jev_value}%[/red]"
+                    jev_cell = f"[red]{jev_value}% x{jev_runs}[/red]"
             else:
                 jev_cell = "--"
 
