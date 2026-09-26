@@ -265,6 +265,97 @@ class TestPersist:
         loaded = json.loads(state_file.read_text())
         assert loaded["downloads"]["A::S"]["status"] == "downloaded"
 
+    def test_records_the_full_story_of_the_attempt(self, tmp_path):
+        state = {"downloads": {}}
+        lock = threading.Lock()
+        result = DownloadResult(
+            artist="Ana Gabriel",
+            song="Tú lo decidiste",
+            status="downloaded",
+            source="youtube",
+            matched_title="Ana Gabriel - Tú lo decidiste (official video)",
+            heuristic_score=88,
+            composite_score=87,
+            score_breakdown={"title_match": 40, "duration": 20, "channel_trust": 28},
+            decision_provider="jev",
+            decision_probability=0.87,
+            decision_runs=3,
+            decision_threshold=0.6,
+            selection_method="jev-fallback",
+            candidates_ranked=9,
+            duration_seconds=214,
+            silence_ratio=0.0412,
+        )
+
+        MusicDownloader._persist(
+            state,
+            lock,
+            "Ana Gabriel::Tú lo decidiste",
+            "downloaded",
+            "http://url",
+            "/path/file.mp3",
+            "abc123",
+            tmp_path,
+            result=result,
+        )
+
+        entry = state["downloads"]["Ana Gabriel::Tú lo decidiste"]
+        assert entry["source_title"] == "Ana Gabriel - Tú lo decidiste (official video)"
+        assert entry["heuristic_score"] == 88
+        assert entry["heuristic_breakdown"] == {
+            "title_match": 40,
+            "duration": 20,
+            "channel_trust": 28,
+        }
+        assert entry["decision_provider"] == "jev"
+        assert entry["decision_probability"] == 0.87
+        assert entry["decision_runs"] == 3
+        assert entry["selection_method"] == "jev-fallback"
+        assert entry["candidates_ranked"] == 9
+        assert entry["silence_ratio"] == 0.0412
+
+    def test_replacement_candidate_travels_with_its_verdict(self, tmp_path):
+        state = {"downloads": {}}
+        result = DownloadResult(
+            artist="A",
+            song="S",
+            status="downloaded",
+            source="youtube",
+            matched_title="first choice",
+            decision_provider="kev",
+            decision_probability=0.91,
+            selection_method="kev",
+        )
+        replacement = {
+            "webpage_url": "http://replacement",
+            "title": "second choice",
+            "duration": 200,
+            "_source": "bandcamp",
+            "_heuristic_score": 71,
+            "_composite_score": 64,
+            "_score_breakdown": {"title_match": 30},
+            "_decision_probability": 0.64,
+            "_decision_samples": [0.64, 0.66],
+            "_decision_runs": 2,
+            "_decision_threshold": 0.6,
+        }
+
+        MusicDownloader._adopt_candidate(result, replacement)
+        MusicDownloader._persist(
+            state, threading.Lock(), "A::S", "downloaded", "http://replacement", None, None, tmp_path, result=result
+        )
+
+        entry = state["downloads"]["A::S"]
+        assert entry["source_title"] == "second choice"
+        assert entry["source"] == "bandcamp"
+        assert entry["heuristic_score"] == 71
+        assert entry["composite_score"] == 64
+        # The decider's verdict for the candidate we actually used, not the
+        # verdict of the one that turned out to be unplayable.
+        assert entry["decision_probability"] == 0.64
+        assert entry["decision_runs"] == 2
+        assert entry["fallback_used"] is True
+
 
 # ===================================================================
 # download() — single song

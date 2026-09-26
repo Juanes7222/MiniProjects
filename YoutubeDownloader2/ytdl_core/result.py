@@ -30,7 +30,10 @@ class DownloadResult:
     decision_probability: Optional[float] = None
     decision_samples: list[float] = field(default_factory=list)
     decision_runs: int = 0
+    decision_threshold: Optional[float] = None
     selection_method: str = "heuristic"
+    candidates_ranked: int = 0
+    fallback_used: bool = False
 
     duration_seconds: int = 0
     file_path: Optional[Path] = None

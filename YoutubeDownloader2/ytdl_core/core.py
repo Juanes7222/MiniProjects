@@ -31,7 +31,7 @@ from .post_checks import check_duration, check_silence, embed_and_verify
 from .reports import export_report, update_json_file
 from .result import DownloadResult
 from .search import search_all_sources, select_best_result
-from .state import load_state, save_state
+from .state import load_state, merge_state_detail, save_state, state_detail
 from .utils import (
     apply_delay,
     compute_md5,
@@ -571,6 +571,12 @@ class MusicDownloader:
         result.decision_probability = best.get("_decision_probability")
         result.decision_samples = list(best.get("_decision_samples") or [])
         result.decision_runs = int(best.get("_decision_runs") or 0)
+        result.decision_threshold = (
+            best.get("_decision_threshold", self.decision_threshold)
+            if self.decision_classifier is not None
+            else None
+        )
+        result.candidates_ranked = len(ranked)
         if result.selection_method == "heuristic":
             result.selection_method = self.decision_provider
         fp_ok, fp_conf, fp_title, fp_label = self._fingerprint_check(
@@ -609,11 +615,20 @@ class MusicDownloader:
                 None,
                 output_dir,
                 state_filename=self.config.STATE_FILE,
+                result=result,
             )
             return result
         if result.url:
             url = result.url
             dur_s = result.duration_seconds or dur_s
+        # The fingerprint stage can promote a different candidate, and the
+        # download stage can replace it again; both make the originally selected
+        # entry the wrong source of the publisher and thumbnail we record.
+        if result.url and result.url != (best.get("webpage_url") or best.get("url")):
+            for entry, _, _ in ranked:
+                if (entry.get("webpage_url") or entry.get("url")) == result.url:
+                    best = entry
+                    break
         (output_dir / safe_a).mkdir(parents=True, exist_ok=True)
 
         dl_file, err, used = self._download_with_fallback(
@@ -635,18 +650,9 @@ class MusicDownloader:
         if used is not None:
             # The winning candidate became unplayable; carry the replacement
             # candidate's identity and score into the report.
-            best = used
-            url = used.get("webpage_url") or used.get("url", url)
-            dur_s = int(used.get("duration") or 0) or dur_s
-            result.url = url
-            result.source = used.get("_source", result.source)
-            result.matched_title = used.get("title") or result.matched_title
-            result.duration_seconds = dur_s
-            result.composite_score = used.get("_composite_score", result.composite_score)
-            result.score_breakdown = used.get("_score_breakdown", result.score_breakdown)
-            result.heuristic_score = int(
-                used.get("_heuristic_score", used.get("_composite_score", 0))
-            )
+            best = self._adopt_candidate(result, used)
+            url = result.url
+            dur_s = result.duration_seconds
 
         if dl_file is None:
             self.events.on_download_failed(artist, song, err)
@@ -661,6 +667,7 @@ class MusicDownloader:
                 None,
                 output_dir,
                 state_filename=self.config.STATE_FILE,
+                result=result,
             )
             return result
         return self._post_download_checks(
@@ -890,6 +897,7 @@ class MusicDownloader:
                             None,
                             output_dir,
                             state_filename=self.config.STATE_FILE,
+                            result=result,
                         )
                         return None, ranked, None
                 else:
@@ -923,6 +931,7 @@ class MusicDownloader:
                             None,
                             output_dir,
                             state_filename=self.config.STATE_FILE,
+                            result=result,
                         )
                         return best, ranked, src
                     if not self.events.confirm_fn(artist, song, found):
@@ -949,6 +958,7 @@ class MusicDownloader:
                 None,
                 output_dir,
                 state_filename=self.config.STATE_FILE,
+                result=result,
             )
         return best, ranked, src
 
@@ -1025,6 +1035,32 @@ class MusicDownloader:
                     pp.unlink(missing_ok=True)
         return fp_ok, fp_conf, fp_title, fp_label
 
+    @staticmethod
+    def _adopt_candidate(result, entry):
+        """Re-point ``result`` at a replacement candidate and copy its verdict.
+
+        A candidate can be replaced twice: once when the fingerprint stage
+        promotes a better match, and again when the download stage finds the
+        winner unplayable. Both times every number we recorded has to travel
+        with the candidate, otherwise the state ends up describing a song we
+        did not actually download.
+        """
+        result.url = entry.get("webpage_url") or entry.get("url") or result.url
+        result.source = entry.get("_source", result.source)
+        result.matched_title = entry.get("title") or result.matched_title
+        result.duration_seconds = int(entry.get("duration") or 0) or result.duration_seconds
+        result.heuristic_score = int(
+            entry.get("_heuristic_score", entry.get("_composite_score", 0))
+        )
+        result.composite_score = entry.get("_composite_score", result.composite_score)
+        result.score_breakdown = entry.get("_score_breakdown", result.score_breakdown)
+        result.decision_probability = entry.get("_decision_probability")
+        result.decision_samples = list(entry.get("_decision_samples") or [])
+        result.decision_runs = int(entry.get("_decision_runs") or 0)
+        result.decision_threshold = entry.get("_decision_threshold")
+        result.fallback_used = True
+        return entry
+
     def _try_next_fp(self, ranked, artist, song, output_dir, result):
         for cr, cs, _ in ranked[1:]:
             if cs < self.score_threshold:
@@ -1055,10 +1091,7 @@ class MusicDownloader:
                     )
                     time.sleep(0.35)
                     if ok:
-                        result.url, result.matched_title = nu, cr.get("title") or ""
-                        result.duration_seconds = int(cr.get("duration") or 0)
-                        result.composite_score = cr.get("_composite_score", 0)
-                        result.score_breakdown = cr.get("_score_breakdown", {})
+                        self._adopt_candidate(result, cr)
                         return True, c, t, f"verified next candidate {c:.0%}"
             finally:
                 if np_ and np_.exists():
@@ -1090,6 +1123,7 @@ class MusicDownloader:
             song,
             self.events,
         )
+        result.duration_verified = duration_ok
         if failure:
             result.reason = failure
             self._persist(
@@ -1102,6 +1136,7 @@ class MusicDownloader:
                 None,
                 output_dir,
                 state_filename=self.config.STATE_FILE,
+                result=result,
             )
             return result
 
@@ -1127,6 +1162,7 @@ class MusicDownloader:
                     None,
                     output_dir,
                     state_filename=self.config.STATE_FILE,
+                    result=result,
                 )
                 return result
 
@@ -1159,6 +1195,7 @@ class MusicDownloader:
                 None,
                 output_dir,
                 state_filename=self.config.STATE_FILE,
+                result=result,
             )
             return result
 
@@ -1186,6 +1223,7 @@ class MusicDownloader:
             fingerprint_confidence=result.fingerprint_confidence,
             fingerprint_label=result.fingerprint_label,
             state_filename=self.config.STATE_FILE,
+            result=result,
             channel=channel,
             channel_url=channel_url,
         )
@@ -1227,6 +1265,8 @@ class MusicDownloader:
         state_filename=None,
         channel=None,
         channel_url=None,
+        result=None,
+        preserve_fields=None,
     ):
         MusicDownloader._persist_state(
             state,
@@ -1244,6 +1284,8 @@ class MusicDownloader:
             state_filename=state_filename,
             channel=channel,
             channel_url=channel_url,
+            result=result,
+            preserve_fields=preserve_fields,
         )
 
     @staticmethod
@@ -1263,6 +1305,8 @@ class MusicDownloader:
         state_filename=None,
         channel=None,
         channel_url=None,
+        result=None,
+        preserve_fields=None,
     ):
         with lock:
             downloads = state.setdefault("downloads", {})
@@ -1291,5 +1335,10 @@ class MusicDownloader:
                 entry["channel"] = resolved_channel
             if resolved_channel_url:
                 entry["channel_url"] = resolved_channel_url
+            # The result carries the full story of the attempt -- which title won,
+            # how the heuristic scored it, what Jev/Kev decided about it -- so the
+            # run can be audited from the state file alone.
+            if result is not None:
+                merge_state_detail(entry, existing, state_detail(result), preserve_fields)
             downloads[key] = entry
             save_state(state, output_dir, state_filename)

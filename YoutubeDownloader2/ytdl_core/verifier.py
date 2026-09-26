@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import inspect
 import threading
 import time
 from collections import Counter
@@ -12,6 +13,7 @@ from .events import DownloaderEvents
 from .fingerprint import AcoustIDCircuitBreaker, verify_duration, verify_fingerprint
 from .metadata import fetch_musicbrainz
 from .result import DownloadResult
+from .state import VERIFY_UNKNOWN_FIELDS
 from .utils import apply_delay, compute_md5, migrate_legacy_audio_path, sanitize_filename
 
 _MIN_FILE_SIZE = 50 * 1024
@@ -24,6 +26,22 @@ _FINGERPRINT_ERRORS = frozenset(
         "max_retries_exceeded",
     }
 )
+
+
+def _accepts_detail(persist_fn: Callable[..., None]) -> bool:
+    """Whether a persist callback understands the extra state-detail kwargs.
+
+    ``verify_library`` is a public entry point and callers may still hand it a
+    legacy ``_persist``-shaped callback, so the detail kwargs only go to
+    callbacks that can actually receive them.
+    """
+    try:
+        parameters = inspect.signature(persist_fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return True
+    return {"result", "preserve_fields"} <= set(parameters)
 
 
 def _failed_result(artist: str, song: str, reason: str) -> DownloadResult:
@@ -206,6 +224,7 @@ def verify_library(
     output_dir = Path(output_dir)
     results_map: dict[tuple[str, str], DownloadResult] = {}
     pairs_to_process: list[tuple[str, str]] = []
+    accepts_detail = _accepts_detail(persist_fn)
 
     for artist, artist_songs in songs.items():
         for song in artist_songs:
@@ -228,6 +247,12 @@ def verify_library(
                         "fingerprint_label": cached_result.fingerprint_label,
                         "preserve_timestamp": True,
                     }
+                    if accepts_detail:
+                        # A verify pass rebuilds the result from the file, so it
+                        # knows nothing about the search or the decider; the
+                        # recorded run stays as it was.
+                        cached_options["result"] = cached_result
+                        cached_options["preserve_fields"] = VERIFY_UNKNOWN_FIELDS
                     if state_filename is not None:
                         cached_options["state_filename"] = state_filename
                     persist_fn(
@@ -314,6 +339,12 @@ def verify_library(
                         "fingerprint_label": result.fingerprint_label,
                         "preserve_timestamp": True,
                     }
+                    if accepts_detail:
+                        # A verify pass rebuilds the result from the file, so it
+                        # knows nothing about the search or the decider; the
+                        # recorded run stays as it was.
+                        persistence_options["result"] = result
+                        persistence_options["preserve_fields"] = VERIFY_UNKNOWN_FIELDS
                     if state_filename is not None:
                         persistence_options["state_filename"] = state_filename
                     persist_fn(
