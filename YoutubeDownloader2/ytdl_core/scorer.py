@@ -11,17 +11,32 @@ Two public functions:
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from rapidfuzz import fuzz
 
-from .config import DEFAULT_FORBIDDEN_TERMS, DEFAULT_LIVE_TERMS, Config
+from .config import (
+    DEFAULT_FORBIDDEN_TERMS,
+    DEFAULT_LIVE_TERMS,
+    DEFAULT_SOFT_TERMS,
+    Config,
+)
 from .utils import (
     find_forbidden_phrases,
     normalize_title,
     remove_matching_noise,
     strip_featuring,
 )
+
+if TYPE_CHECKING:
+    from .channels import ChannelTrust
+
+_CATALOG_SOURCES = ("ytmusic_api", "itunes")
+
+
+def _is_official_channel(channel: str) -> bool:
+    """True for auto-generated Topic channels and VEVO-style label channels."""
+    return channel.endswith("- topic") or channel.endswith("vevo")
 
 
 def score_youtube_result(
@@ -30,13 +45,19 @@ def score_youtube_result(
     song: str,
     mb_duration_seconds: Optional[int],
     config: Config,
+    channel_trust: "Optional[ChannelTrust]" = None,
 ) -> tuple[int, dict[str, int]]:
     """
     Score a single search candidate against the target artist + song.
 
     Uses a composite heuristic with hard-rejection gates for forbidden
     patterns (covers and remixes), fuzzy title/artist matching, channel
-    authority signals, duration alignment, and cross-source consensus.
+    authority signals, learned channel trust, duration alignment, and
+    cross-source consensus.
+
+    ``channel_trust`` is an optional :class:`~ytdl_core.channels.ChannelTrust`.
+    When supplied, candidates published on channels that previously delivered
+    verified downloads for this artist earn a bonus.
 
     Returns (composite_score, breakdown_dict).
     """
@@ -63,7 +84,15 @@ def score_youtube_result(
     if is_live_version:
         breakdown["live_version"] = config.LIVE_PENALTY
 
-    if entry.get("_source") == "ytmusic_api":
+    # Learned channel trust. A channel that has already delivered this artist is
+    # the single most reliable signal available, so it is resolved once here and
+    # applied on both the catalog fast path and the generic path below.
+    trust_bonus = 0
+    if channel_trust is not None and channel:
+        trust_bonus = channel_trust.bonus_for(channel, artist)
+    official_channel = _is_official_channel(channel)
+
+    if entry.get("_source") in _CATALOG_SOURCES:
         title_clean = normalize_title(strip_featuring(raw_title.lower()))
         song_match = int(
             fuzz.token_set_ratio(song_clean, title_clean) * 0.3
@@ -88,9 +117,15 @@ def score_youtube_result(
 
         if song_match >= 80 and artist_match >= 80:
             artist_factor = artist_match / 100.0
-            api_bonus = int(25 + (song_match * artist_match) ** 0.5 * 0.3 * artist_factor)
-
-            breakdown["official_ytmusic_api"] = api_bonus
+            if entry.get("_source") == "itunes":
+                # Resolved from the label's own catalogue entry via MusicBrainz,
+                # so the provenance is already proven -- score it as a flat
+                # bonus rather than compounding a fuzzy-match formula.
+                api_bonus = config.CATALOG_SOURCE_BONUS
+                breakdown["official_catalog_match"] = api_bonus
+            else:
+                api_bonus = int(25 + (song_match * artist_match) ** 0.5 * 0.3 * artist_factor)
+                breakdown["official_ytmusic_api"] = api_bonus
             breakdown["catalog_match"] = song_match
             breakdown["artist_match"] = artist_match
 
@@ -107,6 +142,8 @@ def score_youtube_result(
             if source_count > 1:
                 breakdown["cross_source_consensus"] = min(20, (source_count - 1) * 10)
 
+            if trust_bonus:
+                breakdown["trusted_channel"] = trust_bonus
             return sum(breakdown.values()), breakdown
 
     title_tokens = set(title.split())
@@ -146,6 +183,9 @@ def score_youtube_result(
     elif artist_in_channel > 85:
         breakdown["artist_in_channel"] = 25
 
+    if trust_bonus:
+        breakdown["trusted_channel"] = trust_bonus
+
     if mb_duration_seconds is not None and result_duration > 0:
         diff_seconds = abs(result_duration - mb_duration_seconds)
         if diff_seconds <= 4:
@@ -169,6 +209,13 @@ def score_youtube_result(
     if any(t in title for t in ["lyrics", "letra", "lyric video"]):
         breakdown["lyrics_penalty"] = -20
 
+    # Remasters are legitimate on official channels and suspicious everywhere
+    # else, so the soft penalty is waived when the publisher is trusted.
+    soft_terms = getattr(config, "SOFT_TERMS", DEFAULT_SOFT_TERMS)
+    title_soft = find_forbidden_phrases(raw_title, soft_terms)
+    if title_soft and not (trust_bonus or official_channel):
+        breakdown["remaster_penalty"] = config.SOFT_TERM_PENALTY
+
     total = sum(breakdown.values())
     return total, breakdown
 
@@ -181,6 +228,7 @@ def rank_results(
     config: Config,
     min_duration: Optional[int] = None,
     max_duration: Optional[int] = None,
+    channel_trust: "Optional[ChannelTrust]" = None,
 ) -> list[tuple[dict, int, dict]]:
     """
     Filter, score, and sort candidates descending by composite score.
@@ -199,7 +247,9 @@ def rank_results(
     scored = []
     for raw in valid:
         entry = dict(raw)
-        score, breakdown = score_youtube_result(entry, artist, song, mb_duration_seconds, config)
+        score, breakdown = score_youtube_result(
+            entry, artist, song, mb_duration_seconds, config, channel_trust
+        )
         entry["_composite_score"] = score
         entry["_score_breakdown"] = breakdown
         scored.append((entry, score, breakdown))

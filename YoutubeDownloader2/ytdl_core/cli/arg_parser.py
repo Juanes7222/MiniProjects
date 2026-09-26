@@ -138,7 +138,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--cookies", metavar="FILE", type=Path, help="Path to a cookies.txt file")
     p.add_argument("--proxy", metavar="URL")
-    p.add_argument("--musicbrainz", action="store_true")
+    p.add_argument(
+        "--musicbrainz",
+        action="store_true",
+        help="Enrich tags from MusicBrainz and use it as the duration reference.",
+    )
+    p.add_argument(
+        "--no-channel-search",
+        action="store_true",
+        help="Do not search inside channels that previously delivered this artist.",
+    )
+    p.add_argument(
+        "--backfill-channels",
+        action="store_true",
+        help="Resolve and store the publishing channel of past downloads so the "
+        "learned channel trust model is active on this run.",
+    )
 
     p.add_argument("--acoustid-key", metavar="KEY", dest="acoustid_key")
     p.add_argument("--skip-fingerprint", action="store_true")

@@ -18,8 +18,11 @@ Tag mapping:
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlencode
 
 import mutagen  # type: ignore
 import musicbrainzngs
@@ -30,7 +33,6 @@ from mutagen.id3 import (
     ID3,
     ID3NoHeaderError,  # type: ignore
     TALB,  # type: ignore
-    TDRC,  # type: ignore
     TCON,  # type: ignore
     TIT2,  # type: ignore
     TPE1,  # type: ignore
@@ -40,6 +42,41 @@ from mutagen.id3 import (
 )
 from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
 from mutagen.oggvorbis import OggVorbis
+from rapidfuzz import fuzz
+
+from .utils import normalize_title, strip_featuring
+
+# MusicBrainz allows one request per second per client and answers anything
+# faster with 503, which ``fetch_musicbrainz`` swallows into a silent None. With
+# --workers 4 that silently cost us the reference duration *and* the mb_id the
+# iTunes catalogue lookup depends on, so the throttle is load-bearing.
+_MB_MIN_INTERVAL = 1.1
+_mb_lock = threading.Lock()
+_mb_last_call = 0.0
+_mb_useragent_set = False
+
+
+def _configure_musicbrainz() -> None:
+    global _mb_useragent_set
+    if _mb_useragent_set:
+        return
+    _mb_useragent_set = True
+    try:
+        musicbrainzngs.set_useragent("YTMusicDownloader", "2.0")
+    except Exception:
+        pass
+
+
+def _throttled_search(**kwargs):
+    """Run a MusicBrainz query at no more than one request per second."""
+    global _mb_last_call
+    _configure_musicbrainz()
+    with _mb_lock:
+        wait = _MB_MIN_INTERVAL - (time.monotonic() - _mb_last_call)
+        if wait > 0:
+            time.sleep(wait)
+        _mb_last_call = time.monotonic()
+    return musicbrainzngs.search_recordings(**kwargs)
 
 
 def fetch_musicbrainz(artist: str, song: str) -> Optional[dict]:
@@ -47,10 +84,18 @@ def fetch_musicbrainz(artist: str, song: str) -> Optional[dict]:
     Query MusicBrainz for recording metadata.
 
     Returns a dict with keys: album, year, genre, track_num, mb_id,
-    release_id, cover_url, duration_seconds — or None on any failure.
+    release_id, cover_url, duration_seconds, title, artist — or None on any
+    failure.
+
+    ``title`` and ``artist`` are the recording MusicBrainz actually matched,
+    not what we asked for. Callers compare them against the query to decide
+    whether the returned ``duration_seconds`` is a trustworthy reference (see
+    ``MusicDownloader._mb_reference``): MusicBrainz happily returns a same-titled
+    recording by a different artist, and scoring every candidate -35 for
+    "duration mismatch" against someone else's recording is pure noise.
     """
     try:
-        res = musicbrainzngs.search_recordings(
+        res = _throttled_search(
             query=f"{song} {artist}",
             artist=artist,
             recording=song,
@@ -66,6 +111,14 @@ def fetch_musicbrainz(artist: str, song: str) -> Optional[dict]:
 
         if "length" in best and best["length"]:
             duration_seconds = int(best["length"]) // 1000
+
+        matched_artist = best.get("artist-credit") or best.get("artist") or ""
+        if isinstance(matched_artist, list):
+            matched_artist = "".join(
+                part.get("name", "") if isinstance(part, dict) else str(part)
+                for part in matched_artist
+            )
+        matched_title = best.get("title") or ""
 
         release_list = best.get("release-list", [])
         if release_list:
@@ -98,10 +151,71 @@ def fetch_musicbrainz(artist: str, song: str) -> Optional[dict]:
             "release_id": release_id,
             "cover_url": cover_url,
             "duration_seconds": duration_seconds,
+            "title": matched_title or None,
+            "artist": matched_artist or None,
         }
 
     except (musicbrainzngs.WebServiceError, Exception):
         return None
+
+
+def fetch_itunes_reference(artist: str, song: str, timeout: float = 8.0) -> Optional[dict]:
+    """
+    Look up a song in the iTunes catalogue for a trustworthy duration reference.
+
+    MusicBrainz coverage of Latin American cumbia/vallenato is patchy, and when
+    it *does* answer it frequently returns a same-titled recording by a different
+    artist -- whose duration then penalises every correct candidate. Apple's
+    catalogue carries most of this material and answers by title+artist, so it
+    serves as both the reference duration and an independent check on whether
+    the song is really attributed to the artist named in the song list.
+
+    This is the ``search`` endpoint, not ``lookup``: ``lookup`` does not accept
+    MusicBrainz IDs (it answers 400), and ``trackViewUrl`` points at the Apple
+    Music store rather than at a YouTube video, so it cannot resolve an official
+    upload directly.
+
+    Returns ``{title, artist, album, duration, track_id, view_url}`` or None.
+    """
+    if not artist or not song:
+        return None
+    term = f"{artist} {song}".strip()
+    url = "https://itunes.apple.com/search?" + urlencode(
+        {"term": term, "entity": "song", "limit": 5}
+    )
+    try:
+        response = requests.get(
+            url,
+            timeout=timeout,
+            headers={"User-Agent": "YTMusicDownloader/2.0"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    target = normalize_title(strip_featuring(song))
+    for track in payload.get("results") or []:
+        if not isinstance(track, dict) or track.get("kind") != "song":
+            continue
+        title = track.get("trackName") or ""
+        if not title:
+            continue
+        if fuzz.token_set_ratio(target, normalize_title(strip_featuring(title))) < 85:
+            continue
+        track_time = track.get("trackTimeMillis")
+        return {
+            "title": title,
+            "artist": track.get("artistName") or "",
+            "album": track.get("collectionName") or "",
+            "duration": int(track_time) // 1000 if track_time else 0,
+            "track_id": track.get("trackId"),
+            "view_url": track.get("trackViewUrl") or "",
+        }
+    return None
 
 
 def _fetch_image(url: str) -> Optional[bytes]:

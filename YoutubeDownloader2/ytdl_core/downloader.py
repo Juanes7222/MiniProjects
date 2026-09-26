@@ -33,6 +33,31 @@ def _download_section(seconds: int) -> Callable[[dict, Any], tuple[dict[str, flo
     return resolve_section
 
 
+# Failures that will never succeed on a retry: the media itself is unavailable
+# or protected. Retrying these only burns the budget before falling through to
+# the next candidate, so the caller is told to move on immediately.
+_FATAL_ERROR_MARKERS = (
+    "drm protected",
+    "private video",
+    "video is private",
+    "video unavailable",
+    "members-only",
+    "this video is not available",
+    "removed by the uploader",
+    "account associated with this video has been terminated",
+    "http error 403",
+    "http error 404",
+    "sign in to confirm your age",
+    "unsupported url",
+)
+
+
+def is_fatal_download_error(message: str) -> bool:
+    """True when *message* describes a failure that retrying cannot fix."""
+    lowered = (message or "").lower()
+    return any(marker in lowered for marker in _FATAL_ERROR_MARKERS)
+
+
 def execute_download(
     url: str,
     output_dir: Path,
@@ -115,6 +140,9 @@ def execute_download(
             last_error = f"OSError: {exc}"
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
+
+        if is_fatal_download_error(last_error):
+            break
 
         if attempt < config.RETRY_ATTEMPTS:
             wait = config.RETRY_BACKOFF_BASE**attempt

@@ -71,10 +71,12 @@ def _mock_search_returns_one():
     """Patch search_all_sources to return one result, select_best_result to pick it."""
     result = _fake_search_result()
 
-    def fake_search(artist, song, sources, opts):
+    def fake_search(artist, song, sources, opts, **kwargs):
         return [result]
 
-    def fake_select(results, artist, song, mb_dur, config, console, lock, min_d, max_d, threshold):
+    def fake_select(
+    results, artist, song, mb_dur, config, console, lock, min_d, max_d, threshold, *a, **kw
+):
         scored = [(result, result["_composite_score"], result["_score_breakdown"])]
         return result, scored
 
@@ -357,7 +359,7 @@ class TestDownload:
         assert result_events[0][1][2] is False
 
     def test_search_failure(self, dl, output_dir, spy):
-        def fake_search(artist, song, sources, opts):
+        def fake_search(artist, song, sources, opts, **kwargs):
             return []
 
         def fake_select(results, *args, **kwargs):
@@ -816,11 +818,11 @@ class TestDownloadBatch:
     def test_multiple_songs(self, dl, output_dir, spy):
         songs = {"Artist": ["Song1", "Song2"]}
 
-        def fake_search(artist, song, sources, opts):
+        def fake_search(artist, song, sources, opts, **kwargs):
             return [_fake_search_result(title=f"{artist} - {song}")]
 
         def fake_select(
-            results, artist, song, mb_dur, config, console, lock, min_d, max_d, threshold
+            results, artist, song, mb_dur, config, console, lock, min_d, max_d, threshold, *a, **kw
         ):
             r = results[0]
             return r, [(r, r["_composite_score"], r["_score_breakdown"])]
@@ -1075,11 +1077,11 @@ class TestEventCallbacks:
         assert len(complete_calls) >= 1
 
     def test_on_result_fired_per_song(self, dl, output_dir, spy):
-        def fake_search(artist, song, sources, opts):
+        def fake_search(artist, song, sources, opts, **kwargs):
             return [_fake_search_result(title=f"{artist} - {song}")]
 
         def fake_select(
-            results, artist, song, mb_dur, config, console, lock, min_d, max_d, threshold
+            results, artist, song, mb_dur, config, console, lock, min_d, max_d, threshold, *a, **kw
         ):
             r = results[0]
             return r, [(r, r["_composite_score"], r["_score_breakdown"])]
@@ -1096,7 +1098,7 @@ class TestEventCallbacks:
         assert len(result_calls) == 2
 
     def test_on_search_start_fired(self, dl, output_dir, spy):
-        def fake_search(artist, song, sources, opts):
+        def fake_search(artist, song, sources, opts, **kwargs):
             return []
 
         def fake_select(results, *a, **kw):
@@ -1113,7 +1115,7 @@ class TestEventCallbacks:
         assert len(search_calls) >= 1
 
     def test_on_artist_start_fired(self, dl, output_dir, spy):
-        def fake_search(artist, song, sources, opts):
+        def fake_search(artist, song, sources, opts, **kwargs):
             return []
 
         def fake_select(results, *a, **kw):

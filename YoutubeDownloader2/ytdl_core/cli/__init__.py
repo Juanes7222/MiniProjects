@@ -368,10 +368,31 @@ def main() -> None:
             kev_runs=args.kev_runs,
             kev_url=args.kev_url,
             kev_model=args.kev_model,
+            channel_search=not args.no_channel_search,
         )
     except (RuntimeError, ValueError) as error:
         console.print(f"[red]{error}[/red]")
         raise SystemExit(1) from error
+
+    if getattr(args, "backfill_channels", False):
+        from ..channels import backfill_channels as _backfill
+        from ..state import load_state as _load_state
+        from ..state import save_state as _save_state
+
+        _state = _load_state(args.output, config.STATE_FILE)
+        _console.print("[dim]Resolving channel provenance for past downloads...[/dim]")
+        _enriched = _backfill(
+            _state,
+            {
+                "cookies_browser": args.cookies_browser,
+                "cookies_file": str(args.cookies) if args.cookies else None,
+                "proxy": args.proxy,
+            },
+        )
+        if _enriched:
+            _save_state(_state, args.output, config.STATE_FILE)
+        _console.print(f"[dim]Backfilled channel data for {_enriched} entries.[/dim]")
+        dl._load_channel_trust(_state)
 
     if getattr(args, "verify", False) or getattr(args, "repair", False):
         if getattr(args, "repair", False):

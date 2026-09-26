@@ -19,19 +19,27 @@ from pathlib import Path
 import yt_dlp
 from rapidfuzz import fuzz
 
+from .channels import ChannelTrust, channel_url_for
 from .config import Config
 from .downloader import download_partial, execute_download
 from .events import DownloaderEvents
 from .fingerprint import AcoustIDCircuitBreaker, verify_fingerprint
 from .jev import JevClassifier, JevEvaluationError
 from .kev import KevClassifier
-from .metadata import fetch_musicbrainz
+from .metadata import fetch_itunes_reference, fetch_musicbrainz
 from .post_checks import check_duration, check_silence, embed_and_verify
 from .reports import export_report, update_json_file
 from .result import DownloadResult
 from .search import search_all_sources, select_best_result
 from .state import load_state, save_state
-from .utils import apply_delay, compute_md5, migrate_legacy_audio_path, sanitize_filename
+from .utils import (
+    apply_delay,
+    compute_md5,
+    migrate_legacy_audio_path,
+    normalize_title,
+    sanitize_filename,
+    strip_featuring,
+)
 from .verifier import verify_library as _verify_library
 from .ytdlp_options import build_ytdlp_base_opts, make_progress_hook, resolve_downloaded_file
 
@@ -68,6 +76,7 @@ class MusicDownloader:
         kev_url="http://127.0.0.1:8009",
         kev_model="kev-latest",
         kev_classifier=None,
+        channel_search=True,
     ):
         if require_fingerprint and not acoustid_key:
             raise ValueError("Strict fingerprint verification requires an AcoustID key")
@@ -128,14 +137,93 @@ class MusicDownloader:
             or (JevClassifier(threshold=self.decision_threshold) if use_jev else None)
         )
         self.fpcalc_available = fpcalc_available
+        self.channel_search = channel_search
+        # Rebuilt from disk at the start of every run; see _load_channel_trust.
+        self.channel_trust = ChannelTrust(self.config)
         self._fp_semaphore = threading.Semaphore(3)
         self._circuit_breaker = AcoustIDCircuitBreaker(cooldown_seconds=60.0)
         self._selection_lock = threading.Lock()
+
+    def _load_channel_trust(self, state):
+        """(Re)build the learned channel trust model from the download state."""
+        self.channel_trust = ChannelTrust.from_state(state, self.config)
+        return self.channel_trust
+
+    def _resolve_reference(self, mb_data, artist, song, allow_itunes=True):
+        """
+        Build a trustworthy duration reference for this song.
+
+        MusicBrainz is asked first, then the iTunes catalogue. Either can return
+        a same-titled recording by a *different* artist, whose duration is that
+        recording's and not ours -- and applying a -35 "duration mismatch" to
+        every correct candidate on the strength of someone else's recording
+        actively demotes the right answer. Both sources are therefore checked
+        against the requested title and artist, and a mismatch is surfaced to
+        the user because it usually means the song list itself is wrong
+        ("Con el alma en las manos" is a Jesús Manuel recording, not Miguel
+        Morales; "Coqueta" is Heredero, not Jorge Veloza).
+
+        Returns ``(reference_dict_or_None, warnings)`` where reference_dict has
+        ``title``, ``artist``, ``album``, ``duration``, ``source``.
+        """
+        warnings: list[str] = []
+        sources = [("MusicBrainz", mb_data)]
+        if allow_itunes:
+            sources.append(("iTunes", None))
+        for source, payload in sources:
+            if source == "iTunes":
+                try:
+                    payload = fetch_itunes_reference(artist, song)
+                except Exception:
+                    payload = None
+            if not payload:
+                continue
+
+            duration = payload.get("duration_seconds" if source == "MusicBrainz" else "duration")
+            ref_title = payload.get("title")
+            ref_artist = payload.get("artist")
+            if not ref_artist and source == "iTunes":
+                ref_artist = payload.get("artist")
+
+            if ref_artist:
+                query = normalize_title(strip_featuring(artist))
+                matched = normalize_title(strip_featuring(ref_artist))
+                if matched and fuzz.token_set_ratio(
+                    query, matched
+                ) < self.config.MB_REFERENCE_MIN_ARTIST_MATCH:
+                    warnings.append(
+                        f"{source}: '{ref_title or song}' is credited to {ref_artist}, "
+                        f"not {artist} -- ignoring its reference duration. "
+                        "Check the artist/song in your list."
+                    )
+                    continue
+
+            if ref_title and song:
+                query_song = normalize_title(strip_featuring(song))
+                matched_song = normalize_title(strip_featuring(ref_title))
+                if matched_song and fuzz.token_set_ratio(
+                    query_song, matched_song
+                ) < self.config.MB_REFERENCE_MIN_TITLE_MATCH:
+                    continue
+
+            if duration:
+                return (
+                    {
+                        "title": ref_title,
+                        "artist": ref_artist,
+                        "album": payload.get("album") or payload.get("album"),
+                        "duration": int(duration),
+                        "source": source,
+                    },
+                    warnings,
+                )
+        return None, warnings
 
     def download(self, artist, song, output_dir, fmt="mp3", quality="192", skip_existing=False):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         state = load_state(output_dir, self.config.STATE_FILE)
+        self._load_channel_trust(state)
         return self._process_song(
             artist,
             song,
@@ -168,6 +256,7 @@ class MusicDownloader:
         artist_counts = dict(Counter(artist for artist, _ in pairs))
         state = load_state(output_dir, self.config.STATE_FILE)
         state_lock = threading.Lock()
+        self._load_channel_trust(state)
         stop = threading.Event()
         seen, seen_lock = set(), threading.Lock()
         all_results = []
@@ -526,23 +615,39 @@ class MusicDownloader:
             url = result.url
             dur_s = result.duration_seconds or dur_s
         (output_dir / safe_a).mkdir(parents=True, exist_ok=True)
-        self.events.on_download_start(artist, song, url)
-        dl_file, err = execute_download(
-            url,
+
+        dl_file, err, used = self._download_with_fallback(
+            ranked,
+            best,
+            artist,
+            song,
             output_dir,
             fmt,
             quality,
-            artist,
-            song,
-            self.events,
-            self.config,
             stop_event,
             state,
             state_lock,
-            self.cookies_browser,
-            self.cookies_file,
-            self.proxy,
+            url,
+            dur_s,
+            result,
         )
+
+        if used is not None:
+            # The winning candidate became unplayable; carry the replacement
+            # candidate's identity and score into the report.
+            best = used
+            url = used.get("webpage_url") or used.get("url", url)
+            dur_s = int(used.get("duration") or 0) or dur_s
+            result.url = url
+            result.source = used.get("_source", result.source)
+            result.matched_title = used.get("title") or result.matched_title
+            result.duration_seconds = dur_s
+            result.composite_score = used.get("_composite_score", result.composite_score)
+            result.score_breakdown = used.get("_score_breakdown", result.score_breakdown)
+            result.heuristic_score = int(
+                used.get("_heuristic_score", used.get("_composite_score", 0))
+            )
+
         if dl_file is None:
             self.events.on_download_failed(artist, song, err)
             result.reason = err
@@ -572,24 +677,129 @@ class MusicDownloader:
             result,
             output_dir,
             mb,
+            channel=best.get("channel") or best.get("uploader"),
+            channel_url=channel_url_for(best),
         )
+
+    def _download_with_fallback(
+        self,
+        ranked,
+        best,
+        artist,
+        song,
+        output_dir,
+        fmt,
+        quality,
+        stop_event,
+        state,
+        state_lock,
+        url,
+        dur_s,
+        result,
+    ):
+        """
+        Download the winning candidate, falling through to the next one on failure.
+
+        A dead URL is usually a dead *candidate*, not a transient network fault:
+        DRM-protected SoundCloud rips and removed videos fail identically on
+        every retry. Re-running the same URL three times with backoff wastes the
+        whole budget and then reports failure, even when candidate #2 was
+        perfectly playable.
+
+        Returns ``(file, error, used_candidate)`` where ``used_candidate`` is
+        ``best`` on success and the replacement entry when we fell through, or
+        None when every candidate failed.
+        """
+        tried: set[str] = set()
+        candidates = [best] + [entry for entry, _, _ in (ranked or [])[1:]]
+        last_error = ""
+
+        for index, entry in enumerate(candidates):
+            if entry is None:
+                continue
+            entry_url = entry.get("webpage_url") or entry.get("url") or url
+            if not entry_url or entry_url in tried:
+                continue
+            if index > 0:
+                entry_score = entry.get("_composite_score", 0)
+                if entry_score < self.score_threshold:
+                    break
+            tried.add(entry_url)
+
+            if index > 0:
+                self.events.on_warn(
+                    f"{artist} -- {song}: primary source unusable, trying "
+                    f"{entry.get('title') or entry_url} (score {entry.get('_composite_score', 0)})"
+                )
+                # The replacement needs its own verification pass, not the
+                # fingerprint verdict we collected for a different file.
+                result.fingerprint_verified = False
+                result.fingerprint_confidence = 0.0
+                result.fingerprint_matched_title = None
+                result.fingerprint_label = "not verified (alternate candidate)"
+
+            self.events.on_download_start(artist, song, entry_url)
+            dl_file, err = execute_download(
+                entry_url,
+                output_dir,
+                fmt,
+                quality,
+                artist,
+                song,
+                self.events,
+                self.config,
+                stop_event,
+                state,
+                state_lock,
+                self.cookies_browser,
+                self.cookies_file,
+                self.proxy,
+            )
+            if dl_file is not None:
+                return dl_file, "", (entry if index > 0 else None)
+            last_error = err
+            if stop_event.is_set():
+                break
+
+        return None, last_error, None
 
     def _search_and_select(
         self, artist, song, output_dir, state, state_lock, key, result, stop_event, mb_data
     ):
         opts = {
             "max_results": self.max_results,
+            # Fetch budget is deliberately decoupled from the presentation
+            # budget above; see search.search_with_variants.
+            "fetch_multiplier": self.config.FETCH_MULTIPLIER,
+            "min_fetch_per_query": self.config.MIN_FETCH_PER_QUERY,
             "cookies_browser": self.cookies_browser,
             "cookies_file": self.cookies_file,
             "proxy": self.proxy,
         }
-        mb_duration = mb_data.get("duration_seconds") if isinstance(mb_data, dict) else None
+        reference, reference_warnings = self._resolve_reference(
+            mb_data, artist, song, allow_itunes=self.musicbrainz
+        )
+        for message in reference_warnings:
+            self.events.on_warn(message)
+        mb_duration = reference["duration"] if reference else None
+        if reference and reference.get("album") and isinstance(mb_data, dict):
+            # Prefer the album the reference actually came from: it seeds the
+            # exact catalogue tracklist lookup.
+            mb_data = {**mb_data, "album": reference["album"]}
         best, ranked, src = None, [], None
         if stop_event.is_set():
             result.status = "skipped"
             return best, ranked, src
         self.events.on_search_start(artist, song, "parallel sources")
-        raw = search_all_sources(artist, song, self.sources, opts)
+        raw = search_all_sources(
+            artist,
+            song,
+            self.sources,
+            opts,
+            mb_data=mb_data,
+            channel_trust=self.channel_trust if self.channel_search else None,
+            config=self.config,
+        )
         if raw:
             found, ranked = select_best_result(
                 raw,
@@ -602,6 +812,7 @@ class MusicDownloader:
                 self.min_duration,
                 self.max_duration,
                 self.score_threshold,
+                self.channel_trust if self.channel_search else None,
             )
             has_sel = hasattr(self.events, "selector_fn") and callable(self.events.selector_fn)
             has_con = hasattr(self.events, "confirm_fn") and callable(self.events.confirm_fn)
@@ -869,6 +1080,8 @@ class MusicDownloader:
         result,
         output_dir,
         musicbrainz_data,
+        channel=None,
+        channel_url=None,
     ):
         duration_ok, actual_duration, failure = check_duration(
             downloaded_file,
@@ -973,7 +1186,18 @@ class MusicDownloader:
             fingerprint_confidence=result.fingerprint_confidence,
             fingerprint_label=result.fingerprint_label,
             state_filename=self.config.STATE_FILE,
+            channel=channel,
+            channel_url=channel_url,
         )
+        # Fold this observation into the live model so later songs in the same
+        # run already benefit from the channel that just proved itself.
+        if channel:
+            self.channel_trust.add(
+                channel,
+                artist=artist,
+                channel_url=channel_url or "",
+                verified=bool(result.fingerprint_verified),
+            )
         return result
 
     @staticmethod
@@ -1001,6 +1225,8 @@ class MusicDownloader:
         fingerprint_label=None,
         preserve_timestamp=False,
         state_filename=None,
+        channel=None,
+        channel_url=None,
     ):
         MusicDownloader._persist_state(
             state,
@@ -1016,6 +1242,8 @@ class MusicDownloader:
             fingerprint_label=fingerprint_label,
             preserve_timestamp=preserve_timestamp,
             state_filename=state_filename,
+            channel=channel,
+            channel_url=channel_url,
         )
 
     @staticmethod
@@ -1033,6 +1261,8 @@ class MusicDownloader:
         fingerprint_label=None,
         preserve_timestamp=False,
         state_filename=None,
+        channel=None,
+        channel_url=None,
     ):
         with lock:
             downloads = state.setdefault("downloads", {})
@@ -1042,7 +1272,7 @@ class MusicDownloader:
                 if preserve_timestamp and existing and "timestamp" in existing
                 else datetime.now(timezone.utc).isoformat()
             )
-            downloads[key] = {
+            entry = {
                 "status": status,
                 "url": url,
                 "file_path": file_path,
@@ -1052,4 +1282,14 @@ class MusicDownloader:
                 "fingerprint_label": fingerprint_label,
                 "timestamp": timestamp,
             }
+            # Publisher provenance is what makes the learned channel trust model
+            # work across runs; keep any previously recorded values on failure
+            # paths so a retry does not erase what we already know.
+            resolved_channel = channel or (existing or {}).get("channel")
+            resolved_channel_url = channel_url or (existing or {}).get("channel_url")
+            if resolved_channel:
+                entry["channel"] = resolved_channel
+            if resolved_channel_url:
+                entry["channel_url"] = resolved_channel_url
+            downloads[key] = entry
             save_state(state, output_dir, state_filename)

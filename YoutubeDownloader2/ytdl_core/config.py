@@ -4,6 +4,12 @@ import os
 from dataclasses import dataclass, field
 
 DEFAULT_LIVE_TERMS = frozenset({"live", "en vivo", "concert", "concierto", "tour"})
+
+# Hard rejects: a title containing any of these is never the recording we want.
+# Matching is word-boundary based (see utils.find_forbidden_phrases), so bare
+# "hora" / "version" were removed -- both are ordinary Spanish words that reject
+# legitimate titles ("...durante las horas", "(original version, ...)"). The
+# specific long-form and compound spellings are listed instead.
 DEFAULT_FORBIDDEN_TERMS = frozenset(
     {
         "cover",
@@ -23,25 +29,65 @@ DEFAULT_FORBIDDEN_TERMS = frozenset(
         "8d",
         "bass boosted",
         "extended",
+        "loop",
+        "looping",
         "10 hours",
         "1 hour",
-        "hora",
+        "2 hours",
+        "24 hours",
+        "1 hora",
+        "2 horas",
+        "hora completa",
+        "horas continuas",
         "compilation",
         "instrumental",
         "acoustic",
-        "version",
+        "acustica",
+        "acústica",
+        "version en vivo",
+        "version live",
+        "version remix",
+        "version extended",
+        "version extendida",
+        "version acustica",
+        "version acústica",
+        "version instrumental",
+        "version merengue",
         "radio edit",
         "fan made",
         "fanmade",
         "sped up",
         "speed up",
         "ultra slowed",
-        "remastered",
         "dj mix",
         "megamix",
         "mix",
         "full album",
         "album completo",
+        "parodia",
+        "parody",
+        "reupload",
+    }
+)
+
+# Soft terms: penalised, not rejected. A remaster from the artist's own Topic
+# channel is a legitimate source; a remaster from a random reupload is not, so
+# the penalty is waived for trusted/official channels (see scorer).
+DEFAULT_SOFT_TERMS = frozenset(
+    {
+        "remaster",
+        "remastered",
+        "remasterizado",
+        "remasterizacion",
+        "remasterización",
+        "reedicion",
+        "reedición",
+        "edicion remasterizada",
+        "edición remasterizada",
+        "reissue",
+        "reedition",
+        "version original",
+        "original version",
     }
 )
 
@@ -89,5 +135,32 @@ class Config:
     JEV_DEFAULT_RUNS: int = 1
     JEV_MAX_RUNS: int = 20
 
+    # --- Search recall -----------------------------------------------------
+    # The presentation budget (max_results) and the fetch budget are decoupled:
+    # a small --max-results must not shrink how many candidates we pull from
+    # each provider, or obscure catalogue tracks never surface at all.
+    FETCH_MULTIPLIER: int = 4
+    MIN_FETCH_PER_QUERY: int = 10
+
+    # --- Learned channel trust --------------------------------------------
+    TRUSTED_CHANNEL_BONUS: int = 40
+    TRUSTED_CHANNEL_BONUS_SEEN: int = 12
+    TRUSTED_ARTIST_CHANNEL_BONUS: int = 25
+    TRUST_MAX_BONUS: int = 65
+    TRUST_VERIFIED_MULTIPLIER: int = 3
+    TRUST_STRONG_WEIGHT: int = 4
+    TRUST_MEDIUM_WEIGHT: int = 2
+    MAX_CHANNEL_SEARCHES: int = 2
+
+    # --- Catalog / exact-match sources ------------------------------------
+    CATALOG_SOURCE_BONUS: int = 60
+    SOFT_TERM_PENALTY: int = -8
+
+    # MusicBrainz reference is only trusted for scoring when the recording it
+    # matched actually looks like the song we asked for.
+    MB_REFERENCE_MIN_TITLE_MATCH: int = 70
+    MB_REFERENCE_MIN_ARTIST_MATCH: int = 60
+
     LIVE_TERMS = DEFAULT_LIVE_TERMS
     FORBIDDEN_TERMS = DEFAULT_FORBIDDEN_TERMS
+    SOFT_TERMS = DEFAULT_SOFT_TERMS
