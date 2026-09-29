@@ -1127,6 +1127,153 @@ class TestDownloadUrl:
         short_skipped = [c for c in warns if "too short" in str(c)]
         assert len(short_skipped) >= 1
 
+    def test_single_video_ignores_default_max_duration(self, dl, output_dir, spy):
+        """A lone --url video is downloaded even when it exceeds the default cap."""
+        with patch("ytdl_core.core.yt_dlp.YoutubeDL") as MockYDL:
+            instance = MockYDL.return_value.__enter__.return_value
+            instance.extract_info.return_value = {
+                "title": "Long Episode",
+                "uploader": "Channel",
+                "duration": 9128,
+                "webpage_url": "http://example.com/long",
+            }
+
+            dl.download_url("http://example.com/video", output_dir)
+
+        warns = [c for c in spy.calls if c[0] == "on_warn"]
+        assert not [c for c in warns if "too long" in str(c)]
+        assert any(c[0] == "on_session_start" for c in spy.calls)
+
+    def test_single_video_matching_the_requested_url_is_kept(self, dl, output_dir, spy):
+        """A single video whose webpage_url equals the input URL is still downloaded."""
+        with patch("ytdl_core.core.yt_dlp.YoutubeDL") as MockYDL:
+            instance = MockYDL.return_value.__enter__.return_value
+            instance.extract_info.return_value = {
+                "title": "Episode",
+                "uploader": "Channel",
+                "duration": 200,
+                "webpage_url": "http://example.com/video",
+            }
+
+            dl.download_url("http://example.com/video", output_dir)
+
+        assert any(c[0] == "on_download_start" for c in spy.calls)
+        assert not [c for c in spy.calls if c[0] == "on_warn" and "No suitable URLs" in str(c)]
+
+    def test_single_video_respects_explicit_max_duration(self, output_dir, spy, config):
+        dl = MusicDownloader(
+            config=config,
+            events=spy,
+            delay=(0, 0),
+            workers=1,
+            no_silence_check=True,
+            skip_fingerprint=True,
+            max_duration=600,
+        )
+        with patch("ytdl_core.core.yt_dlp.YoutubeDL") as MockYDL:
+            instance = MockYDL.return_value.__enter__.return_value
+            instance.extract_info.return_value = {
+                "title": "Long Episode",
+                "uploader": "Channel",
+                "duration": 9128,
+                "webpage_url": "http://example.com/long",
+            }
+
+            dl.download_url("http://example.com/video", output_dir)
+
+        warns = [c for c in spy.calls if c[0] == "on_warn"]
+        assert [c for c in warns if "too long" in str(c)]
+
+    def test_single_video_ignores_default_min_duration(self, dl, output_dir, spy):
+        """A lone --url clip is downloaded even when it is shorter than the default floor."""
+        with patch("ytdl_core.core.yt_dlp.YoutubeDL") as MockYDL:
+            instance = MockYDL.return_value.__enter__.return_value
+            instance.extract_info.return_value = {
+                "title": "Short Clip",
+                "uploader": "Channel",
+                "duration": 22,
+                "webpage_url": "http://example.com/clip",
+            }
+
+            dl.download_url("http://example.com/video", output_dir)
+
+        warns = [c for c in spy.calls if c[0] == "on_warn"]
+        assert not [c for c in warns if "too short" in str(c)]
+        assert any(c[0] == "on_download_start" for c in spy.calls)
+
+    def test_single_video_respects_explicit_min_duration(self, output_dir, spy, config):
+        dl = MusicDownloader(
+            config=config,
+            events=spy,
+            delay=(0, 0),
+            workers=1,
+            no_silence_check=True,
+            skip_fingerprint=True,
+            min_duration=600,
+        )
+        with patch("ytdl_core.core.yt_dlp.YoutubeDL") as MockYDL:
+            instance = MockYDL.return_value.__enter__.return_value
+            instance.extract_info.return_value = {
+                "title": "Short Clip",
+                "uploader": "Channel",
+                "duration": 22,
+                "webpage_url": "http://example.com/clip",
+            }
+
+            dl.download_url("http://example.com/video", output_dir)
+
+        warns = [c for c in spy.calls if c[0] == "on_warn"]
+        assert [c for c in warns if "too short" in str(c)]
+
+    def test_playlist_warns_how_to_remove_duration_limits(self, dl, output_dir, spy):
+        with patch("ytdl_core.core.yt_dlp.YoutubeDL") as MockYDL:
+            instance = MockYDL.return_value.__enter__.return_value
+            instance.extract_info.return_value = {
+                "entries": [
+                    {
+                        "title": "Track",
+                        "uploader": "Channel",
+                        "duration": 200,
+                        "webpage_url": "http://example.com/1",
+                    }
+                ]
+            }
+
+            dl.download_url("http://example.com/playlist", output_dir)
+
+        warns = [c for c in spy.calls if c[0] == "on_warn"]
+        assert [c for c in warns if "--max-duration 0" in str(c)]
+        assert [c for c in warns if "--min-duration 0" in str(c)]
+
+    def test_playlist_omits_hints_for_explicit_limits(self, output_dir, spy, config):
+        dl = MusicDownloader(
+            config=config,
+            events=spy,
+            delay=(0, 0),
+            workers=1,
+            no_silence_check=True,
+            skip_fingerprint=True,
+            max_duration=600,
+            min_duration=120,
+        )
+        with patch("ytdl_core.core.yt_dlp.YoutubeDL") as MockYDL:
+            instance = MockYDL.return_value.__enter__.return_value
+            instance.extract_info.return_value = {
+                "entries": [
+                    {
+                        "title": "Track",
+                        "uploader": "Channel",
+                        "duration": 200,
+                        "webpage_url": "http://example.com/1",
+                    }
+                ]
+            }
+
+            dl.download_url("http://example.com/playlist", output_dir)
+
+        warns = [c for c in spy.calls if c[0] == "on_warn"]
+        assert not [c for c in warns if "Playlist/channel" in str(c)]
+
 
 # ===================================================================
 # verify_library()

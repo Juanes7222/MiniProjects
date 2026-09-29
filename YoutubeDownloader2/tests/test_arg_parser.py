@@ -132,3 +132,37 @@ def test_abbreviated_source_flags_are_rejected() -> None:
 def test_missing_source_is_rejected() -> None:
     with pytest.raises(SystemExit):
         parse_args([])
+
+
+def test_max_duration_defaults_to_none() -> None:
+    args = parse_args(["--url", "http://example.com/video"])
+
+    assert args.max_duration is None
+
+
+def test_explicit_max_duration_is_kept() -> None:
+    args = parse_args(["--url", "http://example.com/video", "--max-duration", "0"])
+
+    assert args.max_duration == 0
+
+
+def test_negative_max_duration_is_rejected() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--url", "http://example.com/video", "--max-duration", "-1"])
+
+
+def test_min_duration_defaults_to_none() -> None:
+    args = parse_args(["--url", "http://example.com/video"])
+
+    assert args.min_duration is None
+
+
+def test_explicit_min_duration_is_kept() -> None:
+    args = parse_args(["--url", "http://example.com/video", "--min-duration", "30"])
+
+    assert args.min_duration == 30
+
+
+def test_negative_min_duration_is_rejected() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--url", "http://example.com/video", "--min-duration", "-1"])

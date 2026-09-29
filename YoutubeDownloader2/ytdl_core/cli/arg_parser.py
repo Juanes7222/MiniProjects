@@ -117,8 +117,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Limit number of downloads from a URL (e.g. for playlists)",
     )
     p.add_argument("--max-results", metavar="INT", type=int, default=_CONFIG.DEFAULT_MAX_RESULTS)
-    p.add_argument("--max-duration", metavar="INT", type=int, default=_CONFIG.MAX_DURATION_SECONDS)
-    p.add_argument("--min-duration", metavar="INT", type=int, default=_CONFIG.MIN_DURATION_SECONDS)
+    p.add_argument(
+        "--max-duration",
+        metavar="INT",
+        type=int,
+        default=None,
+        help=(
+            f"Max length in seconds (default: {_CONFIG.MAX_DURATION_SECONDS}, "
+            "0 disables it). With --url on a single video the default is not "
+            "applied unless this flag is given explicitly."
+        ),
+    )
+    p.add_argument(
+        "--min-duration",
+        metavar="INT",
+        type=int,
+        default=None,
+        help=(
+            f"Min length in seconds (default: {_CONFIG.MIN_DURATION_SECONDS}, "
+            "0 disables it). With --url on a single video the default is not "
+            "applied unless this flag is given explicitly."
+        ),
+    )
     p.add_argument(
         "--fuzzy-threshold", metavar="INT", type=int, default=_CONFIG.DEFAULT_FUZZY_THRESHOLD
     )
@@ -391,6 +411,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.dry_run:
             p.error("--dry-run cannot be used with --url")
 
+    if args.max_duration is not None and args.max_duration < 0:
+        p.error("--max-duration must be zero or greater")
+    if args.min_duration is not None and args.min_duration < 0:
+        p.error("--min-duration must be zero or greater")
     if args.review_only_suspects and not args.review:
         p.error("--review-only-suspects requires --review")
     if args.review and (args.verify or args.repair):

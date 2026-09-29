@@ -106,9 +106,11 @@ class MusicDownloader:
         self.max_duration = (
             max_duration if max_duration is not None else self.config.MAX_DURATION_SECONDS
         )
+        self.max_duration_explicit = max_duration is not None
         self.min_duration = (
             min_duration if min_duration is not None else self.config.MIN_DURATION_SECONDS
         )
+        self.min_duration_explicit = min_duration is not None
         self.musicbrainz = musicbrainz
         self.cookies_browser = cookies_browser
         self.cookies_file = cookies_file
@@ -370,6 +372,28 @@ class MusicDownloader:
             return []
         if not info:
             return []
+        is_single_video = not info.get("entries")
+        if is_single_video:
+            max_duration = 0 if not self.max_duration_explicit else self.max_duration
+            min_duration = 0 if not self.min_duration_explicit else self.min_duration
+        else:
+            max_duration = self.max_duration
+            min_duration = self.min_duration
+            if not self.max_duration_explicit or not self.min_duration_explicit:
+                hints = []
+                if not self.max_duration_explicit:
+                    hints.append(
+                        f"longer than {self.max_duration}s are skipped "
+                        f"(pass --max-duration 0 to include them)"
+                    )
+                if not self.min_duration_explicit:
+                    hints.append(
+                        f"shorter than {self.min_duration}s are skipped "
+                        f"(pass --min-duration 0 to include them)"
+                    )
+                self.events.on_warn(
+                    f"Playlist/channel: entries {' and '.join(hints)}."
+                )
         entries = list(self._iter_entries(info))
         urls = []
         for e in entries:
@@ -388,15 +412,20 @@ class MusicDownloader:
                 continue
             dur = e.get("duration")
             if dur is not None:
-                if self.min_duration and dur < self.min_duration:
+                if min_duration and dur < min_duration:
                     self.events.on_warn(f"Skipped (too short): {title}")
                     continue
-                if self.max_duration and dur > self.max_duration:
+                if max_duration and dur > max_duration:
                     self.events.on_warn(f"Skipped (too long): {title}")
                     continue
             iu = e.get("webpage_url") or e.get("url")
             if not iu and e.get("id"):
                 iu = f"https://www.youtube.com/watch?v={e['id']}"
+            if is_single_video:
+                # The requested URL *is* this entry — never drop it.
+                if iu:
+                    urls.append((uploader, title, iu))
+                continue
             if iu and iu != url and "search?" not in iu:
                 urls.append((uploader, title, iu))
         if not urls:
