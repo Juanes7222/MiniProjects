@@ -11,7 +11,8 @@
     "Serviremos al Señor", "Ven a Mi Casa", "La Flor Más Hermosa", "Quiero Estar Presente",
     "Te Llamas Amor", "Ser un Adorador", "Hasta el Desierto", "La Luz del Día Llegará",
     "Fuiste Tú Mi Amanecer", "Al Creer en Ti",
-    "De Tal Manera", "Hoy Te Rindo Mi Ser", "Nada Imposible", "Sopla"
+    "De Tal Manera", "Hoy Te Rindo Mi Ser", "Nada Imposible",
+    "El Padre Que Siempre Soñé", "Sopla"
   ],
 
   "Abraham Zelada": [
@@ -23,7 +24,8 @@
     "En Su Templo", "Pecados Perdonados", "Eres Tú", "Alabemos al Creador",
     "De Mañana", "Guíame Señor", "Acuérdate de Tu Creador", "Tú Misericordia",
     "Allí Está Jesús", "Vive en Mí", "El Mismo de Ayer", "Resucitó",
-    "A Lo Suyo Vino", "Acuérdate", "No Hay Nadie Como Tú"
+    "A Lo Suyo Vino", "Acuérdate", "No Hay Nadie Como Tú",
+    "Quiero Amarte Más", "Resucitó"
   ],
 
   "Alejandro Alonso": [
@@ -125,10 +127,10 @@
   ],
   "Jorge Lozano": [
     "Señor, Llévame A Tus Atrios", "El León De La Tribu De Judá", "Eterno Amor",
-    "Alto Precio", "Al Que Vive",
-    "Somos Un Pueblo", "Refleja Al Mundo", "Tuyo Soy",
+    "El Dios De Israel Es Poderoso", "Alto Precio", "Al Que Vive",
+    "Somos Un Pueblo", "Refleja Al Mundo", "Los Muros Caen", "Tuyo Soy",
     "Mi Cristo", "Celebra Victorioso", "Mi Guía Él", "Cristo Es Mi Refugio",
-    "Exáltate Señor", "Tu Dios Es Amor",
+    "Más Que Vencedor", "Exáltate Señor", "Tu Dios Es Amor", "Cristo Eres Bello",
     "Omnipotente", "El Verbo Se Hizo Carne"
   ],
   "Jose Luis Reyes": [
@@ -346,7 +348,7 @@
     
     "Jehová Es Mi Luz (Salmo 27)", "Cien Ovejas", "Bajo Tus Alas",
     "Ave Aprisionada", "Bendice Alma Mía (Salmo 103)",
-    "He Visto A Dios", "Nací De Nuevo",
+    "Mi Iglesia", "He Visto A Dios", "Nací De Nuevo",
     "Gente Muy Sencilla", "Eres Tú",
     
     "Cielo Abierto", "Todo Lo Puedo", "Castillo Mío",
@@ -552,6 +554,7 @@
     "Se Creres Verás",
     "Inevitable",
     "Gracias Señor",
+    "Sol Da",
     
     "Al Pronunciar Su Nombre"
   ],
@@ -662,7 +665,7 @@
     "Se Me Escapa La Vida", "Columna De Nubes",
 
     
-    "Buscando Estoy", "Cerca De Ti",
+    "Buscando Estoy", "El Reina", "Cerca De Ti",
     "Recibid", "Amiga Mujer", "Cosas Nuevas",
 
     
@@ -672,7 +675,7 @@
     "Soy Un Bendecido", "Tu Misericordia", "Cuánto Te Amo",
 
     
-    "La Vid Verdadera"
+    "La Vid Verdadera", "Hijo De David"
   ],
   "Julio Melgar": [
     "Creo en Ti",
@@ -731,6 +734,7 @@
     "Se Abren Los Cielos",
     "Vivo Está",
     "Dios Proveerá",
+    "El Mar Abrirás",
     "El Mar Abrirás (feat. Oasis Ministry)",
     "Sopla Espíritu",
     "MARANATHA (Live)",
@@ -755,7 +759,7 @@
     "Sumérgeme en Tu Gloria", "Yo Estoy Happy", "Allí Quiero Estar",
     "Tu Amor", "Santo", "Dios Es Fiel", "Adoración",
     "Adoración En el Espíritu", "Adoración En el Espíritu Santo",
-    "Adoración Santo", "Profetizaré",
+    "Adoración Santo", "Profetiza", "Profetizaré",
     "Nadie Como Tú", "Jericó", "Shekinah",
     "Cuando Adoro", "Por la Fe", "Todo Va a Estar Bien",
     "Fuego y Poder", "Mi Gran Amor", "Dios",
@@ -774,7 +778,7 @@
     "Amémonos de Corazón", "Puedo Confiar en el Señor", "Por Qué Te Abates",
     "La Traición de Judas", "Cuando Vuelvas a Casa", "Qué Bueno Es el Señor",
     "Malagradecido Soy", "Me Ha Tocado", "Quiero Amarte",
-    "Monte Calvario", "Hoy Más Que Nunca",
+    "El Camino del Evangelio", "Monte Calvario", "Hoy Más Que Nunca",
     "Dios Está Aquí", "Acuérdate de Mí", "A Dónde Vas",
     "Los Juicios de Dios", "Bartimeo el Ciego", "Salmo 51",
     "Déjalo Que Se Mueva", "Cristo Te Limpió", "No Quites Tus Ojos de Mí",
@@ -823,6 +827,7 @@
     "Dios de Avivamiento",
     "Libre Soy",
     "Tu Gloria",
+    "Gratitud",
     "No Hay Otro Lugar",
     "Con Tu Voz",
     "Es Tu Amor",
@@ -869,6 +874,8 @@
     "Quiero Estar Contigo",
     "En Tu Presencia",
     "Te Adoraré",
+    "El Llamado",
+    "Esto Es un Avivamiento",
     "Me Decidí por Ti",
     "Quién Como Tú",
     "Bienvenido",
@@ -879,6 +886,7 @@
     "Ahí Estás Tú",
     "Hasta el Final",
     "Somos Tu Iglesia",
+    "Sana Nuestra Nación",
     "Tu Gracia",
     "No Hay Nada Imposible",
     "Creíste en Mí",
