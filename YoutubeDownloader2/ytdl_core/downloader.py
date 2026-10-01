@@ -73,7 +73,6 @@ def execute_download(
     cookies_browser: Optional[str] = None,
     cookies_file: Optional[str] = None,
     proxy: Optional[str] = None,
-    needs_fp: bool = False,
 ) -> tuple[Optional[Path], str]:
     """
     Download a single URL via yt-dlp with retry and post-download resolution.

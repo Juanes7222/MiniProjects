@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1564,6 +1565,78 @@ class TestDownloadUrl:
 # ===================================================================
 # verify_library()
 # ===================================================================
+
+
+class TestFingerprintGate:
+    """The skip threshold is calibrated on the heuristic's 0-165 scale.
+
+    With a decision model running, `_composite_score` holds a probability x100
+    instead, so a gate that read that field meant something different in the two
+    modes -- and reported a skip reason that did not match the number shown.
+    """
+
+    def _check(self, dl, entry):
+        result = DownloadResult(
+            artist="Artist",
+            song="Song",
+            heuristic_score=entry.get("_heuristic_score", 0),
+            composite_score=entry.get("_composite_score", 0),
+        )
+        with patch("ytdl_core.core.download_partial", return_value=None) as partial:
+            _, _, _, label = dl._fingerprint_check(
+                "Artist", "Song", "http://x", Path("."), entry, [], result
+            )
+        return partial.called, label
+
+    def _dl(self, config, spy, **kwargs):
+        dl = MusicDownloader(
+            config=config,
+            events=spy,
+            workers=1,
+            acoustid_key="KEY",
+            **kwargs,
+        )
+        # fpcalc presence is probed from PATH at construction; the gate under
+        # test is the score comparison, not the binary lookup.
+        dl.fpcalc_available = True
+        return dl
+
+    def test_high_heuristic_score_skips_the_partial_download(self, config, spy):
+        dl = self._dl(config, spy)
+        called, label = self._check(dl, {"_heuristic_score": 165, "_composite_score": 88})
+
+        assert called is False
+        assert "heuristic 165" in label
+
+    def test_gate_ignores_the_decision_probability(self, config, spy):
+        """A 40% decision probability is NOT the heuristic's 40/165.
+
+        Reading the wrong field made a weak decision look like a weak heuristic
+        score and triggered an unnecessary 90-second partial download.
+        """
+        dl = self._dl(config, spy)
+        called, label = self._check(dl, {"_heuristic_score": 165, "_composite_score": 40})
+
+        assert called is False
+        assert "skipped" in label
+
+    def test_weak_heuristic_score_still_fingerprints(self, config, spy):
+        dl = self._dl(config, spy)
+        called, _ = self._check(dl, {"_heuristic_score": 45, "_composite_score": 95})
+
+        assert called is True
+
+    def test_forced_fingerprint_overrides_a_high_score(self, config, spy):
+        dl = self._dl(config, spy, force_fingerprint=True)
+        called, _ = self._check(dl, {"_heuristic_score": 165, "_composite_score": 95})
+
+        assert called is True
+
+    def test_required_fingerprint_overrides_a_high_score(self, config, spy):
+        dl = self._dl(config, spy, require_fingerprint=True)
+        called, _ = self._check(dl, {"_heuristic_score": 165, "_composite_score": 95})
+
+        assert called is True
 
 
 class TestVerifyLibrary:

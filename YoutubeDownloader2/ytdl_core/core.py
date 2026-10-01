@@ -620,7 +620,9 @@ class MusicDownloader:
         fp_ok, fp_conf, fp_title, fp_label = self._fingerprint_check(
             artist, song, url, output_dir, best, ranked, result
         )
-        sc = result.composite_score
+        # Reported on the same scale the gate uses, so the line the user reads
+        # ("high confidence") and the reason fingerprinting was skipped agree.
+        sc = result.heuristic_score
         self.events.on_verification_status(
             artist,
             song,
@@ -1010,7 +1012,13 @@ class MusicDownloader:
 
     def _fingerprint_check(self, artist, song, url, output_dir, best, ranked, result):
         fp_ok, fp_conf, fp_title, fp_label = False, 0.0, None, "disabled"
-        sc = result.composite_score
+        # The threshold is calibrated against the heuristic's 0-165 scale, so it
+        # must be compared with the heuristic score. `_composite_score` means
+        # different things depending on the provider: with a decision model
+        # running it holds a probability x100, so the same 70 would read as a
+        # different decision in the two modes.
+        sc = result.heuristic_score
+        threshold = self.config.SCORE_THRESHOLD_SKIP_FINGERPRINT
         needs = (
             self.force_fingerprint
             or self.require_fingerprint
@@ -1018,16 +1026,16 @@ class MusicDownloader:
                 bool(self.acoustid_key)
                 and not self.skip_fingerprint
                 and self.fpcalc_available
-                and sc < self.config.SCORE_THRESHOLD_SKIP_FINGERPRINT
+                and sc < threshold
             )
         )
         if (
             self.acoustid_key
-            and sc >= self.config.SCORE_THRESHOLD_SKIP_FINGERPRINT
+            and sc >= threshold
             and not self.require_fingerprint
             and not self.force_fingerprint
         ):
-            fp_label = f"skipped -- score {sc} >= threshold"
+            fp_label = f"skipped -- heuristic {sc} >= {threshold}"
         elif self.acoustid_key and not self.fpcalc_available:
             fp_label = "disabled -- fpcalc not found"
         elif self.skip_fingerprint:
