@@ -40,17 +40,12 @@
     "De Regreso a Casa", "Último Acto", "Pacientemente", "Tomaste Mi Lugar",
     "Oración", "No Me Digas", "Otra Oportunidad",
     "Cicatrices de Amor", "Señor Escucha", "Alabemos al Señor",
-    "Perseguidos y Angustiados", "Eres Tú", "Tu Amor Señor", "Cuando Podré",
-    "Lord I Lift Your Name On High", "More Love, More Power", "Come Holy Spirit",
-    "Follow Me", "He Will Quiet You", "Let's Worship",
-    "Scars of Love", "Everybody Praise the Lord", "A Song for You",
-    "Persecuted, Overtaken", "You Alone", "Your Love Oh Lord", "How Long",
-    "Que Es El Hombre", "Country Walk"
+    "Perseguidos y Angustiados", "Eres Tú", "Tu Amor Señor", "Cuando Podré"
   ],
 
   "Benjamín Rivera": [
     
-    "Polos Opuestos", "Dios Es Así", "La Gran Tribulación",
+    "La Gran Tribulación",
     "Pa Que Cante El Pueblo", "Gente Feliz",
 
     
@@ -81,7 +76,7 @@
     "Una Cosa He Demandado a Jehová",
 
     
-    "Estás Aquí", "Blink", "Via Dolorosa", "Dios Es Así (2025)"
+    "Estás Aquí", "Via Dolorosa", "Dios Es Así"
   ],
 
   "Danny Berríos": [
@@ -124,12 +119,17 @@
     "Amar Unos A Otros", "Nací Para Adorar", "Voy A Profetizar"
   ],
   "Jorge Lozano": [
-    "Señor, Llévame A Tus Atrios", "El León De La Tribu De Judá", "Eterno Amor",
-    "Alto Precio", "Al Que Vive",
-    "Somos Un Pueblo", "Refleja Al Mundo", "Tuyo Soy",
-    "Mi Cristo", "Celebra Victorioso", "Mi Guía Él", "Cristo Es Mi Refugio",
-    "Exáltate Señor", "Tu Dios Es Amor",
-    "Omnipotente", "El Verbo Se Hizo Carne"
+    "El León De La Tribu De Judá", "Eterno Amor",
+    "Alto Precio", "Refleja Al Mundo", "Tuyo Soy",
+    "Celebra Victorioso", "Mi Guía Él", "Cristo Es Mi Refugio",
+    "Tu Dios Es Amor", "Más Que Vencedor",
+    "Omnipotente",
+    
+    "Verdadero Adorador", "Nuestro Comandante",
+    "Victoria", "Mi Libertador", "Majestuoso Dios",
+    "No Hay Nadie Como Tú", "Muéstrame Tu Gloria",
+    "Con Mis Manos Hacia El Cielo", "Solo Una Palabra Tuya",
+    "Vive a Través De Mi", "Yo Te Alabaré", "Corazón Travieso"
   ],
   "Jose Luis Reyes": [
     
@@ -512,7 +512,7 @@
     
     "La Vida Es", "A Cielos Abiertos", "Que Se Abran Los Cielos (25 años)",
     
-    "Cuando Te Vuelva a Ver", "Movimiento", "Bailando Contigo",
+    "Cuando Te Vuelva a Ver", "Movimiento",
     "No Temas", "Tú Estás Aquí", "Todo Lo Que Soy",
     "Si Tu Presencia Conmigo No Va", "Me Siento Bien"
   ],
@@ -884,6 +884,33 @@
     "Creíste en Mí",
     "Somos Uno",
     "Despierta Mi Corazón"
+  ],
+
+  "Hermanos Devia": [
+    
+    "Vida Y Libertad", "Solo Tú Señor", "Creo En Ti",
+    "Pacto De Amor", "Amigo Ideal", "Lazos De Amor",
+    "Quiero Llegar", "Amémonos", "Sinonimo De Amar",
+    "Vuelve A Dios", "La Luz De Otro Sol", "Dios Es Amor",
+    "Gracias Mi Señor", "Ya No Soy El Mismo", "Hay Una Ciudad",
+    
+    "Agradecimiento (feat. Wilmer Devia)", "Tu Eres Mi Amparo",
+    "Acuerdate", "Mi Celeste Hogar", "Quién Irá",
+    "La Playa Celestial", "Sin Igual Amor", "No Hay Nadie Como Dios",
+    "Si Fui Motivo", "Ven Llena Mi Vida", "Mi Eterno Compañero",
+    "El Justo Florecerá", "La Caridad",
+    
+    "Tan Necesario Eres Tú", "Siempre Feliz", "Solo Jesús",
+    "Te Amo Buen Jesús", "Ya Basta De Pescar", "Seguiré Adelante",
+    "Feliz Cumpleaños",
+    
+    "Amigo", "Sin Amor Nada Soy", "Sin Ti Nada Soy",
+    "Eres Mi Poema", "Bueno Y Temible", "Dónde Está Tu Amor?",
+    "Tu Cuidas De Mí", "Por Ti Soy Feliz", "Soy Feliz",
+    "La Paz Renacera", "Quince Años",
+    
+    "No Debes Temer", "Perfume Divino", "Me Das La Calma",
+    "Motivo De Adoración", "Es El Amor"
   ]
 
 }

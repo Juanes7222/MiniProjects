@@ -135,6 +135,19 @@ class Config:
     JEV_DEFAULT_RUNS: int = 1
     JEV_MAX_RUNS: int = 20
 
+    # --- Decision model (Jev / Kev) ----------------------------------------
+    # Gates veto a candidate outright when it falls under the floor; the
+    # remaining dimensions are weighted into a ranking score.
+    DECISION_GATE_FLOOR: float = 0.50
+    DECISION_STABLE_SPREAD: float = 0.15
+    # How many candidates go to the model per song. Search returns far more than
+    # this, and every extra candidate multiplies the request size across all
+    # dimensions; the ones past the cap cannot change which candidate wins.
+    DECISION_MAX_CANDIDATES: int = 12
+    # Candidates whose per-dimension answers moved more than this across runs are
+    # unstable, and are surfaced for review instead of downloaded silently.
+    DECISION_REVIEW_MARGIN: float = 0.10
+
     # --- Search recall -----------------------------------------------------
     # The presentation budget (max_results) and the fetch budget are decoupled:
     # a small --max-results must not shrink how many candidates we pull from

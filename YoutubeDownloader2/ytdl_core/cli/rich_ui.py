@@ -203,14 +203,17 @@ class RichEvents(DownloaderEvents):
             else "Decision"
         )
         if has_decision:
-            tbl.add_column(decision_provider, width=12)
+            # Wide enough for "Kev veto identity/origin" without truncating the
+            # reason a candidate was discarded.
+            tbl.add_column(decision_provider, width=24)
         tbl.add_column("Heur.", width=8)
         tbl.add_column("Top signals", min_width=30, style="dim")
 
         if has_decision:
             best_idx = (
                 0
-                if float(ranked[0][0].get("_decision_probability") or 0) >= self.decision_threshold
+                if ranked[0][0].get("_decision_eligible", True)
+                and float(ranked[0][0].get("_decision_probability") or 0) >= self.decision_threshold
                 else None
             )
         else:
@@ -221,18 +224,7 @@ class RichEvents(DownloaderEvents):
             title_str = (entry.get("title") or "")[:55]
             channel_str = (entry.get("channel") or entry.get("uploader") or "")[:30]
             heuristic_score = int(entry.get("_heuristic_score", sc))
-            top = sorted(
-                ((key, value) for key, value in bd.items() if key != "decision_probability"),
-                key=lambda kv: abs(kv[1]),
-                reverse=True,
-            )[:3]
-            signals = ", ".join(f"{'+' if value >= 0 else ''}{value} {key}" for key, value in top)
-            if has_decision and "_decision_min" in entry and "_decision_max" in entry:
-                range_label = (
-                    f"{decision_provider} range {float(entry['_decision_min']):.0%}-"
-                    f"{float(entry['_decision_max']):.0%}"
-                )
-                signals = f"{range_label}, {signals}" if signals else range_label
+            signals = self._candidate_signals(entry, bd, decision_provider, has_decision)
             if heuristic_score >= 70:
                 heuristic_cell = f"[green]{heuristic_score}[/green]"
             elif heuristic_score >= 30:
@@ -258,7 +250,16 @@ class RichEvents(DownloaderEvents):
                         or len(entry.get("_decision_samples") or [])
                         or 1
                     )
-                    if probability >= self.decision_threshold:
+                    if not entry.get("_decision_eligible", True):
+                        failed = "/".join(entry.get("_decision_failed_gates") or [])
+                        decision_cell = (
+                            f"[red]{decision_provider} veto {failed}[/red]"
+                            if failed
+                            else f"[red]{decision_provider} vetoed[/red]"
+                        )
+                    elif not entry.get("_decision_stable", True):
+                        decision_cell = f"[yellow]{decision_percent}%?[/yellow]"
+                    elif probability >= self.decision_threshold:
                         decision_cell = f"[green]{decision_percent}% x{decision_runs}[/green]"
                     elif probability >= self.decision_threshold - 0.15:
                         decision_cell = f"[yellow]{decision_percent}% x{decision_runs}[/yellow]"
@@ -269,6 +270,36 @@ class RichEvents(DownloaderEvents):
             tbl.add_row(*row)
 
         self._print(tbl)
+
+    @staticmethod
+    def _candidate_signals(entry: dict, breakdown: dict, provider: str, has_decision: bool) -> str:
+        """Describe a candidate: decision dimensions first, heuristic signals after."""
+        parts: list[str] = []
+        if has_decision:
+            dimensions = entry.get("_decision_dimensions") or {}
+            if dimensions:
+                parts.append(
+                    " ".join(f"{key} {float(value):.0%}" for key, value in dimensions.items())
+                )
+            spread = entry.get("_decision_spread")
+            if spread is not None and not entry.get("_decision_stable", True):
+                parts.append(f"{provider} spread {float(spread):.0%}")
+            confidence = entry.get("_decision_confidence")
+            if confidence is not None:
+                parts.append(f"conf {float(confidence):.0%}")
+        heuristic_keys = {
+            key for key in breakdown if key not in (entry.get("_decision_dimensions") or {})
+        }
+        top = sorted(
+            ((key, value) for key, value in breakdown.items() if key in heuristic_keys),
+            key=lambda kv: abs(kv[1]),
+            reverse=True,
+        )[:3]
+        if top:
+            parts.append(
+                ", ".join(f"{'+' if value >= 0 else ''}{value} {key}" for key, value in top)
+            )
+        return ", ".join(parts)
 
     def on_search_failed(self, artist: str, song: str, sources_tried: list[str]) -> None:
         self._print(
@@ -579,7 +610,7 @@ class RichEvents(DownloaderEvents):
         tbl.add_column("Status", overflow="ellipsis")
         tbl.add_column("Duration", style="yellow", width=9)
         tbl.add_column("Fuzzy", style="magenta", width=5)
-        tbl.add_column("Decision", width=12)
+        tbl.add_column("Decision", width=22)
         tbl.add_column("Heur.", width=7)
         tbl.add_column("Fingerprint", overflow="ellipsis", ratio=2)
         tbl.add_column("Silence", width=8)
@@ -601,7 +632,20 @@ class RichEvents(DownloaderEvents):
                 decision_value = int(round(r.decision_probability * 100))
                 decision_runs = r.decision_runs or len(r.decision_samples) or 1
                 provider = r.decision_provider or "AI"
-                if r.decision_probability >= self.decision_threshold:
+                if r.decision_failed_gates:
+                    decision_cell = (
+                        f"[red]{provider} veto {'/'.join(r.decision_failed_gates)}[/red]"
+                    )
+                elif not r.decision_stable:
+                    decision_cell = (
+                        f"[yellow]{provider} {decision_value}%? "
+                        f"[dim](spread {r.decision_spread:.0%})[/dim][/yellow]"
+                    )
+                elif r.decision_needs_review:
+                    decision_cell = (
+                        f"[yellow]{provider} {decision_value}% [dim]review[/dim][/yellow]"
+                    )
+                elif r.decision_probability >= self.decision_threshold:
                     decision_cell = f"[green]{provider} {decision_value}% x{decision_runs}[/green]"
                 elif r.decision_probability >= self.decision_threshold - 0.15:
                     decision_cell = (

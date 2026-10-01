@@ -128,15 +128,30 @@ class MusicDownloader:
         self.kev_runs = kev_runs if kev_runs is not None else self.config.JEV_DEFAULT_RUNS
         self.decision_threshold = self.kev_threshold if use_kev else self.jev_threshold
         self.decision_runs = self.kev_runs if use_kev else self.jev_runs
+        gate_floor = float(self.config.DECISION_GATE_FLOOR)
+        stable_spread = float(self.config.DECISION_STABLE_SPREAD)
+        max_candidates = int(self.config.DECISION_MAX_CANDIDATES)
         self.decision_classifier = kev_classifier or (
             KevClassifier(
                 url=kev_url,
                 model=kev_model,
                 threshold=self.decision_threshold,
+                gate_floor=gate_floor,
+                stable_spread=stable_spread,
+                max_candidates=max_candidates,
             )
             if use_kev
             else jev_classifier
-            or (JevClassifier(threshold=self.decision_threshold) if use_jev else None)
+            or (
+                JevClassifier(
+                    threshold=self.decision_threshold,
+                    gate_floor=gate_floor,
+                    stable_spread=stable_spread,
+                    max_candidates=max_candidates,
+                )
+                if use_jev
+                else None
+            )
         )
         self.fpcalc_available = fpcalc_available
         self.channel_search = channel_search
@@ -190,9 +205,11 @@ class MusicDownloader:
             if ref_artist:
                 query = normalize_title(strip_featuring(artist))
                 matched = normalize_title(strip_featuring(ref_artist))
-                if matched and fuzz.token_set_ratio(
-                    query, matched
-                ) < self.config.MB_REFERENCE_MIN_ARTIST_MATCH:
+                if (
+                    matched
+                    and fuzz.token_set_ratio(query, matched)
+                    < self.config.MB_REFERENCE_MIN_ARTIST_MATCH
+                ):
                     warnings.append(
                         f"{source}: '{ref_title or song}' is credited to {ref_artist}, "
                         f"not {artist} -- ignoring its reference duration. "
@@ -203,9 +220,11 @@ class MusicDownloader:
             if ref_title and song:
                 query_song = normalize_title(strip_featuring(song))
                 matched_song = normalize_title(strip_featuring(ref_title))
-                if matched_song and fuzz.token_set_ratio(
-                    query_song, matched_song
-                ) < self.config.MB_REFERENCE_MIN_TITLE_MATCH:
+                if (
+                    matched_song
+                    and fuzz.token_set_ratio(query_song, matched_song)
+                    < self.config.MB_REFERENCE_MIN_TITLE_MATCH
+                ):
                     continue
 
             if duration:
@@ -391,9 +410,7 @@ class MusicDownloader:
                         f"shorter than {self.min_duration}s are skipped "
                         f"(pass --min-duration 0 to include them)"
                     )
-                self.events.on_warn(
-                    f"Playlist/channel: entries {' and '.join(hints)}."
-                )
+                self.events.on_warn(f"Playlist/channel: entries {' and '.join(hints)}.")
         entries = list(self._iter_entries(info))
         urls = []
         for e in entries:
@@ -596,15 +613,7 @@ class MusicDownloader:
         result.heuristic_score = int(best.get("_heuristic_score", best.get("_composite_score", 0)))
         result.composite_score = best.get("_composite_score", 0)
         result.score_breakdown = best.get("_score_breakdown", {})
-        result.decision_provider = self.decision_provider
-        result.decision_probability = best.get("_decision_probability")
-        result.decision_samples = list(best.get("_decision_samples") or [])
-        result.decision_runs = int(best.get("_decision_runs") or 0)
-        result.decision_threshold = (
-            best.get("_decision_threshold", self.decision_threshold)
-            if self.decision_classifier is not None
-            else None
-        )
+        self._apply_decision(result, best)
         result.candidates_ranked = len(ranked)
         if result.selection_method == "heuristic":
             result.selection_method = self.decision_provider
@@ -875,17 +884,22 @@ class MusicDownloader:
                 self.events.on_candidates_scored(artist, song, ranked)
 
                 if decision_best is None:
-
+                    # A vetoed or under-threshold best still beats a silent gap:
+                    # report *why* it was not taken, which the atomic dimensions
+                    # now make answerable ("origin" vs "studio"), not just a score.
                     def heuristic_score(entry: dict) -> int:
                         value = entry.get("_heuristic_score")
                         if value is None:
                             value = entry.get("_composite_score")
                         return int(value or 0)
 
+                    # Prefer a candidate the model did not veto; only consider a
+                    # vetoed one when nothing else exists.
+                    fallback_pool = [
+                        item[0] for item in ranked if item[0].get("_decision_eligible", True)
+                    ] or [item[0] for item in ranked]
                     fallback_entry = (
-                        max(ranked, key=lambda item: heuristic_score(item[0]))[0]
-                        if ranked
-                        else None
+                        max(fallback_pool, key=heuristic_score) if fallback_pool else None
                     )
                     fallback_score = heuristic_score(fallback_entry) if fallback_entry else 0
                     fallback_threshold = max(
@@ -895,12 +909,10 @@ class MusicDownloader:
                     if fallback_entry and fallback_score >= fallback_threshold:
                         found = fallback_entry
                         result.selection_method = f"{self.decision_provider}-fallback"
-                        probability = fallback_entry.get("_decision_probability")
                         detail = (
                             str(decision_error)
                             if decision_error
-                            else f"best confidence {float(probability or 0):.0%} is below "
-                            f"{self.decision_threshold:.0%}"
+                            else self._decision_rejection_reason(fallback_entry)
                         )
                         self.events.on_warn(
                             f"{self.decision_provider}: {detail}; using heuristic fallback"
@@ -911,8 +923,13 @@ class MusicDownloader:
                             if decision_error
                             else (
                                 f"{self.decision_provider.capitalize()} found no candidate at "
-                                f"or above {self.decision_threshold:.2f}, and no valid "
-                                "heuristic candidate remains"
+                                f"or above {self.decision_threshold:.2f}"
+                                + (
+                                    f" ({self._decision_rejection_reason(fallback_entry)})"
+                                    if fallback_entry
+                                    else ""
+                                )
+                                + ", and no valid heuristic candidate remains"
                             )
                         )
                         self.events.on_warn(result.reason)
@@ -1083,12 +1100,61 @@ class MusicDownloader:
         )
         result.composite_score = entry.get("_composite_score", result.composite_score)
         result.score_breakdown = entry.get("_score_breakdown", result.score_breakdown)
+        MusicDownloader._copy_decision(result, entry)
+        result.fallback_used = True
+        return entry
+
+    @staticmethod
+    def _copy_decision(result: "DownloadResult", entry: dict) -> None:
+        """Move a decision model's verdict from a candidate entry onto the result."""
         result.decision_probability = entry.get("_decision_probability")
         result.decision_samples = list(entry.get("_decision_samples") or [])
         result.decision_runs = int(entry.get("_decision_runs") or 0)
         result.decision_threshold = entry.get("_decision_threshold")
-        result.fallback_used = True
-        return entry
+        result.decision_dimensions = {
+            key: float(value) for key, value in (entry.get("_decision_dimensions") or {}).items()
+        }
+        result.decision_failed_gates = list(entry.get("_decision_failed_gates") or [])
+        result.decision_spread = float(entry.get("_decision_spread") or 0.0)
+        result.decision_stable = bool(entry.get("_decision_stable", True))
+        result.decision_choice_probability = entry.get("_decision_choice_probability")
+        result.decision_confidence = entry.get("_decision_confidence")
+
+    @staticmethod
+    def _decision_rejection_reason(entry: dict) -> str:
+        """Explain a rejection with the dimension that caused it."""
+        failed = list(entry.get("_decision_failed_gates") or [])
+        if failed:
+            return f"rejected on {'/'.join(failed)}"
+        if not entry.get("_decision_stable", True):
+            return f"unstable across runs (spread {float(entry.get('_decision_spread') or 0):.0%})"
+        return f"best score {float(entry.get('_decision_probability') or 0):.0%} is below threshold"
+
+    def _apply_decision(self, result: "DownloadResult", entry: dict) -> None:
+        """Copy a decision model's verdict, then judge whether it needs a human.
+
+        The model is not just "yes/no" here: it reports per-dimension
+        probabilities and run-to-run spread. A candidate that only just cleared
+        the threshold, or whose answers moved between runs, is a case for review
+        rather than an automatic download.
+        """
+        self._copy_decision(result, entry)
+        result.decision_needs_review = self._needs_review(result)
+
+    def _needs_review(self, result: "DownloadResult") -> bool:
+        """Whether a human should look at this pick before trusting it."""
+        if result.decision_threshold is None or result.decision_probability is None:
+            return False
+        if result.decision_failed_gates or not result.decision_stable:
+            return True
+        margin = self.config.DECISION_REVIEW_MARGIN
+        probability = float(result.decision_probability)
+        # Only just above threshold, or only just below it: either way the model
+        # did not really settle the question.
+        return (
+            result.decision_threshold <= probability < result.decision_threshold + margin
+            or result.decision_threshold - margin <= probability < result.decision_threshold
+        )
 
     def _try_next_fp(self, ranked, artist, song, output_dir, result):
         for cr, cs, _ in ranked[1:]:

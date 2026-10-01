@@ -31,6 +31,13 @@ class DownloadResult:
     decision_samples: list[float] = field(default_factory=list)
     decision_runs: int = 0
     decision_threshold: Optional[float] = None
+    decision_dimensions: dict[str, float] = field(default_factory=dict)
+    decision_failed_gates: list[str] = field(default_factory=list)
+    decision_spread: float = 0.0
+    decision_stable: bool = True
+    decision_choice_probability: Optional[float] = None
+    decision_confidence: Optional[float] = None
+    decision_needs_review: bool = False
     selection_method: str = "heuristic"
     candidates_ranked: int = 0
     fallback_used: bool = False

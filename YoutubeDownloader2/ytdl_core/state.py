@@ -68,6 +68,12 @@ VERIFY_UNKNOWN_FIELDS = frozenset(
         "decision_samples",
         "decision_runs",
         "decision_threshold",
+        "decision_dimensions",
+        "decision_failed_gates",
+        "decision_spread",
+        "decision_stable",
+        "decision_confidence",
+        "decision_needs_review",
         "selection_method",
         "candidates_ranked",
         "fallback_used",
@@ -99,6 +105,16 @@ def state_detail(result: DownloadResult) -> dict[str, Any]:
         "decision_samples": [round(float(s), 4) for s in (result.decision_samples or [])],
         "decision_runs": result.decision_runs,
         "decision_threshold": result.decision_threshold,
+        # The atomic verdict: what each dimension answered, which gates failed,
+        # and how much the answers moved between runs.
+        "decision_dimensions": {
+            key: round(float(value), 4) for key, value in (result.decision_dimensions or {}).items()
+        },
+        "decision_failed_gates": list(result.decision_failed_gates or []),
+        "decision_spread": round(float(result.decision_spread), 4),
+        "decision_stable": result.decision_stable,
+        "decision_confidence": result.decision_confidence,
+        "decision_needs_review": result.decision_needs_review,
         "selection_method": result.selection_method,
         "candidates_ranked": result.candidates_ranked,
         "fallback_used": result.fallback_used,
@@ -142,4 +158,3 @@ def merge_state_detail(
             value = known[name]
         entry[name] = value
     return entry
-

@@ -627,6 +627,292 @@ class TestDownload:
         assert best is None
         assert "no valid heuristic candidate" in result.reason
 
+    def test_eligible_candidate_beats_a_vetoed_one_for_fallback(self, config, spy, output_dir):
+        """The model's veto holds even against a much stronger heuristic score."""
+        cover = _fake_search_result(score=90)
+        cover["title"] = "Artist - Song (Cover)"
+        weak = _fake_search_result(score=75)
+        weak["title"] = "Artist - Song (Alternate Take)"
+        vetoed = dict(cover)
+        vetoed.update(
+            {
+                "_heuristic_score": 90,
+                "_decision_eligible": False,
+                "_decision_failed_gates": ["origin"],
+                "_decision_probability": 0.0,
+            }
+        )
+        eligible = dict(weak)
+        eligible.update({"_heuristic_score": 75, "_decision_eligible": True})
+        classifier = MagicMock()
+        classifier.select.return_value = (None, [(vetoed, 0, {}), (eligible, 75, {})])
+        downloader = MusicDownloader(
+            config=config,
+            events=spy,
+            workers=1,
+            use_jev=True,
+            jev_classifier=classifier,
+        )
+        result = DownloadResult(artist="Artist", song="Song")
+
+        with (
+            patch("ytdl_core.core.search_all_sources", return_value=[cover, weak]),
+            patch(
+                "ytdl_core.core.select_best_result",
+                return_value=(cover, [(cover, 90, {}), (weak, 75, {})]),
+            ),
+        ):
+            best, _, _ = downloader._search_and_select(
+                "Artist",
+                "Song",
+                output_dir,
+                {"downloads": {}},
+                threading.Lock(),
+                "Artist::Song",
+                result,
+                threading.Event(),
+                None,
+            )
+
+        assert best is eligible
+        assert result.selection_method == "jev-fallback"
+
+    def test_vetoed_candidate_is_used_when_nothing_else_is_eligible(
+        self, config, spy, output_dir
+    ):
+        """With every candidate vetoed, the strongest heuristic one still saves the run."""
+        cover = _fake_search_result(score=90)
+        cover["title"] = "Artist - Song (Cover)"
+        vetoed = dict(cover)
+        vetoed.update(
+            {
+                "_heuristic_score": 90,
+                "_decision_eligible": False,
+                "_decision_failed_gates": ["origin"],
+                "_decision_probability": 0.0,
+            }
+        )
+        classifier = MagicMock()
+        classifier.select.return_value = (None, [(vetoed, 0, {})])
+        downloader = MusicDownloader(
+            config=config,
+            events=spy,
+            workers=1,
+            use_jev=True,
+            jev_classifier=classifier,
+        )
+        result = DownloadResult(artist="Artist", song="Song")
+
+        with (
+            patch("ytdl_core.core.search_all_sources", return_value=[cover]),
+            patch(
+                "ytdl_core.core.select_best_result",
+                return_value=(cover, [(cover, 90, {})]),
+            ),
+        ):
+            best, _, _ = downloader._search_and_select(
+                "Artist",
+                "Song",
+                output_dir,
+                {"downloads": {}},
+                threading.Lock(),
+                "Artist::Song",
+                result,
+                threading.Event(),
+                None,
+            )
+
+        assert best is vetoed
+        assert result.selection_method == "jev-fallback"
+        warnings = [str(call) for call in spy.calls if call[0] == "on_warn"]
+        assert any("rejected on origin" in message for message in warnings)
+
+    def test_rejection_reason_names_the_failed_gate(self, config, spy, output_dir):
+        candidate = _fake_search_result(score=20)
+        vetoed = dict(candidate)
+        vetoed.update(
+            {
+                "_heuristic_score": 20,
+                "_decision_eligible": False,
+                "_decision_failed_gates": ["origin", "identity"],
+                "_decision_probability": 0.0,
+            }
+        )
+        classifier = MagicMock()
+        classifier.select.return_value = (None, [(vetoed, 0, {})])
+        downloader = MusicDownloader(
+            config=config,
+            events=spy,
+            workers=1,
+            use_jev=True,
+            jev_classifier=classifier,
+        )
+        result = DownloadResult(artist="Artist", song="Song")
+
+        with (
+            patch("ytdl_core.core.search_all_sources", return_value=[candidate]),
+            patch(
+                "ytdl_core.core.select_best_result",
+                return_value=(candidate, [(candidate, 20, {})]),
+            ),
+        ):
+            best, _, _ = downloader._search_and_select(
+                "Artist",
+                "Song",
+                output_dir,
+                {"downloads": {}},
+                threading.Lock(),
+                "Artist::Song",
+                result,
+                threading.Event(),
+                None,
+            )
+
+        assert best is None
+        assert "rejected on origin/identity" in result.reason
+
+    def test_rejection_reason_names_instability(self, config, spy, output_dir):
+        candidate = _fake_search_result(score=20)
+        unstable = dict(candidate)
+        unstable.update(
+            {
+                "_heuristic_score": 20,
+                "_decision_eligible": True,
+                "_decision_stable": False,
+                "_decision_spread": 0.31,
+                "_decision_probability": 0.5,
+            }
+        )
+        classifier = MagicMock()
+        classifier.select.return_value = (None, [(unstable, 50, {})])
+        downloader = MusicDownloader(
+            config=config,
+            events=spy,
+            workers=1,
+            use_jev=True,
+            jev_classifier=classifier,
+        )
+        result = DownloadResult(artist="Artist", song="Song")
+
+        with (
+            patch("ytdl_core.core.search_all_sources", return_value=[candidate]),
+            patch(
+                "ytdl_core.core.select_best_result",
+                return_value=(candidate, [(candidate, 20, {})]),
+            ),
+        ):
+            best, _, _ = downloader._search_and_select(
+                "Artist",
+                "Song",
+                output_dir,
+                {"downloads": {}},
+                threading.Lock(),
+                "Artist::Song",
+                result,
+                threading.Event(),
+                None,
+            )
+
+        assert best is None
+        assert "unstable across runs" in result.reason
+
+    def test_candidate_just_above_threshold_needs_review(self, config, spy, output_dir):
+        candidate = _fake_search_result()
+        decided = dict(candidate)
+        decided.update(
+            {
+                "_heuristic_score": 80,
+                "_decision_eligible": True,
+                "_decision_stable": True,
+                "_decision_probability": 0.62,
+                "_decision_threshold": 0.60,
+                "_decision_runs": 1,
+                "_decision_dimensions": {"identity": 0.95, "studio": 0.66},
+            }
+        )
+        classifier = MagicMock()
+        classifier.select.return_value = (decided, [(decided, 62, {})])
+        downloader = MusicDownloader(
+            config=config,
+            events=spy,
+            delay=(0, 0),
+            workers=1,
+            no_silence_check=True,
+            skip_fingerprint=True,
+            use_jev=True,
+            jev_classifier=classifier,
+        )
+        downloaded_file = output_dir / "Artist" / "Song.mp3"
+        downloaded_file.parent.mkdir(parents=True, exist_ok=True)
+        downloaded_file.write_bytes(b"\x00" * 60000)
+        fake_search, fake_select = _mock_search_returns_one()
+
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch(
+                "ytdl_core.core.execute_download",
+                return_value=(downloaded_file, ""),
+            ),
+            patch("ytdl_core.core.check_duration", return_value=(True, 200, None)),
+            patch("ytdl_core.core.embed_and_verify", return_value=True),
+            patch("ytdl_core.core.apply_delay"),
+        ):
+            result = downloader.download("Artist", "Song", output_dir)
+
+        assert result.status == "downloaded"
+        assert result.decision_needs_review is True
+        assert result.decision_dimensions["studio"] == 0.66
+
+    def test_confident_selection_does_not_need_review(self, config, spy, output_dir):
+        candidate = _fake_search_result()
+        decided = dict(candidate)
+        decided.update(
+            {
+                "_heuristic_score": 80,
+                "_decision_eligible": True,
+                "_decision_stable": True,
+                "_decision_probability": 0.91,
+                "_decision_threshold": 0.60,
+                "_decision_runs": 1,
+                "_decision_dimensions": {"identity": 0.99, "studio": 0.94},
+                "_decision_confidence": 0.88,
+            }
+        )
+        classifier = MagicMock()
+        classifier.select.return_value = (decided, [(decided, 91, {})])
+        downloader = MusicDownloader(
+            config=config,
+            events=spy,
+            delay=(0, 0),
+            workers=1,
+            no_silence_check=True,
+            skip_fingerprint=True,
+            use_jev=True,
+            jev_classifier=classifier,
+        )
+        downloaded_file = output_dir / "Artist" / "Song.mp3"
+        downloaded_file.parent.mkdir(parents=True, exist_ok=True)
+        downloaded_file.write_bytes(b"\x00" * 60000)
+        fake_search, fake_select = _mock_search_returns_one()
+
+        with (
+            patch("ytdl_core.core.search_all_sources", fake_search),
+            patch("ytdl_core.core.select_best_result", fake_select),
+            patch(
+                "ytdl_core.core.execute_download",
+                return_value=(downloaded_file, ""),
+            ),
+            patch("ytdl_core.core.check_duration", return_value=(True, 200, None)),
+            patch("ytdl_core.core.embed_and_verify", return_value=True),
+            patch("ytdl_core.core.apply_delay"),
+        ):
+            result = downloader.download("Artist", "Song", output_dir)
+
+        assert result.status == "downloaded"
+        assert result.decision_needs_review is False
+        assert result.decision_confidence == 0.88
+
     def test_skip_existing_with_matching_md5(self, dl, output_dir, spy):
         fake_file = output_dir / "Artist" / "Song.mp3"
         fake_file.parent.mkdir(parents=True, exist_ok=True)
