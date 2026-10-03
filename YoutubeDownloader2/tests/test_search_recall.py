@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 import pytest
 
-from ytdl_core.channels import ChannelTrust
 from ytdl_core.config import Config
 from ytdl_core.core import MusicDownloader
 from ytdl_core.downloader import is_fatal_download_error

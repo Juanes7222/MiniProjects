@@ -34,6 +34,7 @@ from ..core import MusicDownloader
 from ..kev_server import KevServerError, KevServerManager
 from ..result import DownloadResult
 from ..utils import check_ffmpeg
+from ..cache import caches
 
 if TYPE_CHECKING:
     from rich.console import Console
@@ -339,6 +340,26 @@ def main() -> None:
         args.fingerprint_mode == "lenient" and bool(args.acoustid_key) and not args.skip_fingerprint
     )
 
+    # Pipeline / cache overrides are applied to the config before the downloader
+    # reads it, so the stage sizes, the fingerprint semaphore and the cache all
+    # agree on one set of numbers.
+    if getattr(args, "no_pipeline", False):
+        config.PIPELINE_ENABLED = False
+    if getattr(args, "fingerprint_concurrency", None):
+        config.FP_CONCURRENCY = max(1, int(args.fingerprint_concurrency))
+    if getattr(args, "kev_timeout", None):
+        config.DECISION_TIMEOUT_SECONDS = max(1, int(args.kev_timeout))
+    if getattr(args, "decision_questions", None):
+        config.DECISION_MAX_QUESTIONS = max(1, int(args.decision_questions))
+    stage_workers = getattr(args, "stage_workers", None) or []
+    for attribute, value in zip(
+        ("SEARCH_WORKERS", "VERIFY_WORKERS", "DOWNLOAD_WORKERS", "POST_WORKERS"), stage_workers
+    ):
+        setattr(config, attribute, max(1, int(value)))
+    if getattr(args, "no_cache", False):
+        config.CACHE_ENABLED = False
+        caches.disable()
+
     try:
         dl = MusicDownloader(
             config=config,
@@ -380,7 +401,7 @@ def main() -> None:
         from ..state import save_state as _save_state
 
         _state = _load_state(args.output, config.STATE_FILE)
-        _console.print("[dim]Resolving channel provenance for past downloads...[/dim]")
+        console.print("[dim]Resolving channel provenance for past downloads...[/dim]")
         _enriched = _backfill(
             _state,
             {
@@ -391,7 +412,7 @@ def main() -> None:
         )
         if _enriched:
             _save_state(_state, args.output, config.STATE_FILE)
-        _console.print(f"[dim]Backfilled channel data for {_enriched} entries.[/dim]")
+        console.print(f"[dim]Backfilled channel data for {_enriched} entries.[/dim]")
         dl._load_channel_trust(_state)
 
     if getattr(args, "verify", False) or getattr(args, "repair", False):

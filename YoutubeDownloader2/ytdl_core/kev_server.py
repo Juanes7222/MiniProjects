@@ -38,6 +38,9 @@ class KevServerManager:
         self.log_file: TextIO | None = None
         self._job_handle: int | None = None
         self._previous_sigterm_handler: Any = None
+        # Detected during _sync_environment, reused by _verify_cuda so the
+        # hardware is only ever probed once per start.
+        self._gpu_name: str | None = None
 
     def start(self) -> str:
         if not self._is_local_url():
@@ -60,6 +63,9 @@ class KevServerManager:
         self._start_process()
         self._install_termination_handler()
         self._wait_until_ready()
+        # Up is not the same as usable at batch speed; find out now, not from a
+        # thousand identical timeouts.
+        self._report_latency()
         return self.url
 
     def stop(self) -> None:
@@ -129,10 +135,56 @@ class KevServerManager:
         self._step("Kev: checking repository updates")
         self._run(["git", "pull", "--ff-only"], self.root)
 
+    def _nvidia_gpu_name(self) -> str | None:
+        """Name of the first NVIDIA GPU, or None. Does not require torch.
+
+        Detecting the hardware by importing torch is circular here: the sync
+        deliberately excludes torch (it is a multi-gigabyte download installed
+        separately with a CUDA-specific backend), so the one thing we need torch
+        for is the one thing torch is not there to answer. ``nvidia-smi`` is part
+        of the NVIDIA driver, is always present when a CUDA device is, and tells
+        us what we need before anything is installed.
+        """
+        executable = shutil_which("nvidia-smi")
+        if executable is None:
+            return None
+        try:
+            completed = subprocess.run(
+                [executable, "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        names = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+        return names[0] if names else None
+
     def _sync_environment(self) -> None:
         if shutil_which("uv") is None:
             raise KevServerError("uv was not found; install it to manage Kev")
-        self._step("Kev: syncing Python dependencies")
+
+        self._gpu_name = self._nvidia_gpu_name()
+
+        if self._gpu_name is None:
+            # No CUDA device: install the ordinary CPU torch so the environment
+            # is at least coherent, and let _verify_cuda explain the real problem.
+            # Excluding torch here would instead leave a broken venv behind and
+            # report the absence as a missing-module error.
+            self._step("Kev: no NVIDIA GPU found; syncing CPU dependencies")
+            self._run(
+                ["uv", "sync", "--extra", "serve", "--inexact"],
+                self.root,
+                env=self._environment(),
+            )
+            return
+
+        self._step(f"Kev: CUDA GPU found ({self._gpu_name}); syncing dependencies")
         self._run(
             [
                 "uv",
@@ -149,12 +201,14 @@ class KevServerManager:
         self._install_cuda_torch()
 
     def _install_cuda_torch(self) -> None:
-        if "CUDA=True" in self._cuda_probe():
-            return
         python_path = (
             self.root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         )
-        self._step("Kev: installing CUDA-enabled PyTorch")
+        self._step("Kev: installing CUDA-enabled PyTorch (cu128)")
+        # 2.7 is the floor on purpose: it is the first release whose cu128 wheels
+        # carry Blackwell (sm_120) kernels, which is what current consumer cards
+        # need. Older builds import fine and then fail at runtime with
+        # "no kernel image is available for execution on the device".
         self._run(
             [
                 "uv",
@@ -165,7 +219,7 @@ class KevServerManager:
                 "--torch-backend",
                 "cu128",
                 "--reinstall",
-                "torch>=2.6,<2.9",
+                "torch>=2.7,<2.9",
             ],
             self.root,
             env=self._environment(),
@@ -188,18 +242,135 @@ class KevServerManager:
         )
 
     def _verify_cuda(self) -> None:
+        if self._gpu_name is None:
+            raise KevServerError(
+                "Kev needs an NVIDIA GPU with CUDA, and no NVIDIA device was found on "
+                "this machine (nvidia-smi is missing or reports no GPUs). Install the "
+                "NVIDIA driver, or run with --jev / without --kev to use the hosted "
+                "decision model instead."
+            )
         self._step("Kev: verifying CUDA availability")
         output = self._cuda_probe()
         if "CUDA=True" not in output:
-            self._step("Kev: CUDA PyTorch was not detected; installing the CUDA build")
-            self._install_cuda_torch()
-            output = self._cuda_probe()
-        if "CUDA=True" not in output:
+            # The hardware is there but torch cannot see it: a driver too old for
+            # the card, or a torch build without kernels for its architecture.
             raise KevServerError(
-                "CUDA is not available in the Kev environment; refusing to start on CPU"
+                f"CUDA is present ({self._gpu_name}) but the installed PyTorch cannot "
+                "use it. This usually means an NVIDIA driver older than the card, or a "
+                "torch build without kernels for its architecture; reinstalling with "
+                "--torch-backend cu128 fixes the latter."
             )
         gpu = next((line[4:] for line in output.splitlines() if line.startswith("GPU=")), "unknown")
         self._step(f"Kev: CUDA detected on {gpu}")
+
+    def _probe_payload(self) -> dict[str, Any]:
+        """A request shaped exactly like a real evaluation.
+
+        This has to be built with the same question contract the pipeline uses. An
+        earlier version sent an empty ``questions`` dict and reported the latency
+        of that as 0.0s -- the server answers a request with nothing to infer
+        instantly, so the probe measured nothing at all and cheerfully reported
+        a healthy server while every real evaluation took minutes. A benchmark
+        that skips the work is worse than no benchmark.
+        """
+        from . import decision_questions as dq
+
+        candidates = [
+            {
+                "id": f"probe{i}",
+                "title": f"Probe Artist - Probe Song {i}",
+                "channel": "Probe Artist",
+                "uploader": "Probe Artist",
+                "artists": ["Probe Artist"],
+                "duration": 200 + i,
+                "_composite_score": 200 - i,
+            }
+            for i in range(3)
+        ]
+        state, _candidate_states, questions = dq.build_state_and_questions(
+            "Probe Artist", "Probe Song", candidates, None, dq.TYPESAFE_DIALECT
+        )
+        return {"state": state, "model": "kev-latest", "questions": questions}
+
+    def _report_latency(self, budget_seconds: float = 20.0) -> None:
+        """Time one real evaluation and warn if the server is too slow to use.
+
+        Knowing a server is *up* says nothing about whether it is usable at batch
+        speed. This model can load and answer correctly while being far too slow
+        for a thousand-song run -- the usual cause is a hybrid architecture whose
+        compiled kernels are absent, leaving a reference PyTorch fallback that
+        transformers itself describes as "much slower". Finding that out from a
+        thousand identical timeouts, each after a full retry ladder, is the worst
+        possible way to find out.
+
+        A probe that times out has already answered the question -- that is the
+        slow path, reported with its remedy, not a broken probe.
+        """
+        try:
+            payload = self._probe_payload()
+        except Exception:  # noqa: BLE001 - never block startup on the probe
+            payload = {
+                "state": {"artist": "probe", "song": "probe", "candidates": []},
+                "model": "kev-latest",
+                "questions": {},
+            }
+
+        started = time.monotonic()
+        self._step("Kev: timing a real evaluation to confirm batch speed")
+        timed_out = False
+        try:
+            response = requests.post(
+                f"{self.url}/v1/systemone",
+                json=payload,
+                # Ceiling, not budget: we only need to know it is far too slow.
+                timeout=budget_seconds * 3,
+            )
+            elapsed = time.monotonic() - started
+        except requests.Timeout:
+            timed_out = True
+            elapsed = time.monotonic() - started
+        except requests.RequestException as exc:
+            self._step(f"Kev: latency probe could not reach the server ({type(exc).__name__})")
+            return
+
+        question_count = len(payload.get("questions") or {})
+        if timed_out:
+            self._step(
+                f"Kev: TOO SLOW -- one evaluation ({question_count} questions) did not "
+                f"finish within {elapsed:.0f}s. The model is running without its "
+                "compiled kernels (causal_conv1d / flash-linear-attention), which "
+                "transformers reports as 'much slower'. Fix it by installing them "
+                "into the Kev environment: uv pip install --python .venv "
+                "flash-linear-attention[cuda]. Alternatively raise --kev-timeout, "
+                "but at this speed the run will not finish in reasonable time. "
+                "Continuing with the heuristic ranking, which remains fully functional."
+            )
+            return
+
+        if response.status_code >= 400:
+            # The server answered without evaluating anything, so this timing says
+            # nothing about inference speed. Reporting it as "within budget" would
+            # be the exact failure this probe exists to prevent.
+            self._step(
+                f"Kev: latency probe was rejected (HTTP {response.status_code}) after "
+                f"{elapsed:.1f}s, so it measured no inference. Treating the model as "
+                "unverified; if real evaluations time out, the kernels are the likely "
+                "cause (uv pip install --python .venv flash-linear-attention[cuda])."
+            )
+            return
+
+        if elapsed > budget_seconds:
+            self._step(
+                f"Kev: SLOW -- one evaluation ({question_count} questions) took "
+                f"{elapsed:.0f}s (budget {budget_seconds:.0f}s). If every song pays "
+                "this, the run will take hours. Consider --kev-timeout, or run "
+                "without --kev."
+            )
+        else:
+            self._step(
+                f"Kev: evaluation latency {elapsed:.1f}s for {question_count} "
+                "questions -- within budget"
+            )
 
     def _environment(self) -> dict[str, str]:
         env = os.environ.copy()

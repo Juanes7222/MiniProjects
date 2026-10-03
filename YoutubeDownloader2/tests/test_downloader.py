@@ -107,6 +107,10 @@ class TestExecuteDownload:
 
     def test_retries_on_failure(self, tmp_path, spy_events, config):
         config.RETRY_ATTEMPTS = 2
+        # The backoff is now jittered and waited on through the stop event, so
+        # it cannot be suppressed by patching time.sleep. Shrinking the window
+        # exercises the real backoff path for a negligible amount of time.
+        config.RETRY_BACKOFF_BASE = 0.001
 
         fake_file = tmp_path / "Artist" / "Song.mp3"
         fake_file.parent.mkdir(parents=True, exist_ok=True)
@@ -128,19 +132,18 @@ class TestExecuteDownload:
             instance.extract_info.side_effect = side_effect
             instance.prepare_filename.return_value = str(fake_file)
 
-            with patch("ytdl_core.downloader.time.sleep"):
-                stop = threading.Event()
-                file, err = execute_download(
-                    "http://example.com/video",
-                    tmp_path,
-                    "mp3",
-                    "192",
-                    "Artist",
-                    "Song",
-                    spy_events,
-                    config,
-                    stop,
-                )
+            stop = threading.Event()
+            file, err = execute_download(
+                "http://example.com/video",
+                tmp_path,
+                "mp3",
+                "192",
+                "Artist",
+                "Song",
+                spy_events,
+                config,
+                stop,
+            )
             assert file is not None
             assert call_count == 2
             assert any(c[0] == "on_download_retry" for c in spy_events.calls)

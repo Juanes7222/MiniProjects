@@ -137,6 +137,13 @@ class ChannelTrust:
         self.seen_bonus = cfg.TRUSTED_CHANNEL_BONUS_SEEN
         self.artist_bonus = cfg.TRUSTED_ARTIST_CHANNEL_BONUS
         self._channels: dict[str, dict[str, Any]] = {}
+        # The model is folded forward as each download completes, from several
+        # stage workers at once. ``weight += 1`` is a read-modify-write, so
+        # without this, concurrent observations of the same channel silently
+        # lose increments -- and lost increments mean a channel that reliably
+        # delivers verified downloads never becomes trusted. Reads need no lock:
+        # dict lookups are atomic, and only the totals are being accumulated.
+        self._lock = threading.Lock()
 
     # -- construction ------------------------------------------------------
     def add(
@@ -150,14 +157,15 @@ class ChannelTrust:
         key = _norm(channel)
         if not key:
             return
-        record = self._channels.setdefault(
-            key, {"name": channel, "weight": 0, "artists": {}, "url": ""}
-        )
-        record["weight"] += self.verified_multiplier if verified else 1
-        if artist:
-            record["artists"][_norm(artist)] = record["artists"].get(_norm(artist), 0) + 1
-        if channel_url and not record["url"]:
-            record["url"] = channel_url
+        with self._lock:
+            record = self._channels.setdefault(
+                key, {"name": channel, "weight": 0, "artists": {}, "url": ""}
+            )
+            record["weight"] += self.verified_multiplier if verified else 1
+            if artist:
+                record["artists"][_norm(artist)] = record["artists"].get(_norm(artist), 0) + 1
+            if channel_url and not record["url"]:
+                record["url"] = channel_url
 
     @classmethod
     def from_state(cls, state: Optional[dict], config: Optional[Config] = None) -> "ChannelTrust":

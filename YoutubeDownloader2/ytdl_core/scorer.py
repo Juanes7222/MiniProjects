@@ -11,6 +11,7 @@ Two public functions:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from rapidfuzz import fuzz
@@ -22,8 +23,9 @@ from .config import (
     Config,
 )
 from .utils import (
-    find_forbidden_phrases,
+    PhraseMatcher,
     normalize_title,
+    phrase_matcher,
     remove_matching_noise,
     strip_featuring,
 )
@@ -32,6 +34,58 @@ if TYPE_CHECKING:
     from .channels import ChannelTrust
 
 _CATALOG_SOURCES = ("ytmusic_api", "itunes")
+
+
+def _terms(explicit, default) -> frozenset[str]:
+    return frozenset(explicit if explicit is not None else default)
+
+
+@dataclass(frozen=True)
+class QueryContext:
+    """Everything about the *query* that does not vary between candidates.
+
+    Ranking a song means running the same fuzzy normalisations and the same
+    query-side forbidden/live checks once per candidate, even though they depend
+    only on the artist and title being looked for. With forty candidates that is
+    forty identical computations of four values. Built once per song instead.
+    """
+
+    artist: str
+    song: str
+    artist_clean: str
+    song_clean: str
+    query_forbidden: frozenset[str]
+    query_live: frozenset[str]
+    forbidden_matcher: PhraseMatcher
+    live_matcher: PhraseMatcher
+    soft_matcher: PhraseMatcher
+
+
+def build_query_context(
+    artist: str,
+    song: str,
+    config: Optional[Config] = None,
+) -> QueryContext:
+    """Precompute the per-song invariants used by :func:`score_youtube_result`."""
+    cfg = config or Config()
+    forbidden = _terms(getattr(cfg, "FORBIDDEN_TERMS", DEFAULT_FORBIDDEN_TERMS), DEFAULT_FORBIDDEN_TERMS)
+    live = _terms(getattr(cfg, "LIVE_TERMS", DEFAULT_LIVE_TERMS), DEFAULT_LIVE_TERMS)
+    soft = _terms(getattr(cfg, "SOFT_TERMS", DEFAULT_SOFT_TERMS), DEFAULT_SOFT_TERMS)
+
+    forbidden_matcher = phrase_matcher(forbidden)
+    live_matcher = phrase_matcher(live)
+    query_text = f"{artist} {song}"
+    return QueryContext(
+        artist=artist,
+        song=song,
+        artist_clean=normalize_title(strip_featuring(artist.lower())),
+        song_clean=normalize_title(strip_featuring(song.lower())),
+        query_forbidden=frozenset(forbidden_matcher.find(query_text)),
+        query_live=frozenset(live_matcher.find(query_text)),
+        forbidden_matcher=forbidden_matcher,
+        live_matcher=live_matcher,
+        soft_matcher=phrase_matcher(soft),
+    )
 
 
 def _is_official_channel(channel: str) -> bool:
@@ -46,6 +100,7 @@ def score_youtube_result(
     mb_duration_seconds: Optional[int],
     config: Config,
     channel_trust: "Optional[ChannelTrust]" = None,
+    context: Optional[QueryContext] = None,
 ) -> tuple[int, dict[str, int]]:
     """
     Score a single search candidate against the target artist + song.
@@ -59,23 +114,28 @@ def score_youtube_result(
     When supplied, candidates published on channels that previously delivered
     verified downloads for this artist earn a bonus.
 
+    ``context`` is an optional prebuilt :class:`QueryContext`; supply it when
+    scoring many candidates for the same song. It is pure memoisation -- the
+    result is identical either way.
+
     Returns (composite_score, breakdown_dict).
     """
-    entry = dict(result)
+    if context is None:
+        context = build_query_context(artist, song, config)
+
+    entry = result
     raw_title = entry.get("title") or ""
     title: str = normalize_title(raw_title)
     channel: str = (entry.get("channel") or entry.get("uploader") or "").lower()
     view_count: int = int(entry.get("view_count") or 0)
     result_duration: int = int(entry.get("duration") or 0)
     breakdown: dict[str, int] = {}
-    artist_clean = normalize_title(strip_featuring(artist.lower()))
-    song_clean = normalize_title(strip_featuring(song.lower()))
-    forbidden_terms = getattr(config, "FORBIDDEN_TERMS", DEFAULT_FORBIDDEN_TERMS)
-    title_forbidden = find_forbidden_phrases(raw_title, forbidden_terms)
-    query_forbidden = find_forbidden_phrases(f"{artist} {song}", forbidden_terms)
-    live_terms = getattr(config, "LIVE_TERMS", DEFAULT_LIVE_TERMS)
-    title_live = find_forbidden_phrases(raw_title, live_terms)
-    query_live = find_forbidden_phrases(f"{artist} {song}", live_terms)
+    artist_clean = context.artist_clean
+    song_clean = context.song_clean
+    title_forbidden = context.forbidden_matcher.find(raw_title)
+    query_forbidden = context.query_forbidden
+    title_live = context.live_matcher.find(raw_title)
+    query_live = context.query_live
     is_live_version = bool(title_live and not query_live)
     live_descriptor_allowed = is_live_version and title_forbidden.issubset({"version", "extended"})
     if title_forbidden and not query_forbidden and not live_descriptor_allowed:
@@ -211,8 +271,7 @@ def score_youtube_result(
 
     # Remasters are legitimate on official channels and suspicious everywhere
     # else, so the soft penalty is waived when the publisher is trusted.
-    soft_terms = getattr(config, "SOFT_TERMS", DEFAULT_SOFT_TERMS)
-    title_soft = find_forbidden_phrases(raw_title, soft_terms)
+    title_soft = context.soft_matcher.find(raw_title)
     if title_soft and not (trust_bonus or official_channel):
         breakdown["remaster_penalty"] = config.SOFT_TERM_PENALTY
 
@@ -235,6 +294,10 @@ def rank_results(
 
     Only candidates within [min_duration, max_duration] are considered.
 
+    The per-song :class:`QueryContext` is built once here and threaded through
+    every candidate, so the query-side work is done once per song instead of once
+    per candidate.
+
     Returns a list of ``(entry_dict, score, breakdown_dict)`` tuples.
     """
     min_dur = min_duration if min_duration is not None else config.MIN_DURATION_SECONDS
@@ -244,11 +307,18 @@ def rank_results(
     if not valid:
         return []
 
+    context = build_query_context(artist, song, config)
     scored = []
     for raw in valid:
         entry = dict(raw)
         score, breakdown = score_youtube_result(
-            entry, artist, song, mb_duration_seconds, config, channel_trust
+            entry,
+            artist,
+            song,
+            mb_duration_seconds,
+            config,
+            channel_trust,
+            context=context,
         )
         entry["_composite_score"] = score
         entry["_score_breakdown"] = breakdown

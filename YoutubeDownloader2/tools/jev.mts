@@ -19,13 +19,12 @@ async function readStdin(): Promise<string> {
   return input;
 }
 
-async function main(): Promise<void> {
+async function evaluateRequest(request: any): Promise<Record<string, unknown>> {
   const apiKey = process.env.AI_GATEWAY_API_KEY;
   if (!apiKey) {
     throw new Error('AI_GATEWAY_API_KEY is required for Jev');
   }
 
-  const request = JSON.parse(await readStdin());
   const state = request.state;
   const questions = request.questions;
   if (state === undefined || questions === undefined) {
@@ -51,11 +50,61 @@ async function main(): Promise<void> {
   }
 
   const result = await response.json();
-  process.stdout.write(JSON.stringify({ answers: result.answers }));
+  return { answers: result.answers };
+}
+
+// One-shot: read a single request from stdin, write one response to stdout,
+// then exit. Kept for callers that want a fresh process per evaluation.
+async function main(): Promise<void> {
+  const request = JSON.parse(await readStdin());
+  process.stdout.write(JSON.stringify(await evaluateRequest(request)));
+}
+
+// Long-lived mode: newline-delimited JSON in, newline-delimited JSON out.
+//
+// Spawning Node and re-loading the runtime for every song is a fixed cost paid
+// per candidate set, on top of a network round trip that is far larger. Keeping
+// one process for the whole run removes that cost entirely. Requests are still
+// answered strictly in order, one line in to one line out, which is what lets
+// the Python side keep its retries and error handling unchanged.
+//
+// A failing request answers with {"error": ...} and the loop continues: one bad
+// evaluation must not take the bridge -- and every evaluation after it -- down.
+async function serve(): Promise<void> {
+  let buffer = '';
+  process.stdin.setEncoding('utf8');
+
+  for await (const chunk of process.stdin) {
+    buffer += chunk;
+
+    let newline = buffer.indexOf('\n');
+    while (newline !== -1) {
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+
+      if (line.length > 0) {
+        let response: Record<string, unknown>;
+        try {
+          response = await evaluateRequest(JSON.parse(line));
+        } catch (error) {
+          response = {
+            error: error instanceof Error ? error.message : 'Unknown Jev bridge error',
+          };
+        }
+        process.stdout.write(`${JSON.stringify(response)}\n`);
+      }
+
+      newline = buffer.indexOf('\n');
+    }
+  }
 }
 
 try {
-  await main();
+  if (process.argv.includes('--server')) {
+    await serve();
+  } else {
+    await main();
+  }
 } catch (error) {
   const message = error instanceof Error ? error.message : 'Unknown Jev bridge error';
   process.stderr.write(`${message}\n`);

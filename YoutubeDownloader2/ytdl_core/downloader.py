@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import shutil
 import threading
-import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 from uuid import uuid4
@@ -21,6 +20,7 @@ from yt_dlp.utils import DownloadError, ExtractorError
 
 from .config import Config
 from .events import DownloaderEvents
+from .ratelimit import full_jitter_backoff, is_rate_limit_error
 from .state import save_state
 from .utils import migrate_legacy_audio_path, sanitize_filename
 from .ytdlp_options import build_ytdlp_base_opts, make_progress_hook, resolve_downloaded_file
@@ -53,8 +53,22 @@ _FATAL_ERROR_MARKERS = (
 
 
 def is_fatal_download_error(message: str) -> bool:
-    """True when *message* describes a failure that retrying cannot fix."""
-    lowered = (message or "").lower()
+    """True when *message* describes a failure that retrying cannot fix.
+
+    A dead URL is usually a dead *candidate* rather than a transient fault: DRM
+    rips and removed videos fail identically on every attempt. Recognising that
+    lets the caller fall through to the next candidate immediately instead of
+    spending the whole budget on a URL that was never going to work.
+
+    Note what is deliberately absent: rate limiting. A 429 is the opposite of
+    fatal -- it means wait and try again -- so it must never short-circuit the
+    retry loop.
+    """
+    if not message:
+        return False
+    lowered = message.lower()
+    if is_rate_limit_error(lowered):
+        return False
     return any(marker in lowered for marker in _FATAL_ERROR_MARKERS)
 
 
@@ -144,9 +158,18 @@ def execute_download(
             break
 
         if attempt < config.RETRY_ATTEMPTS:
-            wait = config.RETRY_BACKOFF_BASE**attempt
+            # Full jitter. A deterministic backoff re-synchronises every worker
+            # that failed at the same moment, so the retry storm is what keeps a
+            # struggling service down -- the exact thing the backoff was meant
+            # to prevent.
+            wait = full_jitter_backoff(
+                attempt,
+                base=config.RETRY_BACKOFF_BASE,
+                cap=config.RETRY_BACKOFF_CAP,
+            )
             events.on_download_retry(artist, song, attempt, config.RETRY_ATTEMPTS, last_error, wait)
-            time.sleep(wait)
+            if stop_event.wait(wait):
+                break
 
     if downloaded_file is None or not downloaded_file.exists():
         return None, last_error

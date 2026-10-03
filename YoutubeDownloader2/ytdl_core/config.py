@@ -5,6 +5,10 @@ from dataclasses import dataclass, field
 
 DEFAULT_LIVE_TERMS = frozenset({"live", "en vivo", "concert", "concierto", "tour"})
 
+
+def _logical_cpus() -> int:
+    return os.cpu_count() or 4
+
 # Hard rejects: a title containing any of these is never the recording we want.
 # Matching is word-boundary based (see utils.find_forbidden_phrases), so bare
 # "hora" / "version" were removed -- both are ordinary Spanish words that reject
@@ -100,10 +104,15 @@ class Config:
     DEFAULT_QUALITY: str = "192"
     DEFAULT_OUTPUT_DIR: str = "./downloads"
     DEFAULT_MAX_RESULTS: int = 5
-    DEFAULT_WORKERS: int = 1
-    MAX_WORKERS: int = os.cpu_count() or 4
-    DEFAULT_DELAY_MIN: float = 2.0
-    DEFAULT_DELAY_MAX: float = 5.0
+    # The workload is overwhelmingly I/O-bound (yt-dlp extractions, partial
+    # downloads, HTTP metadata calls), so the worker ceiling tracks logical
+    # CPUs with headroom rather than the CPU count itself. A previous value of
+    # ``os.cpu_count()`` capped an I/O-bound pool at the number of cores and
+    # silently throttled a 12-thread machine to 12 in-flight songs.
+    DEFAULT_WORKERS: int = min(8, max(2, _logical_cpus()))
+    MAX_WORKERS: int = max(16, _logical_cpus() * 4)
+    DEFAULT_DELAY_MIN: float = 0.0
+    DEFAULT_DELAY_MAX: float = 0.0
     DEFAULT_FUZZY_THRESHOLD: int = 65
     DEFAULT_SOURCES: list[str] = field(default_factory=lambda: ["youtube", "soundcloud"])
     YOUTUBE_PLAYER_CLIENTS: list[str] = field(
@@ -114,6 +123,91 @@ class Config:
     STATE_FILE: str = ".download_state.json"
     RETRY_ATTEMPTS: int = 3
     RETRY_BACKOFF_BASE: float = 2.0
+    RETRY_BACKOFF_CAP: float = 30.0
+
+    # --- Remote service budgets ---------------------------------------------
+    # These are per-process ceilings published by the services themselves. They
+    # are enforced by token buckets that block only when the caller would
+    # actually exceed the budget, replacing the unconditional sleeps that used
+    # to run once per song regardless of how much of the budget was left.
+    ACOUSTID_RATE_PER_SECOND: float = 3.0
+    # Burst of 1 keeps the "no more than 3 requests per second" rule true even
+    # when measured over a sub-second window.
+    ACOUSTID_BURST: float = 1.0
+    MUSICBRAINZ_RATE_PER_SECOND: float = 1.0
+    MUSICBRAINZ_BURST: float = 1.0
+    ITUNES_RATE_PER_SECOND: float = 5.0
+    ITUNES_BURST: float = 5.0
+    YOUTUBE_RATE_PER_SECOND: float = 8.0
+    YOUTUBE_BURST: float = 8.0
+
+    # --- Stage concurrency ---------------------------------------------------
+    # Each pipeline stage is sized against the resource it actually contends
+    # for. Search, download and metadata are network-bound and want more threads
+    # than cores; the post-download checks decode audio and want about one
+    # worker per core; the decision model is latency-bound and needs few.
+    PIPELINE_ENABLED: bool = True
+    PIPELINE_QUEUE_DEPTH: int = 64
+    SEARCH_WORKERS: int = 0  # 0 = auto
+    VERIFY_WORKERS: int = 0
+    DOWNLOAD_WORKERS: int = 0
+    POST_WORKERS: int = 0
+    DECIDE_WORKERS: int = 0
+    # Concurrency for the 90-second partial downloads. Sized so that
+    # FP_CONCURRENCY / partial_latency comfortably exceeds ACOUSTID_RATE_PER_SECOND:
+    # otherwise the AcoustID budget is the ceiling and the semaphore is what
+    # actually throttles the run.
+    FP_CONCURRENCY: int = 8
+    # How many alternate candidates to fingerprint speculatively, in parallel,
+    # when the winner does not match. Serialised this was N round trips.
+    FP_ALTERNATE_FANOUT: int = 3
+
+    # --- Decision model ------------------------------------------------------
+    # A decision server is a shared single-device resource, so these bound how
+    # hard it is leaned on. One in-flight request is the safe default: it makes a
+    # slow server predictable instead of collapsing under a queue. Raise it only
+    # if the server batches concurrent requests, where several at once finish
+    # sooner in total rather than merely queueing.
+    DECISION_MAX_IN_FLIGHT: int = 1
+    DECISION_TIMEOUT_SECONDS: int = 60
+    # Consecutive failures after which the provider is abandoned for the run.
+    # Low on purpose: the heuristic is a complete ranker, so the model is a
+    # second opinion, and there is no reason to keep paying for one.
+    DECISION_FAILURE_THRESHOLD: int = 2
+    # Give up quickly at startup if the model cannot answer promptly, instead of
+    # discovering it one timeout per song.
+    DECISION_PROBE_BUDGET_SECONDS: float = 20.0
+
+    # --- Search fan-out and cache -------------------------------------------
+    SEARCH_VARIANT_FANOUT: int = 3
+    SEARCH_CACHE_TTL: float = 7 * 24 * 3600.0
+    SEARCH_CACHE_NEGATIVE_TTL: float = 6 * 3600.0
+    CATALOG_CACHE_TTL: float = 30 * 24 * 3600.0
+    COVER_CACHE_TTL: float = 30 * 24 * 3600.0
+    FINGERPRINT_CACHE_TTL: float = 30 * 24 * 3600.0
+    CACHE_ENABLED: bool = True
+
+    # --- yt-dlp request shaping ---------------------------------------------
+    # yt-dlp already sleeps between extraction requests, with jitter, and only
+    # when it needs to. Letting it do that is strictly better than a fixed
+    # per-song sleep, and it applies per request rather than per song.
+    SLEEP_INTERVAL_REQUESTS: float = 0.0
+    MAX_SLEEP_INTERVAL: float = 5.0
+    # Two retry layers used to stack: yt-dlp's internal 10 and the app's 3, for
+    # up to 30 attempts on one URL. The app loop now owns retries, so yt-dlp's
+    # internal count is kept short and its sleeps bounded and jittered.
+    YTDLP_SCAN_RETRIES: int = 2
+    YTDLP_DOWNLOAD_RETRIES: int = 4
+    YTDLP_RETRY_SLEEP: str = "http:exp=1:8"
+    SOCKET_TIMEOUT: int = 30
+
+    # --- State persistence ---------------------------------------------------
+    # The state file was rewritten in full, with an fsync, on every persist --
+    # including every failure path -- while holding the lock that all other
+    # workers need in order to make progress. Writes are now coalesced onto a
+    # single background writer.
+    STATE_FLUSH_INTERVAL: float = 1.0
+    STATE_FLUSH_BATCH: int = 25
 
     PARTIAL_DOWNLOAD_SECONDS: int = 90
     FINGERPRINT_MIN_CONFIDENCE: float = 0.60
@@ -143,7 +237,15 @@ class Config:
     # How many candidates go to the model per song. Search returns far more than
     # this, and every extra candidate multiplies the request size across all
     # dimensions; the ones past the cap cannot change which candidate wins.
-    DECISION_MAX_CANDIDATES: int = 12
+    DECISION_MAX_CANDIDATES: int = 4
+    # The real budget. Cost is the *question count*, which grows as
+    # candidates x dimensions, so bounding candidates alone does not actually
+    # bound anything: at 12 candidates plus 4 of headroom this reached 97
+    # questions per song, and at --kev-runs 2 that is 194 generations before a
+    # single download starts. Trimming to a question budget keeps the cost
+    # predictable no matter how the dimension list grows later.
+    DECISION_MAX_QUESTIONS: int = 32
+    DECISION_HEADROOM: int = 1
     # Candidates whose per-dimension answers moved more than this across runs are
     # unstable, and are surfaced for review instead of downloaded silently.
     DECISION_REVIEW_MARGIN: float = 0.10

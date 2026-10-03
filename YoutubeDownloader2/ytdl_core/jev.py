@@ -3,15 +3,200 @@ from __future__ import annotations
 import json
 import math
 import subprocess
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from . import decision_questions as dq
+from .ratelimit import CircuitBreaker, full_jitter_backoff
 
 
 class JevEvaluationError(RuntimeError):
     pass
+
+
+class DecisionGate:
+    """Admission control and circuit breaking for a decision-model server.
+
+    A decision model is a *shared, single-device* resource. Every song in the
+    batch needs one, so without a gate N pipeline workers each post a full
+    candidate set at once and queue behind each other on one GPU. Two things then
+    go wrong, and both are silent:
+
+    * requests time out while merely waiting their turn, so songs fall back to
+      the heuristic for reasons that have nothing to do with the judgment;
+    * each timeout is retried, so the provider costs a multiple of its own
+      latency per song -- and with a thousand songs that is hours of waiting for
+      a verdict that was never going to arrive.
+
+    So: admit a bounded number of requests at once, and once the provider has
+    failed repeatedly, stop asking for the rest of the run and say so once. A
+    provider that is down should cost one report, not a timeout per song.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_in_flight: int = 1,
+        failure_threshold: int = 3,
+        cooldown_seconds: float = 120.0,
+    ) -> None:
+        self.max_in_flight = max(1, int(max_in_flight))
+        self.failure_threshold = max(1, int(failure_threshold))
+        self._semaphore = threading.BoundedSemaphore(self.max_in_flight)
+        self._breaker = CircuitBreaker(
+            cooldown_seconds=cooldown_seconds, max_cooldown_seconds=1800.0
+        )
+        self._lock = threading.Lock()
+        self._consecutive_failures = 0
+        self._reported = False
+        self.successes = 0
+        self.failures = 0
+
+    def admit(self) -> bool:
+        """Take an admission slot, or return False if the provider is down."""
+        if not self._breaker.allow():
+            return False
+        self._semaphore.acquire()
+        # The breaker may have opened while we waited for a slot.
+        if not self._breaker.allow():
+            self._semaphore.release()
+            return False
+        return True
+
+    def release(self) -> None:
+        self._semaphore.release()
+
+    def record_success(self) -> None:
+        with self._lock:
+            self.successes += 1
+            self._consecutive_failures = 0
+        self._breaker.record_success()
+
+    def record_failure(self) -> bool:
+        """Record a failure. True the first time the provider is given up on."""
+        newly_tripped = False
+        with self._lock:
+            self.failures += 1
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self.failure_threshold:
+                newly_tripped = True
+        if newly_tripped:
+            self._breaker.trip()
+        return newly_tripped
+
+    def give_up_notice(self) -> Optional[str]:
+        """Why the provider was abandoned, or None while it still looks healthy."""
+        with self._lock:
+            if not self._reported and self._consecutive_failures >= self.failure_threshold:
+                self._reported = True
+                return (
+                    f"{self._consecutive_failures} consecutive decision-model failures; "
+                    "skipping it for the rest of this run and using the heuristic "
+                    "ranking. The selection quality is unaffected -- the model is a "
+                    "second opinion, not the primary ranker."
+                )
+            return None
+
+
+class PersistentBridge:
+    """A long-lived ``node tools/jev.mts --server`` process.
+
+    The one-shot form spawns Node and re-loads the runtime for every song. That
+    is a fixed cost per candidate set, paid on top of a network round trip that
+    dominates it anyway -- pure overhead repeated once per song. Keeping one
+    process alive for the run removes it.
+
+    Every failure mode degrades to the one-shot path rather than raising: a
+    bridge that will not start, dies mid-run, or answers something unusable is
+    not a reason to fail the song.
+    """
+
+    def __init__(self, script: Path, project_root: Path, node_command: str) -> None:
+        self.script = script
+        self.project_root = project_root
+        self.node_command = node_command
+        self._process: Optional[subprocess.Popen[str]] = None
+        self._lock = threading.Lock()
+        self._disabled = False
+
+    @property
+    def enabled(self) -> bool:
+        return not self._disabled
+
+    def _ensure_process(self) -> Optional[subprocess.Popen[str]]:
+        if self._disabled:
+            return None
+        process = self._process
+        if process is not None and process.poll() is None:
+            return process
+        if process is not None:
+            # Died between calls; fall back rather than respawn-storming.
+            self._disabled = True
+            return None
+        try:
+            self._process = subprocess.Popen(
+                [self.node_command, str(self.script), "--server"],
+                cwd=self.project_root,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except OSError:
+            self._disabled = True
+            return None
+        return self._process
+
+    def request(self, payload: dict[str, Any], timeout: float) -> Optional[dict[str, Any]]:
+        """Send one request and read one response. None means "fall back"."""
+        with self._lock:
+            process = self._ensure_process()
+            if process is None or process.stdin is None or process.stdout is None:
+                return None
+            try:
+                process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                process.stdin.flush()
+                line = process.stdout.readline()
+            except (OSError, ValueError):
+                self._shutdown()
+                return None
+        if not line:
+            self._shutdown()
+            return None
+        try:
+            response = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(response, dict) or "error" in response:
+            return None
+        return response
+
+    def _shutdown(self) -> None:
+        process = self._process
+        self._process = None
+        self._disabled = True
+        if process is None:
+            return
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+            process.terminate()
+            process.wait(timeout=5)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        with self._lock:
+            self._disabled = False
+            self._shutdown()
 
 
 class JevClassifier:
@@ -33,6 +218,9 @@ class JevClassifier:
         stable_spread: float = dq.STABLE_SPREAD,
         max_candidates: int = dq.MAX_EVALUATED_CANDIDATES,
         eval_headroom: int = dq.EVALUATION_HEADROOM,
+        max_in_flight: int = 1,
+        failure_threshold: int = 2,
+        max_questions: int = 32,
     ) -> None:
         package_root = Path(__file__).resolve().parent
         source_root = package_root.parent
@@ -47,10 +235,37 @@ class JevClassifier:
         self.stable_spread = stable_spread
         self.max_candidates = max_candidates
         self.eval_headroom = eval_headroom
+        self.max_questions = max(1, int(max_questions))
         # The hosted Jev bridge goes through Vercel AI Gateway, which spells the
         # yes/no primitive `boolean` and answers under `probability`. The native
         # TypeSafe endpoint spells it `noul`. The judgments are identical.
         self.dialect = dq.GATEWAY_DIALECT
+        self.bridge = PersistentBridge(
+            self.project_root / "tools" / "jev.mts", self.project_root, node_command
+        )
+        # A decision server is a shared single-device resource; admission and
+        # give-up live on the provider so they can be tuned per provider.
+        self.gate = DecisionGate(
+            max_in_flight=max_in_flight, failure_threshold=failure_threshold
+        )
+
+    @staticmethod
+    def _question_count(candidate_count: int) -> int:
+        """How many questions a candidate count costs: one per dimension, plus the choice."""
+        return max(0, candidate_count) * len(dq.DIMENSIONS) + 1
+
+    def _trim_to_question_budget(
+        self, candidates: list[dict], keep: list[int]
+    ) -> list[int]:
+        """Drop the lowest-scoring candidates until the request fits the budget."""
+        budget = max(1, int(self.max_questions))
+        if self._question_count(len(keep)) <= budget or not keep:
+            return keep
+
+        # keep is already ordered best-first by select_for_evaluation, so the
+        # tail is exactly the candidates worth giving up.
+        affordable = max(1, (budget - 1) // max(1, len(dq.DIMENSIONS)))
+        return keep[:affordable]
 
     def select(
         self,
@@ -70,6 +285,15 @@ class JevClassifier:
         # overrule a correct "instrumental" rejection. Everything the model does
         # not see keeps its heuristic score in the report below.
         keep = dq.select_for_evaluation(candidates, self.max_candidates, self.eval_headroom)
+
+        # Then bound the actual cost. Questions scale as candidates x dimensions,
+        # so a candidate cap is only a proxy: at 12 candidates plus headroom this
+        # reached 97 questions for one song, which is minutes of generation
+        # before any download starts -- and multiplied again by ``runs``.
+        # Trimming to a question budget keeps latency predictable regardless of
+        # how the dimension list evolves, and drops the *worst-scoring*
+        # candidates, which are the ones least likely to win.
+        keep = self._trim_to_question_budget(candidates, keep)
         evaluated_candidates = [candidates[index] for index in keep]
         skipped = [candidates[index] for index in range(len(candidates)) if index not in set(keep)]
 
@@ -287,6 +511,17 @@ class JevClassifier:
         if model:
             request["model"] = model
 
+        # Prefer the long-lived bridge: it amortises Node's start-up across the
+        # whole run. Anything it cannot answer falls through to a fresh process,
+        # which is the behaviour that has always worked.
+        bridged = self.bridge.request(request, self.timeout_seconds)
+        if bridged is not None:
+            answers = bridged.get("answers")
+            if isinstance(answers, dict):
+                return answers
+        elif not self.bridge.enabled:
+            pass  # bridge retired; one-shot is now the only path
+
         for attempt in range(3):
             try:
                 completed = subprocess.run(
@@ -304,7 +539,7 @@ class JevClassifier:
                 raise JevEvaluationError("Node.js is required for --jev") from exc
             except subprocess.TimeoutExpired:
                 if attempt < 2:
-                    time.sleep(0.5 * (attempt + 1))
+                    time.sleep(full_jitter_backoff(attempt + 1, base=0.5, cap=5.0))
                     continue
                 raise JevEvaluationError("Jev evaluation timed out after 3 attempts")
 
@@ -313,7 +548,7 @@ class JevClassifier:
 
             stderr = completed.stderr
             if self._is_retryable_error(stderr) and attempt < 2:
-                time.sleep(0.5 * (attempt + 1))
+                time.sleep(full_jitter_backoff(attempt + 1, base=0.5, cap=5.0))
                 continue
             raise JevEvaluationError(self._bridge_error(stderr))
 

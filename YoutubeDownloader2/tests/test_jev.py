@@ -449,7 +449,10 @@ def test_hard_rejected_candidates_stay_in_the_report(monkeypatch):
 
 def test_candidate_cap_keeps_the_top_ones_plus_headroom(monkeypatch):
     classifier = JevClassifier(
-        threshold=0.50, max_candidates=3, eval_headroom=dq.EVALUATION_HEADROOM
+        threshold=0.50,
+        max_candidates=3,
+        eval_headroom=dq.EVALUATION_HEADROOM,
+        max_questions=10_000,  # isolate the candidate cap from the question budget
     )
     seen: list[dict] = []
 
@@ -471,6 +474,42 @@ def test_candidate_cap_keeps_the_top_ones_plus_headroom(monkeypatch):
     # Everything the model never saw is still reported, so nothing disappears.
     assert len(ranked) == 10
     assert selected["title"] == "Artist - Song 0"
+
+
+def test_question_budget_caps_the_request(monkeypatch):
+    """Cost is questions, not candidates, so the budget is what must hold.
+
+    At 12 candidates plus 4 of headroom this reached 97 questions for a single
+    song -- minutes of generation before any download begins, multiplied again
+    by --kev-runs. The budget is what actually keeps latency predictable.
+    """
+    seen: list[dict] = []
+    budget = 32
+    classifier = JevClassifier(threshold=0.50, max_candidates=12, max_questions=budget)
+
+    def fake_evaluate(state, questions, model=None):
+        seen.append(questions)
+        keys = sorted({key.split("::")[0] for key in questions})
+        return _answers(keys)
+
+    monkeypatch.setattr(classifier, "_evaluate", fake_evaluate)
+    candidates = [_candidate(f"Artist - Song {i}", 200 - i) for i in range(40)]
+
+    selected, ranked = classifier.select("Artist", "Song", candidates)
+
+    assert len(seen[0]) <= budget, "the question budget must actually bound the request"
+    # Trimming drops the worst-scoring candidates, which are least likely to win.
+    assert selected["title"] == "Artist - Song 0"
+    # Nothing disappears from the report, even what the model never saw.
+    assert len(ranked) == 40
+
+
+def test_question_budget_is_multiplied_by_runs_in_practice(monkeypatch):
+    """The cost that matters is questions x runs; the budget bounds one request."""
+    dimension_count = len(dq.DIMENSIONS)
+    affordable = (32 - 1) // dimension_count
+    assert JevClassifier._question_count(affordable) <= 32
+    assert JevClassifier._question_count(affordable + 1) > 32
 
 
 def test_headroom_can_be_switched_off():

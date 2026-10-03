@@ -11,6 +11,7 @@ import re
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -18,59 +19,122 @@ import acoustid
 import mutagen
 from rapidfuzz import fuzz
 
+from .cache import caches
 from .config import Config
+from .ratelimit import CircuitBreaker, full_jitter_backoff, is_rate_limit_error, limiters
 
-# AcoustID free-tier API limit: 3 requests/second. A single shared limiter
-# (lock + last-request timestamp) throttles ALL workers so parallel batches
-# never burst past the limit.
-ACOUSTID_RATE_PER_SECOND: float = 3.0
-_acoustid_lock = threading.Lock()
-_acoustid_last_request = 0.0
-
-
-def _wait_for_acoustid_slot() -> None:
-    """Block until the global AcoustID request budget allows another call."""
-    global _acoustid_last_request
-    min_interval = 1.0 / ACOUSTID_RATE_PER_SECOND
-    with _acoustid_lock:
-        now = time.time()
-        wait = min_interval - (now - _acoustid_last_request)
-        if wait > 0:
-            time.sleep(wait)
-            now = time.time()
-        _acoustid_last_request = now
+# AcoustID's free tier allows three requests per second, process-wide. pyacoustid
+# ships its own limiter for the same rule; two limiters on one budget means two
+# locks, two queues and no clearer picture of what is actually being spent, so we
+# disable the library's and own the budget explicitly. That also lets us pace the
+# API call alone instead of the whole fingerprint block.
+try:  # pragma: no cover - depends on the installed pyacoustid version
+    acoustid.REQUEST_INTERVAL = 0
+except Exception:  # pragma: no cover
+    pass
 
 
-class AcoustIDCircuitBreaker:
-    """
-    Thread-safe circuit breaker for the AcoustID API.
+def acoustid_bucket(config: Optional[Config] = None):
+    """The process-wide AcoustID request bucket."""
+    cfg = config or Config()
+    return limiters.bucket(
+        "acoustid",
+        cfg.ACOUSTID_RATE_PER_SECOND,
+        burst=cfg.ACOUSTID_BURST,
+    )
 
-    When too many rate-limit errors accumulate, the breaker opens and
-    suspends all fingerprinting for a configurable cooldown period.
+
+class AcoustIDCircuitBreaker(CircuitBreaker):
+    """Circuit breaker for the AcoustID API.
+
+    Repeated throttling widens the cooldown instead of re-serving a fixed one, and
+    the first request after a cooldown is admitted alone as a probe, so a
+    recovered service is not immediately buried again by every queued worker.
     """
 
     def __init__(self, cooldown_seconds: float = 60.0) -> None:
-        self._open = False
-        self._cooldown_until = 0.0
+        super().__init__(cooldown_seconds=cooldown_seconds, max_cooldown_seconds=900.0)
+
+
+@dataclass(frozen=True)
+class FingerprintVerdict:
+    """The outcome of one AcoustID lookup."""
+
+    verified: bool
+    confidence: float
+    matched_title: Optional[str]
+
+    def as_tuple(self) -> tuple[bool, float, Optional[str]]:
+        return self.verified, self.confidence, self.matched_title
+
+
+class FingerprintCache:
+    """Remembers the verdict for a (url, artist, song) triple.
+
+    The same upload turns up as a candidate for several songs of an artist, and
+    the same song is re-checked on every ``--retry``. Each of those checks costs
+    one of three requests per second, so a remembered verdict is budget the run
+    does not have to spend. Keyed by URL *and* by what we are looking for: the
+    same file verified as one song says nothing about another.
+    """
+
+    def __init__(self, config: Optional[Config] = None, enabled: Optional[bool] = None) -> None:
+        cfg = config or Config()
+        self._cache = caches.get("fingerprint")
+        if enabled is not None:
+            self._cache.enabled = bool(enabled) and cfg.CACHE_ENABLED
+        self._ttl = cfg.FINGERPRINT_CACHE_TTL
         self._lock = threading.Lock()
-        self._cooldown_duration = cooldown_seconds
+        self._in_flight: dict[str, threading.Event] = {}
 
-    @property
-    def is_open(self) -> bool:
-        with self._lock:
-            if self._open:
-                if time.time() < self._cooldown_until:
-                    return True
-                # Cooldown expired — close the breaker
-                self._open = False
+    @staticmethod
+    def _key(url: str, artist: str, song: str) -> str:
+        return caches.get("fingerprint").make_key(url, artist.lower(), song.lower())
+
+    def get(self, url: str, artist: str, song: str) -> Optional[FingerprintVerdict]:
+        if not self._cache.enabled or not url:
+            return None
+        payload = self._cache.get_json(self._key(url, artist, song))
+        if not isinstance(payload, (list, tuple)) or len(payload) != 3:
+            return None
+        verified, confidence, title = payload
+        return FingerprintVerdict(bool(verified), float(confidence), title)
+
+    def put(self, url: str, artist: str, song: str, verdict: FingerprintVerdict) -> None:
+        if not self._cache.enabled or not url:
+            return
+        self._cache.put_json(
+            self._key(url, artist, song),
+            [verdict.verified, verdict.confidence, verdict.matched_title],
+            self._ttl,
+        )
+
+    def coalesce(self, url: str, artist: str, song: str, timeout: float = 120.0) -> bool:
+        """Wait for another worker already checking this exact triple.
+
+        Returns True when the caller should skip its own check and re-read the
+        cache. Without this, N workers holding the same candidate each spend a
+        request to learn the same answer.
+        """
+        if not self._cache.enabled or not url:
             return False
-
-    def trip(self) -> None:
-        """Open the circuit breaker."""
+        key = self._key(url, artist, song)
         with self._lock:
-            if not self._open:
-                self._open = True
-                self._cooldown_until = time.time() + self._cooldown_duration
+            event = self._in_flight.get(key)
+            if event is None:
+                self._in_flight[key] = event = threading.Event()
+                return False
+        event.wait(timeout)
+        return True
+
+
+def release_fingerprint_slot(cache: FingerprintCache, url: str, artist: str, song: str) -> None:
+    """Signal waiters that a coalesced fingerprint check has finished."""
+    key = cache._key(url, artist, song)  # noqa: SLF001 - same module family
+    with cache._lock:  # noqa: SLF001
+        event = cache._in_flight.pop(key, None)
+    if event is not None:
+        event.set()
 
 
 def _artist_stem(name: str) -> str:
@@ -81,6 +145,49 @@ def _artist_stem(name: str) -> str:
     if not name:
         return ""
     return re.split(r"\s+(?:feat\.?|ft\.?|featuring|con)\s+", name, flags=re.IGNORECASE)[0].strip()
+
+
+def _interruptible_sleep(seconds: float, circuit_breaker: AcoustIDCircuitBreaker) -> None:
+    """Sleep in short slices, giving up as soon as the breaker opens.
+
+    Waiting out a full backoff while the circuit is already open is time the run
+    cannot get back.
+    """
+    remaining = max(0.0, float(seconds))
+    while remaining > 0:
+        if circuit_breaker.is_open:
+            return
+        slice_seconds = min(0.25, remaining)
+        time.sleep(slice_seconds)
+        remaining -= slice_seconds
+
+
+def _score_matches(results, artist: str, song: str, config: Config, on_info) -> tuple[bool, float, str]:
+    """Pick the best AcoustID result for the requested artist and song."""
+    best_conf = 0.0
+    best_title = ""
+    for score, _rec_id, title, a in results:
+        if score < config.FINGERPRINT_MIN_CONFIDENCE:
+            continue
+        a_sim = fuzz.token_sort_ratio(_artist_stem(artist).lower(), _artist_stem(a).lower())
+        t_sim = fuzz.token_sort_ratio(song.lower(), (title or "").lower())
+        if a_sim > 75 and t_sim > 75:
+            if on_info:
+                on_info(
+                    f"[green]Fingerprint match: '{a} - {title}' "
+                    f"with confidence {score:.2f} "
+                    f"(artist sim: {a_sim}, title sim: {t_sim})[/green]"
+                )
+            return True, score, title or ""
+        if score > best_conf:
+            best_conf = score
+            best_title = f"{a} -- {title}"
+            if on_info:
+                on_info(
+                    f"[yellow]Best match found: {best_title} "
+                    f"(confidence: {best_conf:.2f})[/yellow]"
+                )
+    return False, best_conf, best_title
 
 
 def verify_fingerprint(
@@ -104,73 +211,58 @@ def verify_fingerprint(
     if not acoustid_key:
         return False, 0.0, "no_key"
 
-    if circuit_breaker.is_open:
+    if not circuit_breaker.allow():
         return False, 0.0, "circuit_breaker_open"
 
+    bucket = acoustid_bucket(config)
     max_retries = 3
-    base_delay = 2.0
 
     for attempt in range(max_retries):
         try:
-            # Global throttle: never exceed the AcoustID free-tier request rate,
-            # regardless of how many workers are running in parallel.
-            _wait_for_acoustid_slot()
+            # Paces the API call itself -- the fpcalc/partial work around it runs
+            # at full speed instead of waiting behind the rate limit.
+            bucket.acquire()
 
             results = list(acoustid.match(acoustid_key, str(partial_path), meta="recordings"))
-            best_conf = 0.0
-            best_title = ""
-
-            for score, _rec_id, title, a in results:
-                if score < config.FINGERPRINT_MIN_CONFIDENCE:
-                    continue
-                a_sim = fuzz.token_sort_ratio(_artist_stem(artist).lower(), _artist_stem(a).lower())
-                t_sim = fuzz.token_sort_ratio(song.lower(), (title or "").lower())
-                if a_sim > 75 and t_sim > 75:
-                    if on_info:
-                        on_info(
-                            f"[green]Fingerprint match: '{a} - {title}' "
-                            f"with confidence {score:.2f} "
-                            f"(artist sim: {a_sim}, title sim: {t_sim})[/green]"
-                        )
-                    return True, score, title or ""
-                if score > best_conf:
-                    best_conf = score
-                    best_title = f"{a} -- {title}"
-                    if on_info:
-                        on_info(
-                            f"[yellow]Best match found: {best_title} "
-                            f"(confidence: {best_conf:.2f})[/yellow]"
-                        )
-            return False, best_conf, best_title
+            circuit_breaker.record_success()
+            return _score_matches(results, artist, song, config, on_info)
 
         except Exception as exc:
-            err_str = str(exc).lower()
-
-            if "error" in err_str or "rate limit" in err_str or "429" in err_str:
+            message = str(exc)
+            if is_rate_limit_error(message) or "error" in message.lower():
+                # The service told us to slow down. Spend the budget for the
+                # window it asked for up front so the other in-flight requests
+                # do not immediately retry in lockstep behind this one.
+                bucket.penalty(config.RETRY_BACKOFF_BASE)
                 if attempt < max_retries - 1:
-                    sleep_time = base_delay * (2**attempt)
+                    sleep_time = full_jitter_backoff(
+                        attempt + 1,
+                        base=config.RETRY_BACKOFF_BASE,
+                        cap=config.RETRY_BACKOFF_CAP,
+                    )
                     if on_warn:
                         on_warn(
                             f"[yellow]AcoustID rate limit hit. "
-                            f"Local retry in {sleep_time}s...[/yellow]"
+                            f"Local retry in {sleep_time:.1f}s...[/yellow]"
                         )
-                    time.sleep(sleep_time)
+                    _interruptible_sleep(sleep_time, circuit_breaker)
                     continue
-                else:
-                    circuit_breaker.trip()
-                    if on_warn:
-                        on_warn(
-                            f"[red]CRITICAL: AcoustID API blocked. "
-                            f"Circuit Breaker OPEN. "
-                            f"Suspending all fingerprinting for "
-                            f"{int(circuit_breaker._cooldown_duration)} seconds.[/red]"
-                        )
-                    return False, 0.0, "rate_limit_exceeded"
+                circuit_breaker.trip()
+                if on_warn:
+                    on_warn(
+                        f"[red]CRITICAL: AcoustID API blocked. "
+                        f"Circuit Breaker OPEN. "
+                        f"Suspending all fingerprinting for "
+                        f"{int(circuit_breaker.cooldown_remaining())} seconds.[/red]"
+                    )
+                return False, 0.0, "rate_limit_exceeded"
 
             if on_fingerprint_error:
                 on_fingerprint_error(artist, song, str(exc))
+            circuit_breaker.release_probe()
             return False, 0.0, "fingerprint_error"
 
+    circuit_breaker.release_probe()
     return False, 0.0, "max_retries_exceeded"
 
 
@@ -191,6 +283,11 @@ def has_excessive_silence(file_path: Path, config: Config) -> tuple[bool, float]
             "-v",
             "info",
             "-nostdin",
+            # Decode single-threaded. This runs in the CPU-bound stage alongside
+            # yt-dlp's own transcodes, and letting every silencedetect grab
+            # every core is what makes both of them slow.
+            "-threads",
+            "1",
             "-i",
             str(file_path),
             "-af",

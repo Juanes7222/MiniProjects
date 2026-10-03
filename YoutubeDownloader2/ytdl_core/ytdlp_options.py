@@ -11,7 +11,10 @@ import shutil
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from .config import Config
 from .events import DownloaderEvents
+
+DEFAULT_CONFIG = Config()
 
 
 def normalize_browser_cookies(value: Any) -> tuple[Any, ...]:
@@ -19,6 +22,57 @@ def normalize_browser_cookies(value: Any) -> tuple[Any, ...]:
     if isinstance(value, tuple):
         return value
     return (value,)
+
+
+def _retry_counts(for_scan: bool, config: Optional[Config] = None) -> dict[str, int]:
+    """How many internal retries yt-dlp should make on its own.
+
+    Two retry layers used to stack: yt-dlp's internal ten, wrapped by the
+    application's three, for as many as thirty attempts against a single URL --
+    with yt-dlp sleeping between each. The application loop can see the error
+    text and knows whether a candidate is even worth retrying (a dead URL is
+    usually a dead *candidate*), so it owns retries now and yt-dlp is left with
+    enough attempts to ride out a transient blip.
+
+    A scan pass downloads nothing, so it gets the shorter budget: there is no
+    partial file to protect and no reason to keep hammering.
+    """
+    cfg = config or DEFAULT_CONFIG
+    attempts = cfg.YTDLP_SCAN_RETRIES if for_scan else cfg.YTDLP_DOWNLOAD_RETRIES
+    return {
+        "retries": attempts,
+        "fragment_retries": attempts,
+        "extractor_retries": attempts,
+        "file_access_retries": min(attempts, 3),
+    }
+
+
+def apply_request_shaping(
+    ydl_opts: dict[str, Any],
+    config: Optional[Config] = None,
+    *,
+    for_scan: bool = False,
+) -> dict[str, Any]:
+    """Apply shared retry and politeness settings to a yt-dlp options dict.
+
+    ``sleep_interval_requests`` lets yt-dlp pace itself between extraction
+    requests, with jitter, and only when it needs to. That is strictly better
+    than the unconditional per-song sleep it replaces: that sleep fired even
+    when the budget was not exhausted, and it paced songs rather than requests,
+    so one song firing five extractions multiplied the load fivefold.
+    """
+    cfg = config or DEFAULT_CONFIG
+    ydl_opts.update(_retry_counts(for_scan, cfg))
+    ydl_opts["socket_timeout"] = cfg.SOCKET_TIMEOUT
+    if cfg.YTDLP_RETRY_SLEEP:
+        # Bounded and exponential: an unbounded internal sleep is how a single
+        # bad URL ends up holding a worker for minutes.
+        ydl_opts["retry_sleep"] = cfg.YTDLP_RETRY_SLEEP
+    if cfg.SLEEP_INTERVAL_REQUESTS > 0:
+        ydl_opts["sleep_interval_requests"] = cfg.SLEEP_INTERVAL_REQUESTS
+    if cfg.MAX_SLEEP_INTERVAL > 0:
+        ydl_opts["max_sleep_interval"] = cfg.MAX_SLEEP_INTERVAL
+    return ydl_opts
 
 
 def build_ytdlp_base_opts(
@@ -40,6 +94,7 @@ def build_ytdlp_base_opts(
     for_scan: bool = False,
     output_template: str | Path | None = None,
     embed_thumbnail: bool = True,
+    config: Config | None = None,
 ) -> dict[str, Any]:
     """
     Build the base yt-dlp options dictionary used by both scan and download passes.
@@ -96,14 +151,10 @@ def build_ytdlp_base_opts(
         "extract_flat": False,
         "ignoreerrors": for_scan,
         "skip_unavailable_fragments": True,
-        "socket_timeout": 30,
-        "retries": 10,
-        "fragment_retries": 10,
-        "extractor_retries": 10,
-        "file_access_retries": 5,
         "windowsfilenames": True,
         "noplaylist": noplaylist,
     }
+    apply_request_shaping(ydl_opts, config, for_scan=for_scan)
 
     if not for_scan:
         if embed_thumbnail:

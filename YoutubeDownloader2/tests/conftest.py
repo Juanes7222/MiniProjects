@@ -4,8 +4,32 @@ from __future__ import annotations
 
 import pytest
 
+from ytdl_core.cache import caches
 from ytdl_core.config import Config
 from ytdl_core.events import DownloaderEvents
+from ytdl_core.ratelimit import limiters
+
+
+@pytest.fixture(autouse=True)
+def _isolated_caches():
+    """Never let a developer's on-disk cache change what a test observes.
+
+    The candidate, catalogue and cover caches persist across runs by design. A
+    test that happens to run after a real download would otherwise read a warm
+    entry, short-circuit the very code it means to exercise, and pass or fail
+    depending on what the user last downloaded.
+    """
+    caches.disable()
+    yield
+    caches.enable()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_rate_limits():
+    """Reset service budgets between tests so pacing does not leak across them."""
+    limiters.clear()
+    yield
+    limiters.clear()
 
 
 class SpyEvents(DownloaderEvents):

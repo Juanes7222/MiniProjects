@@ -8,13 +8,16 @@ to the DownloaderEvents instance supplied at construction time.
 from __future__ import annotations
 
 import concurrent.futures
+import os
 import re
 from collections import Counter
+from dataclasses import dataclass, field
 import shutil
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import yt_dlp
 from rapidfuzz import fuzz
@@ -23,15 +26,23 @@ from .channels import ChannelTrust, channel_url_for
 from .config import Config
 from .downloader import download_partial, execute_download
 from .events import DownloaderEvents
-from .fingerprint import AcoustIDCircuitBreaker, verify_fingerprint
+from .fingerprint import (
+    AcoustIDCircuitBreaker,
+    FingerprintCache,
+    FingerprintVerdict,
+    release_fingerprint_slot,
+    verify_fingerprint,
+)
 from .jev import JevClassifier, JevEvaluationError
 from .kev import KevClassifier
-from .metadata import fetch_itunes_reference, fetch_musicbrainz
+from .metadata import CatalogContext, fetch_itunes_reference, fetch_musicbrainz
+from .pipeline import StagePipeline
 from .post_checks import check_duration, check_silence, embed_and_verify
 from .reports import export_report, update_json_file
 from .result import DownloadResult
 from .search import search_all_sources, select_best_result
 from .state import load_state, merge_state_detail, save_state, state_detail
+from .statewriter import CoalescingStateWriter
 from .utils import (
     apply_delay,
     compute_md5,
@@ -42,6 +53,54 @@ from .utils import (
 )
 from .verifier import verify_library as _verify_library
 from .ytdlp_options import build_ytdlp_base_opts, make_progress_hook, resolve_downloaded_file
+
+
+def _resolve_stage_workers(configured: int, fallback: int) -> int:
+    """Auto-size a pipeline stage when the config leaves it at 0."""
+    return max(1, int(configured) if configured else fallback)
+
+
+@dataclass
+class _SongJob:
+    """One song's state, carried through the pipeline stages.
+
+    The stages of a song are the same code whether they run back-to-back (the
+    single-song path) or spread across the pipeline's queues (the batch path).
+    Splitting the work into stages and threading this object through them means
+    there is one implementation of "download a song", not two that drift apart.
+    """
+
+    artist: str
+    song: str
+    output_dir: Path
+    fmt: str
+    quality: str
+    skip_existing: bool
+    state: dict
+    state_lock: threading.Lock
+    stop_event: threading.Event
+    seen: set
+    seen_lock: threading.Lock
+    artist_counts: dict
+
+    result: DownloadResult = field(init=False)
+    key: str = field(init=False)
+    safe_a: str = field(init=False)
+    safe_s: str = field(init=False)
+
+    mb: Optional[dict] = None
+    best: Optional[dict] = None
+    ranked: list = field(default_factory=list)
+    src: Optional[str] = None
+    url: str = ""
+    dur_s: int = 0
+    dl_file: Optional[Path] = None
+
+    def __post_init__(self) -> None:
+        self.result = DownloadResult(artist=self.artist, song=self.song)
+        self.key = f"{self.artist}::{self.song}"
+        self.safe_a = sanitize_filename(self.artist)
+        self.safe_s = sanitize_filename(self.song)
 
 
 class MusicDownloader:
@@ -139,6 +198,11 @@ class MusicDownloader:
                 gate_floor=gate_floor,
                 stable_spread=stable_spread,
                 max_candidates=max_candidates,
+                timeout_seconds=self.config.DECISION_TIMEOUT_SECONDS,
+                max_in_flight=self.config.DECISION_MAX_IN_FLIGHT,
+                failure_threshold=self.config.DECISION_FAILURE_THRESHOLD,
+                max_questions=self.config.DECISION_MAX_QUESTIONS,
+                eval_headroom=self.config.DECISION_HEADROOM,
             )
             if use_kev
             else jev_classifier
@@ -157,9 +221,48 @@ class MusicDownloader:
         self.channel_search = channel_search
         # Rebuilt from disk at the start of every run; see _load_channel_trust.
         self.channel_trust = ChannelTrust(self.config)
-        self._fp_semaphore = threading.Semaphore(3)
+        # Bounds how many 90-second partials may be in flight at once. Sized so
+        # the AcoustID budget, not this semaphore, is what throttles the run:
+        # three concurrent partials at a few seconds each reaches well under the
+        # three-per-second ceiling, so the old value of 3 was the real limit and
+        # the published rate limit was never the constraint it appeared to be.
+        self._fp_semaphore = threading.Semaphore(
+            max(1, int(self.config.FP_CONCURRENCY))
+        )
         self._circuit_breaker = AcoustIDCircuitBreaker(cooldown_seconds=60.0)
         self._selection_lock = threading.Lock()
+        # Remembers AcoustID verdicts across runs and coalesces concurrent
+        # duplicate checks within one.
+        self._fingerprint_cache = FingerprintCache(self.config)
+        # Answers every song of an artist from one release tracklist instead of
+        # one MusicBrainz search per song.
+        self._catalog = CatalogContext(self.config, musicbrainz=self.musicbrainz)
+        # Injected by download_batch so a batch's stages do not each build their
+        # own pool. None keeps the single-song path pool-free.
+        self._search_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._alternate_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        # Set by download_batch so persist() coalesces onto a background writer
+        # instead of rewriting the whole file under the shared lock.
+        self._state_writer: Optional[CoalescingStateWriter] = None
+
+    # -- shared executors ----------------------------------------------------
+
+    def _alternate_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        pool = self._alternate_pool
+        if pool is None:
+            pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, int(self.config.FP_ALTERNATE_FANOUT)),
+                thread_name_prefix="ytdl-fp-alternate",
+            )
+            self._alternate_pool = pool
+        return pool
+
+    def _close_executors(self) -> None:
+        for attribute in ("_alternate_pool", "_search_executor"):
+            pool = getattr(self, attribute, None)
+            if pool is not None:
+                pool.shutdown(wait=False)
+                setattr(self, attribute, None)
 
     def _load_channel_trust(self, state):
         """(Re)build the learned channel trust model from the download state."""
@@ -260,6 +363,38 @@ class MusicDownloader:
             {artist: 1},
         )
 
+    def _pipeline_specs(self) -> list[tuple[str, int]]:
+        """Stage sizes, each sized against the resource that stage contends for.
+
+        Search and download are network-bound and want more threads than cores.
+        Verification is bounded by the AcoustID budget and by how many 90-second
+        partials are sensible in flight. The post-download stage decodes audio
+        and tags files, so it wants about one worker per core -- oversubscribing
+        it does not make it faster, it makes the transcodes running beside it
+        slower too.
+        """
+        cpus = os.cpu_count() or 4
+        return [
+            ("search", _resolve_stage_workers(self.config.SEARCH_WORKERS, self.workers)),
+            (
+                "verify",
+                _resolve_stage_workers(self.config.VERIFY_WORKERS, self.config.FP_CONCURRENCY),
+            ),
+            ("download", _resolve_stage_workers(self.config.DOWNLOAD_WORKERS, self.workers)),
+            ("finalize", _resolve_stage_workers(self.config.POST_WORKERS, cpus)),
+        ]
+
+    def _run_stage(self, job: "_SongJob", stage: str) -> bool:
+        """Run one stage. False means the song's fate is settled here."""
+        if stage == "search":
+            return self._stage_select(job)
+        if stage == "verify":
+            return self._stage_verify(job)
+        if stage == "download":
+            return self._stage_fetch(job)
+        self._stage_finalize(job)
+        return False
+
     def download_batch(
         self,
         songs,
@@ -270,6 +405,17 @@ class MusicDownloader:
         report_formats=None,
         update_json_path=None,
     ):
+        """Download a batch as a stage-bounded pipeline.
+
+        The stages -- search, verify, download, finalize -- each get their own
+        pool sized against their own bottleneck, and hand work on through bounded
+        queues. A slow stage therefore pushes back on the stage feeding it rather
+        than letting the whole batch queue up behind it, and the batch never has
+        every song's search, download and decode in flight at once.
+
+        Results are reported as they complete but returned in the order the songs
+        were requested, so a report for a 500-song batch is reproducible.
+        """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         pairs = [(a, s) for a, lst in songs.items() for s in lst if lst]
@@ -280,54 +426,170 @@ class MusicDownloader:
         self._load_channel_trust(state)
         stop = threading.Event()
         seen, seen_lock = set(), threading.Lock()
-        all_results = []
+
+        all_results: list[DownloadResult] = []
         results_lock = threading.Lock()
+        slots: dict[str, DownloadResult] = {}
         start = time.monotonic()
+
+        jobs = [
+            _SongJob(
+                artist=artist,
+                song=song,
+                output_dir=output_dir,
+                fmt=fmt,
+                quality=quality,
+                skip_existing=skip_existing,
+                state=state,
+                state_lock=state_lock,
+                stop_event=stop,
+                seen=seen,
+                seen_lock=seen_lock,
+                artist_counts=artist_counts,
+            )
+            for artist, song in pairs
+        ]
+
+        # One background writer for the whole run: state writes are coalesced off
+        # the lock that every stage shares.
+        writer = CoalescingStateWriter(
+            state,
+            output_dir,
+            self.config.STATE_FILE,
+            flush_interval=self.config.STATE_FLUSH_INTERVAL,
+            flush_batch=self.config.STATE_FLUSH_BATCH,
+        ).start()
+        self._state_writer = writer
+
+        def _publish(job: _SongJob) -> None:
+            with results_lock:
+                all_results.append(job.result)
+                slots[job.key] = job.result
+            self.events.on_result(job.result)
+
+        def _on_stage_error(job: "_SongJob", error: BaseException) -> None:
+            if isinstance(job, _SongJob):
+                job.result.status = "failed"
+                job.result.reason = f"{type(error).__name__}: {error}"
+                _publish(job)
+            else:  # pragma: no cover - defensive
+                self.events.on_warn(f"Pipeline stage error: {type(error).__name__}: {error}")
+
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
-                futs = {
-                    pool.submit(
-                        self._process_song,
-                        a,
-                        s,
-                        output_dir,
-                        fmt,
-                        quality,
-                        skip_existing,
-                        state,
-                        state_lock,
-                        stop,
-                        seen,
-                        seen_lock,
-                        artist_counts,
-                    ): (a, s)
-                    for a, s in pairs
-                    if not stop.is_set()
-                }
-                for f in concurrent.futures.as_completed(futs):
-                    a, s = futs[f]
+            if not self.config.PIPELINE_ENABLED or len(jobs) <= 1:
+                # A one-song batch gains nothing from a pipeline, and running it
+                # sequentially keeps interrupt handling and ordering trivial.
+                for job in jobs:
+                    if stop.is_set():
+                        break
                     try:
-                        r = f.result()
-                    except Exception as e:
-                        r = DownloadResult(
-                            artist=a, song=s, status="failed", reason=f"{type(e).__name__}: {e}"
+                        self._process_song(
+                            job.artist,
+                            job.song,
+                            job.output_dir,
+                            job.fmt,
+                            job.quality,
+                            job.skip_existing,
+                            job.state,
+                            job.state_lock,
+                            job.stop_event,
+                            job.seen,
+                            job.seen_lock,
+                            job.artist_counts,
                         )
-                    with results_lock:
-                        all_results.append(r)
-                    self.events.on_result(r)
+                    except Exception as error:  # noqa: BLE001 - reported per song
+                        job.result.status = "failed"
+                        job.result.reason = f"{type(error).__name__}: {error}"
+                    _publish(job)
+            else:
+                self._search_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max(1, self.config.SEARCH_WORKERS or self.workers),
+                    thread_name_prefix="ytdl-search",
+                )
+                self._prime_catalogs(jobs)
+                specs = self._pipeline_specs()
+
+                def _make_stage(name: str):
+                    def _run(job: _SongJob):
+                        if self._run_stage(job, name):
+                            return job
+                        # Settled here -- downloaded, or failed, or skipped. Every
+                        # song produces exactly one result however it ends, so it
+                        # is published on the way out rather than by the last
+                        # stage, which most songs never reach.
+                        _publish(job)
+                        return None
+
+                    return _run
+
+                pipeline = StagePipeline[_SongJob](
+                    [
+                        (name, _make_stage(name), workers) for name, workers in specs
+                    ],
+                    queue_depth=self.config.PIPELINE_QUEUE_DEPTH,
+                    on_error=_on_stage_error,
+                    stop_event=stop,
+                )
+                pipeline.run(jobs)
         except KeyboardInterrupt:
             stop.set()
             self.events.on_interrupted(len(all_results), len(pairs), time.monotonic() - start)
-            save_state(state, output_dir, self.config.STATE_FILE)
-            self.events.on_session_complete(all_results, time.monotonic() - start)
-            return all_results
+        finally:
+            # Flush synchronously before anything else: the caller reads this file
+            # as soon as download_batch returns.
+            writer.flush()
+            writer.close()
+            self._state_writer = None
+            self._close_executors()
+
         elapsed = time.monotonic() - start
-        self.events.on_session_complete(all_results, elapsed)
+        # Deterministic order, regardless of which stage happened to finish first.
+        ordered = [slots.get(job.key, job.result) for job in jobs]
+        self.events.on_session_complete(ordered, elapsed)
         if report_formats:
-            export_report([r.to_dict() for r in all_results], output_dir, report_formats)
+            export_report([r.to_dict() for r in ordered], output_dir, report_formats)
         if update_json_path:
-            update_json_file(update_json_path, [r.to_dict() for r in all_results])
-        return all_results
+            update_json_file(update_json_path, [r.to_dict() for r in ordered])
+        return ordered
+
+    def _prime_catalogs(self, jobs: list["_SongJob"]) -> None:
+        """Load each artist's album before its songs start searching.
+
+        One throttled catalogue lookup per artist, overlapping with other artists'
+        work, instead of one per song sitting on a single song's critical path.
+        Only worth doing when the song list actually names several artists.
+        """
+        if not self.musicbrainz:
+            return
+        by_artist: dict[str, list[str]] = {}
+        for job in jobs:
+            by_artist.setdefault(job.artist, []).append(job.song)
+        if len(by_artist) < 2:
+            return
+
+        def _prime(artist: str, first_song: str) -> None:
+            try:
+                self._catalog.prime(artist, first_song, fetch=fetch_musicbrainz)
+            except Exception:
+                # Warming the cache is best-effort; a failure just means those
+                # songs use the per-song lookup they always used.
+                pass
+
+        workers = min(len(by_artist), max(1, self.workers))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="ytdl-catalog"
+        ) as pool:
+            # Submit every artist first, then collect. Collecting inside a
+            # generator expression would submit-then-immediately-block on each
+            # one in turn, which serialises exactly the work being warmed up.
+            pending = [
+                pool.submit(_prime, artist, songs[0]) for artist, songs in by_artist.items()
+            ]
+            for future in pending:
+                try:
+                    future.result()
+                except Exception:
+                    pass
 
     def download_url(
         self,
@@ -524,23 +786,42 @@ class MusicDownloader:
         return all_results
 
     def verify_library(self, songs, output_dir, fmt="mp3"):
-        return _verify_library(
-            songs,
-            Path(output_dir),
-            fmt,
-            self.workers,
-            self.acoustid_key,
-            self.config,
-            self._circuit_breaker,
-            self._fp_semaphore,
-            self.musicbrainz,
-            self.events,
-            self._persist,
-            load_state(Path(output_dir), self.config.STATE_FILE),
-            threading.Lock(),
-            require_fingerprint=self.require_fingerprint,
-            state_filename=self.config.STATE_FILE,
-        )
+        output_dir = Path(output_dir)
+        state = load_state(output_dir, self.config.STATE_FILE)
+        state_lock = threading.Lock()
+        # A verify pass rewrites the same whole-file document once per song, so
+        # it needs the same coalescing the batch path uses; otherwise
+        # re-verifying a large library pays O(N^2) writes under a shared lock.
+        writer = CoalescingStateWriter(
+            state,
+            output_dir,
+            self.config.STATE_FILE,
+            flush_interval=self.config.STATE_FLUSH_INTERVAL,
+            flush_batch=self.config.STATE_FLUSH_BATCH,
+        ).start()
+        self._state_writer = writer
+        try:
+            return _verify_library(
+                songs,
+                output_dir,
+                fmt,
+                self.workers,
+                self.acoustid_key,
+                self.config,
+                self._circuit_breaker,
+                self._fp_semaphore,
+                self.musicbrainz,
+                self.events,
+                self._persist,
+                state,
+                state_lock,
+                require_fingerprint=self.require_fingerprint,
+                state_filename=self.config.STATE_FILE,
+            )
+        finally:
+            writer.flush()
+            writer.close()
+            self._state_writer = None
 
     def _process_song(
         self,
@@ -557,21 +838,58 @@ class MusicDownloader:
         seen_lock,
         artist_counts,
     ):
-        with seen_lock:
-            if artist not in seen:
-                seen.add(artist)
-                self.events.on_artist_start(artist, artist_counts.get(artist, 0))
-        result = DownloadResult(artist=artist, song=song)
-        key = f"{artist}::{song}"
-        if stop_event.is_set():
+        """Run every stage of one song back to back.
+
+        This is the single-song path, and the sequential reference the batch
+        pipeline is measured against. The batch drives these same stage methods,
+        so a song behaves identically either way.
+        """
+        job = _SongJob(
+            artist=artist,
+            song=song,
+            output_dir=Path(output_dir),
+            fmt=fmt,
+            quality=quality,
+            skip_existing=skip_existing,
+            state=state,
+            state_lock=state_lock,
+            stop_event=stop_event,
+            seen=seen,
+            seen_lock=seen_lock,
+            artist_counts=artist_counts,
+        )
+        if not self._stage_select(job):
+            return job.result
+        if not self._stage_verify(job):
+            return job.result
+        if not self._stage_fetch(job):
+            return job.result
+        self._stage_finalize(job)
+        return job.result
+
+    # -- stage 1: catalogue reference, search, rank, decide -------------------
+
+    def _stage_select(self, job: _SongJob) -> bool:
+        """Everything up to and including choosing a candidate. False = stop."""
+        artist, song = job.artist, job.song
+        result = job.result
+
+        with job.seen_lock:
+            if artist not in job.seen:
+                job.seen.add(artist)
+                self.events.on_artist_start(artist, job.artist_counts.get(artist, 0))
+
+        if job.stop_event.is_set():
             result.status = "skipped"
             result.reason = "Interrupted"
-            return result
-        safe_a, safe_s = sanitize_filename(artist), sanitize_filename(song)
-        expected = migrate_legacy_audio_path(output_dir / safe_a / f"{safe_s}.{fmt}")
-        with state_lock:
-            existing = state.get("downloads", {}).get(key)
-        if skip_existing and existing and existing.get("status") == "downloaded":
+            return False
+
+        expected = migrate_legacy_audio_path(
+            job.output_dir / job.safe_a / f"{job.safe_s}.{job.fmt}"
+        )
+        with job.state_lock:
+            existing = job.state.get("downloads", {}).get(job.key)
+        if job.skip_existing and existing and existing.get("status") == "downloaded":
             md5s = existing.get("md5")
             if expected.exists():
                 if md5s:
@@ -580,36 +898,52 @@ class MusicDownloader:
                         result.status = "skipped"
                         result.file_path = expected
                         result.md5 = md5s
-                        return result
+                        return False
                     self.events.on_md5_mismatch(artist, song)
                 else:
                     self.events.on_skip_existing(artist, song, expected, False)
                     result.status = "skipped"
                     result.file_path = expected
-                    return result
-        apply_delay(self.delay[0], self.delay[1])
-        mb = None
+                    return False
+
+        # An explicit --delay is still honoured, but the default is no tax at
+        # all. Request pacing is not missing here: every source paces itself at
+        # its own call site from per-service token buckets (see ratelimit), which
+        # block only when a budget is genuinely exhausted instead of charging
+        # every song a fixed toll -- and which also pace the several extractions
+        # one song performs, not just the song itself.
+        if self.delay[1] > 0:
+            apply_delay(self.delay[0], self.delay[1])
+
+        job.mb = self._resolve_catalog(artist, song)
         if self.musicbrainz:
-            try:
-                mb = fetch_musicbrainz(artist, song)
-            except Exception as e:
-                self.events.on_warn(f"MusicBrainz failed: {e}")
-                mb = None
-            self.events.on_musicbrainz_result(artist, song, bool(mb), mb or {})
+            self.events.on_musicbrainz_result(artist, song, bool(job.mb), job.mb or {})
+
         best, ranked, src = self._search_and_select(
-            artist, song, output_dir, state, state_lock, key, result, stop_event, mb
+            artist,
+            song,
+            job.output_dir,
+            job.state,
+            job.state_lock,
+            job.key,
+            result,
+            job.stop_event,
+            job.mb,
+            executor=self._search_executor,
         )
+        job.best, job.ranked, job.src = best, ranked, src
         if best is None:
-            return result
-        url = best.get("webpage_url") or best.get("url", "")
-        dur_s = int(best.get("duration") or 0)
+            return False
+
+        job.url = best.get("webpage_url") or best.get("url", "")
+        job.dur_s = int(best.get("duration") or 0)
         result.source = src
-        result.url = url
+        result.url = job.url
         result.matched_title = best.get("title") or ""
         result.fuzzy_score = int(
             fuzz.token_sort_ratio(f"{artist} {song}".lower(), (best.get("title") or "").lower())
         )
-        result.duration_seconds = dur_s
+        result.duration_seconds = job.dur_s
         result.heuristic_score = int(best.get("_heuristic_score", best.get("_composite_score", 0)))
         result.composite_score = best.get("_composite_score", 0)
         result.score_breakdown = best.get("_score_breakdown", {})
@@ -617,8 +951,39 @@ class MusicDownloader:
         result.candidates_ranked = len(ranked)
         if result.selection_method == "heuristic":
             result.selection_method = self.decision_provider
+        return True
+
+    def _resolve_catalog(self, artist: str, song: str) -> Optional[dict]:
+        """Catalogue data for a song, from its album's tracklist when available.
+
+        One MusicBrainz search answers one song, and the API is throttled to one
+        request per second process-wide -- which used to serialise a whole album
+        behind fifteen sequential lookups. An artist's songs are usually an
+        album, so once any of them resolves to a release the rest are read off
+        that release's tracklist: two throttled calls for the album instead of
+        one per song, and an exact tracklist rather than a search-ranked guess.
+        """
+        if not self.musicbrainz:
+            return None
+
+        from_tracklist = self._catalog.from_tracklist(artist, song)
+        if from_tracklist is not None:
+            return from_tracklist
+
+        data = fetch_musicbrainz(artist, song)
+        if data and data.get("release_id"):
+            self._catalog.remember_release(artist, data["release_id"])
+        return data
+
+    # -- stage 2: fingerprint the leading candidate ---------------------------
+
+    def _stage_verify(self, job: _SongJob) -> bool:
+        """Fingerprint check plus the strict-verification gate. False = stop."""
+        result, best = job.result, job.best
+        artist, song = job.artist, job.song
+
         fp_ok, fp_conf, fp_title, fp_label = self._fingerprint_check(
-            artist, song, url, output_dir, best, ranked, result
+            artist, song, job.url, job.output_dir, best, job.ranked, result
         )
         # Reported on the same scale the gate uses, so the line the user reads
         # ("high confidence") and the reason fingerprinting was skipped agree.
@@ -646,84 +1011,103 @@ class MusicDownloader:
             result.status = "failed"
             result.reason = "Fingerprint did not confirm the song"
             self._persist(
-                state,
-                state_lock,
-                key,
+                job.state,
+                job.state_lock,
+                job.key,
                 "failed",
-                url,
+                job.url,
                 None,
                 None,
-                output_dir,
+                job.output_dir,
                 state_filename=self.config.STATE_FILE,
+                writer=self._state_writer,
                 result=result,
             )
-            return result
+            return False
+
         if result.url:
-            url = result.url
-            dur_s = result.duration_seconds or dur_s
+            job.url = result.url
+            job.dur_s = result.duration_seconds or job.dur_s
+
         # The fingerprint stage can promote a different candidate, and the
         # download stage can replace it again; both make the originally selected
         # entry the wrong source of the publisher and thumbnail we record.
-        if result.url and result.url != (best.get("webpage_url") or best.get("url")):
-            for entry, _, _ in ranked:
+        best_url = (best or {}).get("webpage_url") or (best or {}).get("url")
+        if result.url and result.url != best_url:
+            for entry, _, _ in job.ranked:
                 if (entry.get("webpage_url") or entry.get("url")) == result.url:
-                    best = entry
+                    job.best = entry
                     break
-        (output_dir / safe_a).mkdir(parents=True, exist_ok=True)
+        return True
+
+    # -- stage 3: download the winner, falling through to alternates ----------
+
+    def _stage_fetch(self, job: _SongJob) -> bool:
+        """Download, falling through to the next candidate on failure."""
+        result = job.result
+        (job.output_dir / job.safe_a).mkdir(parents=True, exist_ok=True)
 
         dl_file, err, used = self._download_with_fallback(
-            ranked,
-            best,
-            artist,
-            song,
-            output_dir,
-            fmt,
-            quality,
-            stop_event,
-            state,
-            state_lock,
-            url,
-            dur_s,
+            job.ranked,
+            job.best,
+            job.artist,
+            job.song,
+            job.output_dir,
+            job.fmt,
+            job.quality,
+            job.stop_event,
+            job.state,
+            job.state_lock,
+            job.url,
+            job.dur_s,
             result,
         )
 
         if used is not None:
             # The winning candidate became unplayable; carry the replacement
             # candidate's identity and score into the report.
-            best = self._adopt_candidate(result, used)
-            url = result.url
-            dur_s = result.duration_seconds
+            job.best = self._adopt_candidate(result, used)
+            job.url = result.url or job.url
+            job.dur_s = result.duration_seconds
 
+        job.dl_file = dl_file
         if dl_file is None:
-            self.events.on_download_failed(artist, song, err)
+            self.events.on_download_failed(job.artist, job.song, err)
             result.reason = err
             self._persist(
-                state,
-                state_lock,
-                key,
+                job.state,
+                job.state_lock,
+                job.key,
                 "failed",
-                url,
+                job.url,
                 None,
                 None,
-                output_dir,
+                job.output_dir,
                 state_filename=self.config.STATE_FILE,
+                writer=self._state_writer,
                 result=result,
             )
-            return result
-        return self._post_download_checks(
-            dl_file,
-            artist,
-            song,
-            url,
+            return False
+        return True
+
+    # -- stage 4: post-download checks, tagging, persistence -----------------
+
+    def _stage_finalize(self, job: _SongJob) -> None:
+        best = job.best or {}
+        self._post_download_checks(
+            job.dl_file,
+            job.artist,
+            job.song,
+            job.url,
             best.get("thumbnail"),
-            fmt,
-            dur_s,
-            state,
-            state_lock,
-            key,
-            result,
-            output_dir,
-            mb,
+            job.fmt,
+            job.dur_s,
+            job.state,
+            job.state_lock,
+            job.key,
+            job.result,
+            job.output_dir,
+            job.mb,
             channel=best.get("channel") or best.get("uploader"),
             channel_url=channel_url_for(best),
         )
@@ -811,7 +1195,17 @@ class MusicDownloader:
         return None, last_error, None
 
     def _search_and_select(
-        self, artist, song, output_dir, state, state_lock, key, result, stop_event, mb_data
+        self,
+        artist,
+        song,
+        output_dir,
+        state,
+        state_lock,
+        key,
+        result,
+        stop_event,
+        mb_data,
+        executor=None,
     ):
         opts = {
             "max_results": self.max_results,
@@ -822,6 +1216,7 @@ class MusicDownloader:
             "cookies_browser": self.cookies_browser,
             "cookies_file": self.cookies_file,
             "proxy": self.proxy,
+            "config": self.config,
         }
         reference, reference_warnings = self._resolve_reference(
             mb_data, artist, song, allow_itunes=self.musicbrainz
@@ -838,6 +1233,7 @@ class MusicDownloader:
             result.status = "skipped"
             return best, ranked, src
         self.events.on_search_start(artist, song, "parallel sources")
+        search_kwargs = {"executor": executor} if executor is not None else {}
         raw = search_all_sources(
             artist,
             song,
@@ -846,6 +1242,7 @@ class MusicDownloader:
             mb_data=mb_data,
             channel_trust=self.channel_trust if self.channel_search else None,
             config=self.config,
+            **search_kwargs,
         )
         if raw:
             found, ranked = select_best_result(
@@ -879,6 +1276,15 @@ class MusicDownloader:
                     )
                 except JevEvaluationError as exc:
                     decision_error = exc
+                    # Reported once per run, not once per song: a provider that
+                    # has been given up on has nothing new to say 999 more times.
+                    notice = (
+                        self.decision_classifier.gate.give_up_notice()
+                        if hasattr(self.decision_classifier, "gate")
+                        else None
+                    )
+                    if notice:
+                        self.events.on_warn(notice)
 
                 if decision_ranked:
                     ranked = decision_ranked
@@ -945,6 +1351,7 @@ class MusicDownloader:
                             None,
                             output_dir,
                             state_filename=self.config.STATE_FILE,
+                writer=self._state_writer,
                             result=result,
                         )
                         return None, ranked, None
@@ -979,6 +1386,7 @@ class MusicDownloader:
                             None,
                             output_dir,
                             state_filename=self.config.STATE_FILE,
+                writer=self._state_writer,
                             result=result,
                         )
                         return best, ranked, src
@@ -1006,6 +1414,7 @@ class MusicDownloader:
                 None,
                 output_dir,
                 state_filename=self.config.STATE_FILE,
+                writer=self._state_writer,
                 result=result,
             )
         return best, ranked, src
@@ -1042,52 +1451,100 @@ class MusicDownloader:
             fp_label = "disabled -- --skip-fingerprint"
         if needs:
             self.events.on_fingerprint_start(artist, song, self.config.PARTIAL_DOWNLOAD_SECONDS)
-            pp = None
-            try:
-                with self._fp_semaphore:
-                    pp = download_partial(
-                        url,
-                        output_dir,
-                        self.events,
-                        self.cookies_browser,
-                        self.cookies_file,
-                        self.proxy,
-                        self.config,
+            # A remembered verdict costs nothing, and the same upload is a
+            # candidate for several songs of an artist and for every --retry.
+            cached = self._fingerprint_cache.get(url, artist, song)
+            if cached is not None:
+                fp_ok, fp_conf, fp_title = cached.as_tuple()
+                fp_label = f"verified {fp_conf:.0%} conf. (cached)" if fp_ok else cached.matched_title
+                self.events.on_fingerprint_result(artist, song, fp_ok, fp_conf, fp_title)
+            elif self._fingerprint_cache.coalesce(url, artist, song):
+                # Another worker is already spending one of three requests per
+                # second on this exact check; wait for its answer rather than
+                # duplicating the request.
+                cached = self._fingerprint_cache.get(url, artist, song)
+                if cached is not None:
+                    fp_ok, fp_conf, fp_title = cached.as_tuple()
+                    fp_label = f"verified {fp_conf:.0%} conf. (shared)" if fp_ok else cached.matched_title
+                else:
+                    fp_ok, fp_conf, fp_title = False, 0.0, None
+                    fp_label = "fingerprint check did not complete"
+            else:
+                try:
+                    fp_ok, fp_conf, fp_title, fp_label = self._fingerprint_one(
+                        url, artist, song, output_dir
                     )
-                    if pp is None:
-                        self.events.on_fingerprint_partial_failed(artist, song)
-                        fp_label = "partial download failed"
-                    else:
-                        is_m, conf, t = verify_fingerprint(
-                            pp,
-                            artist,
-                            song,
-                            self.acoustid_key,
-                            self.config,
-                            self._circuit_breaker,
-                            on_warn=self.events.on_warn,
-                            on_info=self.events.on_info,
-                            on_fingerprint_error=self.events.on_fingerprint_error,
-                        )
-                        time.sleep(0.35)
-                        fp_conf = conf
-                        fp_title = t
-                        self.events.on_fingerprint_result(artist, song, is_m, conf, t)
-                        if is_m:
-                            fp_ok, fp_label = True, f"verified {conf:.0%} conf."
-                        elif conf > 0.4 or self.require_fingerprint:
-                            if conf > 0.4:
-                                self.events.on_fingerprint_low_confidence(artist, song, t)
-                            fp_ok, fp_conf, fp_title, fp_label = self._try_next_fp(
-                                ranked, artist, song, output_dir, result
-                            )
-                        else:
-                            self.events.on_fingerprint_no_match(artist, song)
-                            fp_label = "no AcoustID match"
-            finally:
-                if pp and pp.exists():
-                    pp.unlink(missing_ok=True)
+                finally:
+                    release_fingerprint_slot(self._fingerprint_cache, url, artist, song)
+                if fp_conf > 0.4 or self.require_fingerprint:
+                    if fp_conf > 0.4:
+                        self.events.on_fingerprint_low_confidence(artist, song, fp_title)
+                    fp_ok, fp_conf, fp_title, fp_label = self._try_next_fp(
+                        ranked, artist, song, output_dir, result
+                    )
+                elif not fp_ok:
+                    self.events.on_fingerprint_no_match(artist, song)
+                    if fp_label is None:
+                        fp_label = "no AcoustID match"
         return fp_ok, fp_conf, fp_title, fp_label
+
+    def _fingerprint_one(
+        self,
+        url: str,
+        artist: str,
+        song: str,
+        output_dir: Path,
+    ) -> tuple[bool, float, Optional[str], Optional[str]]:
+        """Partial-download one candidate, fingerprint it, and cache the verdict.
+
+        The semaphore wraps the partial download as well as the lookup. That is
+        deliberate: the AcoustID rate limit only paces the API call, and pacing
+        the download around it too would have wasted the budget -- but bounding
+        concurrent partials is still what keeps a batch from putting dozens of
+        90-second clips in flight at once.
+        """
+        partial = None
+        try:
+            with self._fp_semaphore:
+                partial = download_partial(
+                    url,
+                    output_dir,
+                    self.events,
+                    self.cookies_browser,
+                    self.cookies_file,
+                    self.proxy,
+                    self.config,
+                )
+                if partial is None:
+                    self.events.on_fingerprint_partial_failed(artist, song)
+                    return False, 0.0, None, "partial download failed"
+
+                verified, confidence, title = verify_fingerprint(
+                    partial,
+                    artist,
+                    song,
+                    self.acoustid_key,
+                    self.config,
+                    self._circuit_breaker,
+                    on_warn=self.events.on_warn,
+                    on_info=self.events.on_info,
+                    on_fingerprint_error=self.events.on_fingerprint_error,
+                )
+                label = (
+                    f"verified {confidence:.0%} conf."
+                    if verified
+                    else title
+                    if title and confidence > 0
+                    else "no AcoustID match"
+                )
+                self.events.on_fingerprint_result(artist, song, verified, confidence, title)
+                self._fingerprint_cache.put(
+                    url, artist, song, FingerprintVerdict(verified, confidence, title)
+                )
+                return verified, confidence, title, label
+        finally:
+            if partial and partial.exists():
+                partial.unlink(missing_ok=True)
 
     @staticmethod
     def _adopt_candidate(result, entry):
@@ -1164,41 +1621,91 @@ class MusicDownloader:
             or result.decision_threshold - margin <= probability < result.decision_threshold
         )
 
-    def _try_next_fp(self, ranked, artist, song, output_dir, result):
-        for cr, cs, _ in ranked[1:]:
-            if cs < self.score_threshold:
+    def _diversified_alternates(self, ranked) -> list:
+        """Pick alternate candidates worth a second fingerprint.
+
+        Taking the next *N* by score spends the partial-download and AcoustID
+        budget on near-duplicates of the candidate that just failed -- a live
+        rip and its "radio edit" score almost identically and answer identically.
+        Choosing by marginal relevance instead means each speculative check is
+        a genuinely different recording, which is the only way the fan-out can
+        change the outcome.
+
+        Ties fall back to score order, so the choice stays deterministic.
+        """
+        pool = []
+        for entry, score, _ in ranked[1:]:
+            if score < self.score_threshold:
                 break
-            nu = cr.get("webpage_url") or cr.get("url", "")
-            np_ = None
-            try:
-                np_ = download_partial(
-                    nu,
-                    output_dir,
-                    self.events,
-                    self.cookies_browser,
-                    self.cookies_file,
-                    self.proxy,
-                    self.config,
+            title = normalize_title(strip_featuring((entry.get("title") or "").lower()))
+            if title:
+                pool.append((title, int(score or 0), entry))
+        if not pool:
+            return []
+
+        chosen: list[dict] = []
+        chosen_titles: list[str] = []
+        remaining = list(pool)
+        while remaining and len(chosen) < max(1, int(self.config.FP_ALTERNATE_FANOUT)):
+            best_entry = None
+            best_rank = None
+            for index, (title, score, entry) in enumerate(remaining):
+                similarity = max(
+                    (fuzz.token_set_ratio(title, already) for already in chosen_titles), default=0
                 )
-                if np_:
-                    ok, c, t = verify_fingerprint(
-                        np_,
-                        artist,
-                        song,
-                        self.acoustid_key,
-                        self.config,
-                        self._circuit_breaker,
-                        on_warn=self.events.on_warn,
-                        on_info=self.events.on_info,
-                        on_fingerprint_error=self.events.on_fingerprint_error,
-                    )
-                    time.sleep(0.35)
-                    if ok:
-                        self._adopt_candidate(result, cr)
-                        return True, c, t, f"verified next candidate {c:.0%}"
-            finally:
-                if np_ and np_.exists():
-                    np_.unlink(missing_ok=True)
+                # Higher is better: reward low similarity to what is already
+                # chosen, and use score only to break ties.
+                rank = (1000 - similarity) * 1000 + score
+                if best_rank is None or rank > best_rank:
+                    best_rank = rank
+                    best_entry = index
+            title, _score, entry = remaining.pop(best_entry or 0)
+            chosen.append(entry)
+            chosen_titles.append(title)
+        return chosen
+
+    def _try_next_fp(self, ranked, artist, song, output_dir, result):
+        """Fingerprint alternates in parallel and adopt the first real match.
+
+        Done one at a time this cost, per alternate, a full partial download plus
+        a rate-limited lookup plus a fixed 0.35s sleep -- all serialised. Running
+        the top alternates concurrently turns the worst case from the sum of
+        those latencies into roughly the slowest one. The AcoustID budget still
+        serialises the API calls themselves, which is correct: that limit is
+        real.
+        """
+        alternates = self._diversified_alternates(ranked)
+        if not alternates:
+            return False, 0.0, None, "low confidence (no alternate match)"
+
+        pool = self._alternate_executor()
+
+        def _check(entry: dict):
+            url = entry.get("webpage_url") or entry.get("url", "")
+            if not url:
+                return entry, False, 0.0, None
+            cached = self._fingerprint_cache.get(url, artist, song)
+            if cached is not None:
+                return entry, cached.verified, cached.confidence, cached.matched_title
+            try:
+                verified, confidence, title, _label = self._fingerprint_one(
+                    url, artist, song, output_dir
+                )
+            except Exception:
+                return entry, False, 0.0, None
+            return entry, verified, confidence, title
+
+        # Submit in rank order so the best alternate is checked first; results
+        # are collected in that same order, which keeps selection deterministic.
+        futures = [pool.submit(_check, entry) for entry in alternates]
+        for future in futures:
+            try:
+                entry, verified, confidence, title = future.result()
+            except Exception:
+                continue
+            if verified:
+                self._adopt_candidate(result, entry)
+                return True, confidence, title, f"verified next candidate {confidence:.0%}"
         return False, 0.0, None, "low confidence (no alternate match)"
 
     def _post_download_checks(
@@ -1239,6 +1746,7 @@ class MusicDownloader:
                 None,
                 output_dir,
                 state_filename=self.config.STATE_FILE,
+                writer=self._state_writer,
                 result=result,
             )
             return result
@@ -1265,6 +1773,7 @@ class MusicDownloader:
                     None,
                     output_dir,
                     state_filename=self.config.STATE_FILE,
+                writer=self._state_writer,
                     result=result,
                 )
                 return result
@@ -1298,6 +1807,7 @@ class MusicDownloader:
                 None,
                 output_dir,
                 state_filename=self.config.STATE_FILE,
+                writer=self._state_writer,
                 result=result,
             )
             return result
@@ -1326,6 +1836,7 @@ class MusicDownloader:
             fingerprint_confidence=result.fingerprint_confidence,
             fingerprint_label=result.fingerprint_label,
             state_filename=self.config.STATE_FILE,
+                writer=self._state_writer,
             result=result,
             channel=channel,
             channel_url=channel_url,
@@ -1370,6 +1881,7 @@ class MusicDownloader:
         channel_url=None,
         result=None,
         preserve_fields=None,
+        writer=None,
     ):
         MusicDownloader._persist_state(
             state,
@@ -1389,6 +1901,7 @@ class MusicDownloader:
             channel_url=channel_url,
             result=result,
             preserve_fields=preserve_fields,
+            writer=writer,
         )
 
     @staticmethod
@@ -1410,6 +1923,7 @@ class MusicDownloader:
         channel_url=None,
         result=None,
         preserve_fields=None,
+        writer=None,
     ):
         with lock:
             downloads = state.setdefault("downloads", {})
@@ -1444,4 +1958,12 @@ class MusicDownloader:
             if result is not None:
                 merge_state_detail(entry, existing, state_detail(result), preserve_fields)
             downloads[key] = entry
+        # The mutation above is the cheap part and stays under the lock. The
+        # write is not: rewriting the whole document and fsyncing it while every
+        # other worker waits on this same lock is what turned a 500-song batch
+        # into an O(N^2) stall. The writer snapshots under the lock and does the
+        # serialisation and I/O on a background thread instead.
+        if writer is not None:
+            writer.record()
+        else:
             save_state(state, output_dir, state_filename)

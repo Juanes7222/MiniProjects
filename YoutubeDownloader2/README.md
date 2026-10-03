@@ -58,6 +58,65 @@ Successful retries are removed from the queue automatically. The final summary
 shows pending retries, unverified files, and the exact command for the next
 recommended action.
 
+## How a batch runs
+
+A batch is a **stage pipeline**. Each stage gets its own pool of threads, sized
+against the resource it actually contends for, and hands work on through bounded
+queues:
+
+| Stage | Work | Sized against |
+| --- | --- | --- |
+| search | multi-source search, ranking, decision model | network |
+| verify | 90-second partial download + AcoustID lookup | the AcoustID request budget |
+| download | full download with candidate fallback | network |
+| post | duration/silence checks, tagging, checksums | CPU |
+
+Because the queues are bounded, a slow stage pushes back on the stage feeding it
+instead of letting the whole batch queue up behind it. Results are reported as
+they finish but returned in the order the songs were requested, so a report for
+a large batch is reproducible.
+
+```bash
+ytdl --file songs.json --musicbrainz --workers 8
+ytdl --file songs.json --stage-workers 12 8 12 6   # search verify download post
+ytdl --file songs.json --no-pipeline                # one worker, song at a time
+```
+
+## Rate limiting
+
+Remote services publish per-process budgets, and they are enforced by token
+buckets that block **only when a request would actually exceed the budget** —
+not with a fixed sleep charged to every song. Backoff uses full jitter, so
+workers that fail together do not retry together, and `Retry-After` is honoured.
+
+| Service | Budget |
+| --- | --- |
+| AcoustID | 3 requests/second (published limit) |
+| MusicBrainz | 1 request/second |
+| YouTube / other search | configurable |
+
+If a service throttles us repeatedly, a circuit breaker opens and widens its
+cooldown, letting exactly one probe through once it expires.
+
+`--delay MIN MAX` still adds an extra pause per song if you want it; it is off
+by default.
+
+## Caching
+
+Candidate lists, MusicBrainz/iTunes metadata, cover art and AcoustID verdicts are
+cached under `~/.cache/ytdl`, each with its own TTL. Re-running a batch, retrying
+failures, and re-verifying a library all reuse them. `--no-cache` bypasses this,
+and `YTDL_NO_CACHE=1` disables it permanently.
+
+Set `YTDL_CACHE_DIR` to move the cache elsewhere.
+
+## Albums
+
+An artist's songs are usually one album. Once any of them resolves to a MusicBrainz
+release, the rest are answered from that release's tracklist — two throttled
+calls for a whole album instead of one per song, and an exact tracklist rather
+than a search-ranked guess.
+
 ## License
 
 This project is licensed under the MIT License.

@@ -4,16 +4,20 @@ orchestration, candidate scoring heuristic, and selection logic."""
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import quote_plus
 
 import yt_dlp
 from rapidfuzz import fuzz
 
+from .cache import caches
 from .config import Config
+from .ratelimit import limiters
 from .scorer import rank_results, score_youtube_result  # noqa: F401 — re-exported
 from .utils import normalize_title, strip_featuring
+from .ytdlp_options import apply_request_shaping
 
 if TYPE_CHECKING:
     from rich.console import Console
@@ -56,6 +60,11 @@ def search_ytmusic_official(artist: str, song: str, opts: dict) -> list[dict]:
     try:
         from ytmusicapi import YTMusic
 
+        # The YouTube Music catalogue is a separate service from the search
+        # extractor: it goes through ytmusicapi against Google's own API rather
+        # than through yt-dlp. It still needs its own budget, and a batch adds
+        # this call for every song.
+        _pace_source("ytmusic_api", opts.get("config"))
         ytmusic = YTMusic()
         max_r = min(opts.get("max_results", 5), 5)
         query = f"{artist} {song}"
@@ -99,6 +108,26 @@ def search_ytmusic_official(artist: str, song: str, opts: dict) -> list[dict]:
     return structured_results
 
 
+def _pace_source(source: str, config: Optional[Config] = None) -> None:
+    """Spend a token from *source*'s request budget before hitting it.
+
+    Replaces the unconditional per-song sleep that used to run before every
+    search. That sleep was both wasteful -- it fired even when the budget was
+    empty -- and wrong, because it paced songs rather than requests: one song
+    fires several extractions across several sources, and five songs firing in
+    parallel multiplied the load five times over.
+    """
+    cfg = config or Config()
+    if source == "youtube":
+        limiters.bucket(
+            "youtube", cfg.YOUTUBE_RATE_PER_SECOND, burst=cfg.YOUTUBE_BURST
+        ).acquire()
+    else:
+        # Other providers get a shared, generous budget keyed by name, so a
+        # second platform cannot be flooded by the first one's fan-out.
+        limiters.bucket(f"search:{source}", cfg.YOUTUBE_RATE_PER_SECOND).acquire()
+
+
 def search_source(query: str, source: str, opts: dict) -> list[dict]:
     """
     Extracts flat metadata entries from a specific scraper source using yt_dlp.
@@ -125,12 +154,15 @@ def search_source(query: str, source: str, opts: dict) -> list[dict]:
         "extract_flat": True,
         "noplaylist": True,
     }
+    apply_request_shaping(ydl_opts, opts.get("config"), for_scan=True)
     if opts.get("cookies_browser"):
         ydl_opts["cookiesfrombrowser"] = (opts["cookies_browser"],)
     if opts.get("cookies_file"):
         ydl_opts["cookiefile"] = str(opts["cookies_file"])
     if opts.get("proxy"):
         ydl_opts["proxy"] = opts["proxy"]
+
+    _pace_source(source, opts.get("config"))
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -201,9 +233,10 @@ def search_with_variants(
     source: str,
     opts: dict,
     queries: Optional[list[str]] = None,
+    executor: Optional[ThreadPoolExecutor] = None,
 ) -> list[dict]:
     """
-    Iterates over multiple query permutations to gather candidate tracks.
+    Gathers candidate tracks from every query permutation.
 
     Every query is fetched to completion before returning: the caller's
     ``max_results`` is a *presentation* budget, not a fetch budget. Truncating
@@ -211,12 +244,21 @@ def search_with_variants(
     allowance, which is precisely the failure mode that hid the real recording
     of obscure catalogue tracks behind four organic results.
 
+    The variants run **concurrently** but are collected in submission order.
+    Overlapping them turns five serialised extraction round trips into one
+    round trip's worth of latency, while keeping the resulting candidate pool
+    byte-for-byte reproducible -- which matters because the scorer breaks ties
+    on order, and a pool whose membership changes run to run makes a selection
+    impossible to reproduce or explain afterwards.
+
     Args:
         artist: The name of the artist.
         song: The title of the song.
-        source: The target platform identifier.
+        source: The target source platform.
         opts: Configuration options dictionary.
         queries: Pre-built query list; defaults to ``build_query_variants``.
+        executor: Optional pool to run in. Supplied by the pipeline so a batch
+            does not build a nested pool per song per source.
 
     Returns:
         A list of unique track results, capped at the fetch budget.
@@ -230,11 +272,51 @@ def search_with_variants(
     per_query_limit = max(min_per_query, -(-max_results // max(1, len(query_list))))
     variant_options = {**opts, "max_results": per_query_limit}
 
+    if len(query_list) <= 1:
+        return _collect_variants(
+            [lambda: search_source(query_list[0], source, variant_options)],
+            source,
+            hard_cap,
+        )
+
+    fanout = max(1, int(opts.get("variant_fanout", 3)))
+    owned: Optional[ThreadPoolExecutor] = None
+    pool = executor
+    if pool is None and fanout > 1:
+        owned = ThreadPoolExecutor(
+            max_workers=min(len(query_list), fanout), thread_name_prefix="ytdl-search-variant"
+        )
+        pool = owned
+
+    try:
+        if pool is None:
+            calls = [(lambda q=q: search_source(q, source, variant_options)) for q in query_list]
+            return _collect_variants(calls, source, hard_cap)
+        futures = [
+            pool.submit(search_source, query, source, variant_options) for query in query_list
+        ]
+        # Collected in submission order, not completion order -- see the docstring.
+        return _collect_variants([f.result for f in futures], source, hard_cap)
+    finally:
+        if owned is not None:
+            owned.shutdown(wait=True)
+
+
+def _collect_variants(
+    fetch_calls: Sequence[Callable[..., list[dict]]],
+    source: str,
+    hard_cap: int,
+) -> list[dict]:
+    """Run each fetch, de-duplicate by id, and stop at the fetch budget."""
     seen_ids: set[str] = set()
     all_results: list[dict] = []
 
-    for query in query_list:
-        for result in search_source(query, source, variant_options):
+    for fetch in fetch_calls:
+        try:
+            results = fetch()
+        except Exception:
+            results = []
+        for result in results:
             video_id = result.get("id") or result.get("url")
             if video_id and video_id in seen_ids:
                 continue
@@ -433,6 +515,8 @@ def search_all_sources(
     mb_data: Optional[dict] = None,
     channel_trust: "Optional[ChannelTrust]" = None,
     config: Optional[Config] = None,
+    executor: Optional[ThreadPoolExecutor] = None,
+    cache: bool = True,
 ) -> list[dict]:
     """
     Executes concurrent cross-platform lookups across all requested streams.
@@ -452,6 +536,9 @@ def search_all_sources(
         mb_data: MusicBrainz metadata for this song, when available.
         channel_trust: Learned channel trust model, when available.
         config: Active configuration, used for fetch-budget defaults.
+        executor: Optional shared pool. A batch passes one in so that a song does
+            not build (and tear down) a fresh pool for every source it queries.
+        cache: Set False to bypass the on-disk candidate cache.
 
     Returns:
         A unified, deduplicated list of candidate dictionaries.
@@ -468,29 +555,69 @@ def search_all_sources(
         canonical_song = mb_data.get("title") or None
         catalog_album = mb_data.get("album") or None
 
+    known_channels: list[dict] = []
+    if channel_trust is not None and "youtube" in active_sources:
+        known_channels = list(
+            channel_trust.channels_for_artist(artist, cfg.MAX_CHANNEL_SEARCHES) or []
+        )
+
+    store = caches.get("search")
+    if cache and store.enabled:
+        key = store.make_key(
+            "all",
+            artist.lower(),
+            song.lower(),
+            sorted(active_sources),
+            canonical_song or "",
+            catalog_album or "",
+            [str(channel.get("url") or "") for channel in known_channels],
+            int(opts.get("max_results", 0)),
+        )
+        hit = store.get_json(key)
+        if isinstance(hit, list):
+            # Copies: callers annotate and mutate entries in place, and a cached
+            # pool must not be changed by the run that happened to read it.
+            return [dict(entry) for entry in hit if isinstance(entry, dict)]
+
     youtube_queries = build_query_variants(artist, song, "youtube", canonical_song)
+    variant_opts = {
+        **opts,
+        "variant_fanout": cfg.SEARCH_VARIANT_FANOUT,
+    }
 
     def _run_variant_scrape(src: str) -> list[dict]:
         queries = youtube_queries if src == "youtube" else None
-        return search_with_variants(artist, song, src, opts, queries=queries)
+        # Only pass ``executor`` when the pipeline actually supplied one, so a
+        # caller (or a test double) with the historical four-argument signature
+        # keeps working unchanged.
+        extra = {"executor": executor} if executor is not None else {}
+        return search_with_variants(
+            artist, song, src, variant_opts, queries=queries, **extra
+        )
 
-    with ThreadPoolExecutor(max_workers=max(1, len(active_sources))) as executor:
-        futures = {}
+    owned: Optional[ThreadPoolExecutor] = None
+    pool = executor
+    if pool is None:
+        owned = ThreadPoolExecutor(
+            max_workers=max(1, len(active_sources)), thread_name_prefix="ytdl-search-source"
+        )
+        pool = owned
+
+    try:
+        futures: dict[Future, str] = {}
         for src in active_sources:
             if src == "ytmusic_api":
-                futures[executor.submit(search_ytmusic_official, artist, song, opts)] = src
+                futures[pool.submit(search_ytmusic_official, artist, song, opts)] = src
             else:
-                futures[executor.submit(_run_variant_scrape, src)] = src
+                futures[pool.submit(_run_variant_scrape, src)] = src
 
         if "youtube" in active_sources and catalog_album:
             futures[
-                executor.submit(search_ytmusic_album, artist, song, catalog_album, opts)
+                pool.submit(search_ytmusic_album, artist, song, catalog_album, opts)
             ] = "itunes"
 
-        if channel_trust is not None and "youtube" in active_sources:
-            known = channel_trust.channels_for_artist(artist, cfg.MAX_CHANNEL_SEARCHES)
-            if known:
-                futures[executor.submit(search_channel_tabs, song, known, opts)] = "channel"
+        if known_channels:
+            futures[pool.submit(search_channel_tabs, song, known_channels, opts)] = "channel"
 
         for future in as_completed(futures):
             source = futures[future]
@@ -501,8 +628,21 @@ def search_all_sources(
             for result in source_results:
                 result.setdefault("_source", source)
             all_results.extend(source_results)
+    finally:
+        if owned is not None:
+            owned.shutdown(wait=True)
 
-    return _dedup_results(all_results)
+    deduped = _dedup_results(all_results)
+
+    if cache and store.enabled:
+        negative = not deduped
+        store.put_json(
+            key,
+            deduped,
+            cfg.SEARCH_CACHE_NEGATIVE_TTL if negative else cfg.SEARCH_CACHE_TTL,
+        )
+
+    return deduped
 
 
 def print_candidates_table(

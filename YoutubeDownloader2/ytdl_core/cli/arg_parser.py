@@ -149,6 +149,63 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         nargs=2,
         default=[_CONFIG.DEFAULT_DELAY_MIN, _CONFIG.DEFAULT_DELAY_MAX],
+        help=(
+            "Optional extra pause before each song, in seconds. Off by default: "
+            "requests are already paced per service, and only when a budget is "
+            "actually exhausted."
+        ),
+    )
+    p.add_argument(
+        "--kev-timeout",
+        metavar="SECONDS",
+        type=int,
+        default=_CONFIG.DECISION_TIMEOUT_SECONDS,
+        help=(
+            "Per-evaluation timeout for the local decision model. Raise it when the "
+            "server is healthy but slow. A timeout is never retried: a slow answer "
+            "needs more time, not another attempt."
+        ),
+    )
+    p.add_argument(
+        "--decision-questions",
+        metavar="INT",
+        type=int,
+        default=_CONFIG.DECISION_MAX_QUESTIONS,
+        help=(
+            "Question budget per evaluation. Cost scales with questions, so this is "
+            "the knob that actually bounds decision latency."
+        ),
+    )
+    p.add_argument(
+        "--no-pipeline",
+        action="store_true",
+        help=(
+            "Run each song end-to-end in one worker instead of staging search, "
+            "verification, download and tagging separately."
+        ),
+    )
+    p.add_argument(
+        "--stage-workers",
+        metavar="INT",
+        nargs="*",
+        type=int,
+        help=(
+            "Per-stage thread counts, in pipeline order: search verify download "
+            "post. Auto-sized by default (e.g. --stage-workers 12 8 12 6)."
+        ),
+        dest="stage_workers",
+    )
+    p.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Ignore and do not write the on-disk candidate/metadata/cover caches.",
+    )
+    p.add_argument(
+        "--fingerprint-concurrency",
+        metavar="INT",
+        type=int,
+        default=_CONFIG.FP_CONCURRENCY,
+        help="How many 90-second partial downloads may be fingerprinted at once.",
     )
     p.add_argument("--sources", metavar="LIST", default=",".join(_CONFIG.DEFAULT_SOURCES))
     p.add_argument(

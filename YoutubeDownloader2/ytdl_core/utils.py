@@ -1,9 +1,10 @@
 """
-Shared utility helpers: filename sanitisation, formatting, MD5, delay.
+Shared utility helpers: filename sanitisation, formatting, MD5, phrase matching.
 """
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import random
 import re
@@ -88,6 +89,7 @@ def check_ffmpeg(console: "Console") -> None:
         sys.exit(1)
 
 
+@functools.lru_cache(maxsize=8192)
 def normalize_title(title: str) -> str:
     if not title:
         return ""
@@ -119,6 +121,69 @@ def strip_featuring(text: str) -> str:
     return _FEAT_PATTERN.sub("", text).strip()
 
 
+class PhraseMatcher:
+    """Matches a fixed phrase set against arbitrary text.
+
+    The phrase sets here are module-level constants -- 55 forbidden terms, 14 soft
+    terms, 5 live terms -- but they were being normalised *per candidate, per
+    call*: ranking forty candidates re-normalised every constant five times over.
+    ``normalize_title`` is not cheap (NFKD decomposition, a regex pass, a split),
+    so that was several thousand redundant normalisations per song.
+
+    Normalising the constants once and collapsing the whole set into a single
+    alternation turns the check into one C-level scan of the text.
+
+    Matching is word-boundary based, and deliberately so: bare "hora" or
+    "version" would reject legitimate Spanish titles.
+    """
+
+    __slots__ = ("_mapping", "_pattern")
+
+    def __init__(self, phrases: Collection[str]) -> None:
+        mapping: dict[str, str] = {}
+        for phrase in phrases:
+            normalized = normalize_title(phrase)
+            if normalized:
+                mapping.setdefault(normalized, phrase)
+        self._mapping = mapping
+        if mapping:
+            # " a " and " b c " as one alternation over a space-padded haystack is
+            # exactly the old substring-per-phrase behaviour, in a single pass.
+            alternatives = "|".join(re.escape(f" {normalized} ") for normalized in mapping)
+            self._pattern: re.Pattern[str] | None = re.compile(alternatives)
+        else:
+            self._pattern = None
+
+    def find(self, text: str) -> set[str]:
+        """Return the original phrases of this set that *text* contains."""
+        if self._pattern is None:
+            return set()
+        padded = f" {normalize_title(text)} "
+        found: set[str] = set()
+        for match in self._pattern.finditer(padded):
+            original = self._mapping.get(match.group(0).strip())
+            if original is not None:
+                found.add(original)
+        return found
+
+    def __bool__(self) -> bool:
+        return self._pattern is not None
+
+
+@functools.lru_cache(maxsize=64)
+def phrase_matcher(phrases: frozenset[str]) -> PhraseMatcher:
+    """A :class:`PhraseMatcher` for *phrases*, built once per distinct set.
+
+    The arguments are the frozen term sets from ``config``, so the cache has one
+    entry per set rather than one per candidate.
+    """
+    return PhraseMatcher(phrases)
+
+
 def find_forbidden_phrases(text: str, forbidden: Collection[str]) -> set[str]:
-    normalized = f" {normalize_title(text)} "
-    return {phrase for phrase in forbidden if f" {normalize_title(phrase)} " in normalized}
+    """Which of *forbidden* appear in *text*, as whole words.
+
+    Prefer :func:`phrase_matcher` on a frozen set when matching repeatedly; this
+    form rebuilds the matcher, which is fine for a one-off call.
+    """
+    return phrase_matcher(frozenset(forbidden)).find(text)
