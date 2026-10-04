@@ -7,7 +7,9 @@ and reuse outside the main class.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -23,6 +25,10 @@ from .cache import caches
 from .config import Config
 from .ratelimit import CircuitBreaker, full_jitter_backoff, is_rate_limit_error, limiters
 
+
+def shutil_which(command: str) -> str | None:
+    return shutil.which(command)
+
 # AcoustID's free tier allows three requests per second, process-wide. pyacoustid
 # ships its own limiter for the same rule; two limiters on one budget means two
 # locks, two queues and no clearer picture of what is actually being spent, so we
@@ -32,6 +38,65 @@ try:  # pragma: no cover - depends on the installed pyacoustid version
     acoustid.REQUEST_INTERVAL = 0
 except Exception:  # pragma: no cover
     pass
+
+
+def find_fpcalc() -> str | None:
+    """Locate the Chromaprint ``fpcalc`` binary, or None.
+
+    Checks ``PATH`` first, then the directories a checkout would plausibly have
+    dropped the binary in. The second check is not a convenience: a bundled
+    ``fpcalc.exe`` sitting in the project root is invisible to ``shutil.which``,
+    so without it the whole verification stage silently disables itself. That
+    failure is invisible by construction -- there is no AcoustID key to be
+    refused, no fingerprint cache to miss, and every result still comes back
+    "downloaded" -- and it took the learned channel-trust model down with it,
+    since ``fingerprint_verified`` was never set, so its verified multiplier never
+    fired either.
+
+    Resolved to an absolute path. On Windows ``shutil.which`` answers with a
+    *relative* name when the binary happens to sit in the current directory, and
+    pyacoustid hands whatever it gets straight to ``subprocess`` -- so a path that
+    works from one directory and silently breaks from another is not a path.
+    """
+    found = shutil_which("fpcalc")
+    if found and os.path.isfile(found):
+        return str(Path(found).resolve())
+    package_root = Path(__file__).resolve().parent
+    roots = (package_root, package_root.parent, package_root.parent / "tools")
+    names = ("fpcalc.exe", "fpcalc") if os.name == "nt" else ("fpcalc",)
+    for root in roots:
+        for name in names:
+            candidate = root / name
+            try:
+                if candidate.is_file():
+                    return str(candidate.resolve())
+            except OSError:
+                continue
+    return None
+
+
+_fpcalc_command: str | None = None
+
+
+def configure_fpcalc() -> str | None:
+    """Point pyacoustid at the discovered ``fpcalc``, once. Returns it or None.
+
+    Finding the binary is only half the job. pyacoustid picks its backend at
+    import time from whether the ``chromaprint`` C extension loaded -- and in this
+    environment it does not, so it falls back to ``audioread``, a pure-Python FFT
+    that is orders of magnitude slower on a 90-second clip and less accurate.
+    ``acoustid.FPCALC_COMMAND`` is the library's own seam for choosing the
+    command-line tool, and ``match(..., force_fpcalc=True)`` is the flag that
+    actually selects that path; without both, a working fpcalc on disk is still
+    never used.
+    """
+    global _fpcalc_command
+    if _fpcalc_command is None:
+        found = find_fpcalc()
+        _fpcalc_command = found or ""
+        if found:
+            acoustid.FPCALC_COMMAND = found
+    return _fpcalc_command or None
 
 
 def acoustid_bucket(config: Optional[Config] = None):
@@ -214,6 +279,11 @@ def verify_fingerprint(
     if not circuit_breaker.allow():
         return False, 0.0, "circuit_breaker_open"
 
+    # Use the command-line tool when we have it. pyacoustid would otherwise pick
+    # its pure-Python audioread backend, because the chromaprint C extension is
+    # absent, and pay an FFT in Python for every 90-second clip.
+    fpcalc = configure_fpcalc()
+
     bucket = acoustid_bucket(config)
     max_retries = 3
 
@@ -223,7 +293,14 @@ def verify_fingerprint(
             # at full speed instead of waiting behind the rate limit.
             bucket.acquire()
 
-            results = list(acoustid.match(acoustid_key, str(partial_path), meta="recordings"))
+            results = list(
+                acoustid.match(
+                    acoustid_key,
+                    str(partial_path),
+                    meta="recordings",
+                    force_fpcalc=bool(fpcalc),
+                )
+            )
             circuit_breaker.record_success()
             return _score_matches(results, artist, song, config, on_info)
 
@@ -290,6 +367,18 @@ def has_excessive_silence(file_path: Path, config: Config) -> tuple[bool, float]
             "1",
             "-i",
             str(file_path),
+            # Decimate before filtering. Deciding whether a passage is quieter
+            # than -50 dB does not need 44.1 kHz stereo: ffmpeg resamples once,
+            # the filter then works on ~1/11th of the samples, and the whole
+            # decode gets correspondingly cheaper. This is a second full pass
+            # over an already-encoded file -- the audio was decoded once already
+            # to produce it -- so its cost is pure overhead, and it was the
+            # largest single item in the post-download stage.
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            str(config.SILENCE_DETECT_SAMPLE_RATE),
             "-af",
             f"silencedetect=noise={thresh_db}dB:d={min_dur_sec}",
             "-f",
@@ -306,12 +395,13 @@ def has_excessive_silence(file_path: Path, config: Config) -> tuple[bool, float]
             check=False,
         )
 
-        silences = [
-            float(match) for match in re.findall(r"silence_duration: ([\d\.]+)", res.stderr)
-        ]
+        # ffmpeg writes progress to one long stderr stream; scanning it for the
+        # two patterns we need is cheaper than splitting every line into a list
+        # and matching each one.
+        silences = [float(m) for m in re.findall(r"silence_duration: ([\d.]+)", res.stderr)]
         total_silence_sec = sum(silences)
 
-        dur_match = re.search(r"Duration: (\d{2}):(\d{2}):([\d\.]+)", res.stderr)
+        dur_match = re.search(r"Duration: (\d{2}):(\d{2}):([\d.]+)", res.stderr)
         if not dur_match:
             return False, 0.0
 

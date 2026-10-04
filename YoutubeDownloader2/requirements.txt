@@ -18,3 +18,14 @@ standard-chunk==3.13.0
 standard-sunau==3.13.0
 urllib3==2.6.3
 yt-dlp==2026.3.17
+# search.py imports this in a try/except, so a missing entry does not fail the
+# install -- it silently drops the YouTube Music catalogue source and
+# search_ytmusic_album, the exact-match label lookup. Pinned here so the frozen
+# list matches what the code actually needs.
+ytmusicapi==1.12.0
+# NOT listed on purpose: torch.
+# The decision model runs in its own uv-managed environment under
+# ~/.cache/ytdl/kev (see kev_server.py), installed with a CUDA-specific build for
+# the local GPU. Nothing in ytdl_core imports torch, and a copy in this
+# environment is a few hundred megabytes that also warns on import because numpy
+# is absent.

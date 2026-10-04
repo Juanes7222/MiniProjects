@@ -1,3 +1,12 @@
+"""Supervision of a local Kev System One server.
+
+Kev is a decision model: it reads one state and a set of typed questions about
+it and returns a calibrated probability distribution, in a single forward pass and
+without generating text. It is fast, but only if it is allowed to be. Three
+things in this module exist purely to stop the server being started in a way
+that quietly throws that away, and a fourth to notice when it happens anyway.
+"""
+
 from __future__ import annotations
 
 import os
@@ -11,6 +20,19 @@ from urllib.parse import urlparse
 
 import requests
 
+# The fused kernels are pinned by kev itself and this must match it exactly:
+# kev.fused_qwen35 refuses any other release rather than tolerating it.
+FLA_VERSION = "0.5.2"
+
+# flash-linear-attention is only installed in the *Kev* environment, never in the
+# application's. The application's own interpreter has no business carrying a
+# multi-gigabyte CUDA stack it never imports, and the two resolve differently.
+#
+# Triton is the other half and the awkward one: it is not distributed for Windows
+# on PyPI, and its binaries are compiled against a specific libtorch, so the
+# series has to track the torch build rather than being taken latest.
+_TRITON_WINDOWS_SERIES = {(2, 7): "3.3", (2, 8): "3.4", (2, 9): "3.5"}
+
 
 class KevServerError(RuntimeError):
     pass
@@ -20,11 +42,12 @@ class KevServerManager:
     def __init__(
         self,
         root: Path,
-        run: str = "jaredpalmer/kev-4b",
+        run: str = "jaredpalmer/kev-4b@v1.0",
         url: str = "http://127.0.0.1:8009",
         port: int = 8009,
         startup_timeout: int = 900,
         update: bool = True,
+        insist_fused: bool | None = None,
         on_step: Callable[[str], None] | None = None,
     ) -> None:
         self.root = root.expanduser()
@@ -33,6 +56,9 @@ class KevServerManager:
         self.port = port
         self.startup_timeout = startup_timeout
         self.update = update
+        # True = use the fused kernels without probing, False = decline them
+        # without probing, None = let the probe decide.
+        self.insist_fused = insist_fused
         self.on_step = on_step or (lambda message: None)
         self.process: subprocess.Popen | None = None
         self.log_file: TextIO | None = None
@@ -41,6 +67,10 @@ class KevServerManager:
         # Detected during _sync_environment, reused by _verify_cuda so the
         # hardware is only ever probed once per start.
         self._gpu_name: str | None = None
+        # Whether the fused Qwen3.5 kernels actually *run* here. Tri-state on
+        # purpose: None = not decided yet, True/False = measured. See
+        # _install_fused_kernels.
+        self._fusable: bool | None = None
 
     def start(self) -> str:
         if not self._is_local_url():
@@ -54,6 +84,7 @@ class KevServerManager:
             if not self._server_uses_cuda(info):
                 raise KevServerError("A Kev server is already running, but it is not using CUDA")
             self._step("Kev: CUDA server is already available; reusing it")
+            self._report_capabilities()
             return self.url
 
         self._ensure_repository()
@@ -63,8 +94,9 @@ class KevServerManager:
         self._start_process()
         self._install_termination_handler()
         self._wait_until_ready()
-        # Up is not the same as usable at batch speed; find out now, not from a
-        # thousand identical timeouts.
+        # Up is not the same as usable at batch speed, and neither is the same as
+        # running the fast path. Find out now, not from a thousand timeouts.
+        self._report_capabilities()
         self._report_latency()
         return self.url
 
@@ -110,6 +142,8 @@ class KevServerManager:
             self.log_file = None
         self.process = None
 
+    # -- repository -----------------------------------------------------------
+
     def _ensure_repository(self) -> None:
         if not self.root.exists():
             self.root.parent.mkdir(parents=True, exist_ok=True)
@@ -134,6 +168,11 @@ class KevServerManager:
 
         self._step("Kev: checking repository updates")
         self._run(["git", "pull", "--ff-only"], self.root)
+
+    # -- environment ----------------------------------------------------------
+
+    def _venv_python(self) -> Path:
+        return self.root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
     def _nvidia_gpu_name(self) -> str | None:
         """Name of the first NVIDIA GPU, or None. Does not require torch.
@@ -201,9 +240,7 @@ class KevServerManager:
         self._install_cuda_torch()
 
     def _install_cuda_torch(self) -> None:
-        python_path = (
-            self.root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-        )
+        python_path = self._venv_python()
         self._step("Kev: installing CUDA-enabled PyTorch (cu128)")
         # 2.7 is the floor on purpose: it is the first release whose cu128 wheels
         # carry Blackwell (sm_120) kernels, which is what current consumer cards
@@ -224,6 +261,269 @@ class KevServerManager:
             self.root,
             env=self._environment(),
         )
+        self._install_fused_kernels()
+
+    # -- fused Qwen3.5 kernels ------------------------------------------------
+    #
+    # Every current Kev checkpoint is a Qwen3.5/Qwen3.8 hybrid backbone whose
+    # Gated DeltaNet layers are recurrent. kev.serve serves *fused* Triton kernels
+    # for them when flash-linear-attention is importable at exactly the pinned
+    # version -- about a third less GPU time per batch -- and otherwise falls back
+    # to PyTorch's reference layers, printing one banner line.
+    #
+    # "Importable" turns out to be a poor proxy for "runs". On the reference
+    # machine (RTX 5060 Ti, sm_120, Windows, triton-windows) a trivial Triton
+    # kernel launched correctly and the package imported at exactly the pinned
+    # version, and then the fused DeltaNet kernels never returned: the first real
+    # evaluation hung indefinitely while the identical request with fused
+    # declined answered in 2.5 s. An import check cannot see that. So the decision
+    # is made by running a real evaluation under a hard timeout.
+
+    def _installed_torch_version(self) -> tuple[int, int] | None:
+        """``(major, minor)`` of the torch in the Kev venv, or None if unknown."""
+        try:
+            completed = subprocess.run(
+                [str(self._venv_python()), "-c", "import torch;print(torch.__version__)"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        raw = (completed.stdout or "").strip().split("+", 1)[0]
+        parts = raw.split(".")
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            return None
+        return int(parts[0]), int(parts[1])
+
+    def _triton_requirement(self) -> str | None:
+        """The Triton build matching this machine, or None to take the default.
+
+        On Linux the Triton shipped with the cu128 torch build already satisfies
+        fla, so there is nothing to pin. On Windows it does not exist and
+        ``triton-windows`` is the only source, so it has to be matched to the
+        torch version deliberately rather than taken latest.
+        """
+        if os.name != "nt":
+            return None
+        version = self._installed_torch_version()
+        if version is None:
+            return None
+        series = _TRITON_WINDOWS_SERIES.get(version[:2])
+        if series is not None:
+            return f"triton-windows~={series}.0"
+        self._step(
+            f"Kev: torch {version[0]}.{version[1]} has no known triton-windows match; "
+            "installing the latest and verifying the kernel actually answers"
+        )
+        return "triton-windows"
+
+    def _fused_kernel_probe(self) -> tuple[bool, str]:
+        """Whether kev's own fused-kernel precondition holds. Never raises.
+
+        Asks kev the same question its serving path asks, rather than a
+        hand-rolled approximation: only kev's gate decides whether the fused path
+        is taken at all.
+        """
+        script = (
+            "import sys;"
+            f"sys.path.insert(0, {str(self.root)!r});"
+            "from kev.checkpoint import fused_available;"
+            "print('FUSED=' + str(fused_available()))"
+        )
+        try:
+            completed = subprocess.run(
+                [str(self._venv_python()), "-c", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+        output = (completed.stdout or "") + (completed.stderr or "")
+        lines = [line for line in output.splitlines() if line.strip()]
+        if "FUSED=True" in output:
+            return True, lines[-1] if lines else "available"
+        return False, (lines[-1] if lines else "no output")[:200]
+
+    def _probe_fused_latency(self, budget_seconds: float = 120.0) -> bool:
+        """Run one real evaluation with fused forced on; did it answer?
+
+        The only honest test. Uses a throwaway server on its own port so the real
+        one is untouched, runs the request on its own thread under a hard
+        timeout, and kills the server either way. A stall therefore costs
+        ``budget_seconds`` and reports "no", rather than hanging the caller.
+        """
+        probe_port = self.port + 1
+        env = self._environment()
+        env.pop("KEV_FUSED", None)  # ask for fused whatever the current answer is
+        log_path = self.root / "ytdl-kev-fused-probe.log"
+        try:
+            log: Any = log_path.open("a", encoding="utf-8")
+        except OSError:
+            log = subprocess.DEVNULL
+
+        proc: subprocess.Popen | None = None
+        try:
+            proc = subprocess.Popen(
+                [
+                    "uv",
+                    "run",
+                    "--no-sync",
+                    "--extra",
+                    "serve",
+                    "python",
+                    "-m",
+                    "kev.serve",
+                    "--run",
+                    self.run,
+                    "--port",
+                    str(probe_port),
+                ],
+                cwd=self.root,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=env,
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+                ),
+            )
+            base = f"http://127.0.0.1:{probe_port}"
+            deadline = time.monotonic() + self.startup_timeout
+            up = False
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    return False
+                try:
+                    requests.get(f"{base}/v1/models", timeout=3)
+                    up = True
+                    break
+                except requests.RequestException:
+                    time.sleep(3)
+            if not up:
+                return False
+
+            payload = self._probe_payload()
+            answer: list[bool] = []
+
+            def _ask() -> None:
+                try:
+                    response = requests.post(
+                        f"{base}/v1/systemone", json=payload, timeout=budget_seconds
+                    )
+                    answer.append(response.status_code < 500)
+                except Exception:
+                    answer.append(False)
+
+            worker = threading.Thread(target=_ask, daemon=True)
+            worker.start()
+            worker.join(timeout=budget_seconds)
+            return bool(answer) and answer[0]
+        except Exception:
+            return False
+        finally:
+            if proc is not None and proc.poll() is None:
+                try:
+                    if os.name == "nt":
+                        subprocess.run(
+                            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                            capture_output=True,
+                            timeout=30,
+                            check=False,
+                        )
+                    else:
+                        proc.terminate()
+                    proc.wait(timeout=15)
+                except Exception:
+                    pass
+            if log is not subprocess.DEVNULL:
+                try:
+                    log.close()
+                except Exception:
+                    pass
+
+    def _install_fused_kernels(self) -> None:
+        """Install flash-linear-attention (and Triton where needed), then prove
+        the fused path answers on this machine.
+
+        Best-effort by design. A missing fused path costs throughput, not
+        correctness -- the model still answers, just slower -- so failing the
+        whole startup over it would trade a performance problem for an
+        availability one. What it must never do is fail *silently*, and it must
+        never accept an import as proof of a working kernel.
+        """
+        if self.insist_fused is True:
+            self._fusable = True
+            self._step("Kev: --kev-fused given; using the fused Qwen3.5 kernels unprobed")
+            return
+        if self.insist_fused is False:
+            self._fusable = False
+            self._step("Kev: --no-kev-fused given; declining the fused Qwen3.5 kernels")
+            return
+
+        available, _detail = self._fused_kernel_probe()
+        if not available:
+            triton_requirement = self._triton_requirement()
+            self._step(
+                f"Kev: installing fused kernels (flash-linear-attention=={FLA_VERSION})"
+            )
+            packages = [f"flash-linear-attention=={FLA_VERSION}"]
+            if triton_requirement:
+                packages.append(triton_requirement)
+            try:
+                self._run(
+                    ["uv", "pip", "install", "--python", str(self._venv_python()), *packages],
+                    self.root,
+                    env=self._environment(),
+                )
+            except KevServerError as exc:
+                self._fusable = False
+                self._step(
+                    f"Kev: fused kernels not installed ({exc}). The model still works, but "
+                    "the Qwen3.5 Gated DeltaNet layers will run PyTorch's slower reference "
+                    "path. Install them manually with: uv pip install --python .venv "
+                    f"flash-linear-attention=={FLA_VERSION}"
+                )
+                return
+            available, _detail = self._fused_kernel_probe()
+
+        if not available:
+            self._fusable = False
+            self._step(
+                "Kev: fused kernels unavailable; the Qwen3.5 Gated DeltaNet layers will "
+                "run PyTorch's slower reference path. Install them with: uv pip install "
+                f"--python .venv flash-linear-attention=={FLA_VERSION}"
+            )
+            return
+
+        # Importable at the pinned version. Now find out whether it runs.
+        self._fusable = True
+        self._step(
+            "Kev: flash-linear-attention present; verifying the fused kernels actually "
+            "answer on this GPU (an import check cannot tell)"
+        )
+        if self._probe_fused_latency():
+            self._step(f"Kev: fused Qwen3.5 kernels verified end-to-end (FLA {FLA_VERSION})")
+            return
+
+        self._fusable = False
+        self._step(
+            "Kev: fused Qwen3.5 kernels are installed but DID NOT ANSWER a real evaluation "
+            "within the probe budget, so they are being declined (KEV_FUSED=0). Some "
+            "Triton/platform combinations import cleanly and then never return. The model "
+            "stays correct and roughly a third slower per batch; pass --kev-fused to insist "
+            "if you know they work here."
+        )
+
+    # -- CUDA verification ----------------------------------------------------
 
     def _cuda_probe(self) -> str:
         return self._run(
@@ -263,15 +563,17 @@ class KevServerManager:
         gpu = next((line[4:] for line in output.splitlines() if line.startswith("GPU=")), "unknown")
         self._step(f"Kev: CUDA detected on {gpu}")
 
+    # -- probes and reporting -------------------------------------------------
+
     def _probe_payload(self) -> dict[str, Any]:
         """A request shaped exactly like a real evaluation.
 
         This has to be built with the same question contract the pipeline uses. An
         earlier version sent an empty ``questions`` dict and reported the latency
         of that as 0.0s -- the server answers a request with nothing to infer
-        instantly, so the probe measured nothing at all and cheerfully reported
-        a healthy server while every real evaluation took minutes. A benchmark
-        that skips the work is worse than no benchmark.
+        instantly, so the probe measured nothing at all and cheerfully reported a
+        healthy server while every real evaluation took minutes. A benchmark that
+        skips the work is worse than no benchmark.
         """
         from . import decision_questions as dq
 
@@ -291,6 +593,85 @@ class KevServerManager:
             "Probe Artist", "Probe Song", candidates, None, dq.TYPESAFE_DIALECT
         )
         return {"state": state, "model": "kev-latest", "questions": questions}
+
+    def _model_card(self) -> dict[str, Any]:
+        """The loaded checkpoint's own description of itself, or {}."""
+        info = self._server_info()
+        if not isinstance(info, dict):
+            return {}
+        models = info.get("models")
+        if isinstance(models, list) and models and isinstance(models[0], dict):
+            return models[0]
+        return {}
+
+    def _report_capabilities(self) -> None:
+        """Report what the server is *actually* doing, from the server itself.
+
+        ``/v1/models`` is the only honest source. The environment we set describes
+        intent; ``cuda_graphs`` being non-null is what the loaded model is really
+        doing. Reporting it is the difference between noticing a silent
+        degradation now and noticing it from a thousand identical timeouts.
+        """
+        card = self._model_card()
+        if not card:
+            self._step("Kev: could not read server capabilities from /v1/models")
+            return
+
+        if card.get("cuda_graphs"):
+            self._step("Kev: CUDA graphs active")
+        else:
+            self._step(
+                "Kev: WARNING -- CUDA graphs are OFF. kev.serve enables them by default "
+                "on CUDA because a serving pass is ~2,000 kernel launches and replaying "
+                "graphs cuts warm latency several-fold (measured here: 3338 ms -> 2470 ms "
+                "per evaluation). Something is setting KEV_CUDA_GRAPHS=0."
+            )
+
+        self._step(
+            f"Kev: serving {card.get('run')} on {card.get('device')} via "
+            f"{card.get('backend')} ({card.get('dtype')}), temperature "
+            f"{card.get('temperature')}"
+        )
+
+        prefix = card.get("prefix_cache")
+        if isinstance(prefix, dict):
+            extra = (
+                f", {prefix.get('oom_retries')} OOM retries"
+                if prefix.get("oom_retries")
+                else ""
+            )
+            self._step(
+                f"Kev: state cache {prefix.get('hits')} hits / {prefix.get('misses')} misses, "
+                f"{prefix.get('cached_states')} states held{extra}"
+            )
+
+        self._report_batching()
+
+        # Whether the fused path is live is *our* decision, not something
+        # /v1/models reports, so it is stated from the decision we made.
+        if self._fusable is False:
+            self._step(
+                "Kev: fused Qwen3.5 kernels DECLINED after a probe (or by flag). The "
+                "Gated DeltaNet layers use PyTorch's reference path, which costs roughly "
+                "a third more GPU time per batch."
+            )
+        elif self._fusable is True:
+            self._step(f"Kev: fused Qwen3.5 kernels active (flash-linear-attention {FLA_VERSION})")
+
+    def _report_batching(self) -> None:
+        """Report whether the server is actually batching concurrent requests.
+
+        Kev drains up to ``MAX_BATCH`` queued requests into one model pass, so
+        several in-flight clients finish sooner in total than one at a time. That
+        only happens if the client sends several at once, which makes this the one
+        number that says whether the GPU is being fed or idling between requests.
+        """
+        batches = self._model_card().get("batches")
+        if isinstance(batches, dict):
+            self._step(
+                f"Kev: {batches.get('count')} model passes for {batches.get('requests')} "
+                f"requests ({batches.get('queued')} queued)"
+            )
 
     def _report_latency(self, budget_seconds: float = 20.0) -> None:
         """Time one real evaluation and warn if the server is too slow to use.
@@ -337,12 +718,18 @@ class KevServerManager:
         if timed_out:
             self._step(
                 f"Kev: TOO SLOW -- one evaluation ({question_count} questions) did not "
-                f"finish within {elapsed:.0f}s. The model is running without its "
-                "compiled kernels (causal_conv1d / flash-linear-attention), which "
-                "transformers reports as 'much slower'. Fix it by installing them "
-                "into the Kev environment: uv pip install --python .venv "
-                "flash-linear-attention[cuda]. Alternatively raise --kev-timeout, "
-                "but at this speed the run will not finish in reasonable time. "
+                f"finish within {elapsed:.0f}s. The cost is the question count, so lower "
+                "--decision-questions first; --kev-timeout raises the ceiling if the "
+                "server is healthy but slow."
+            )
+            if self._fusable is False:
+                self._step(
+                    "Kev: note the fused Qwen3.5 kernels were already probed and declined, "
+                    "so the Qwen3.5 layers are on PyTorch's reference path. On a platform "
+                    f"where flash-linear-attention {FLA_VERSION} does run, that is worth "
+                    "roughly a third of the GPU time; pass --kev-fused to insist on it."
+                )
+            self._step(
                 "Continuing with the heuristic ranking, which remains fully functional."
             )
             return
@@ -354,32 +741,58 @@ class KevServerManager:
             self._step(
                 f"Kev: latency probe was rejected (HTTP {response.status_code}) after "
                 f"{elapsed:.1f}s, so it measured no inference. Treating the model as "
-                "unverified; if real evaluations time out, the kernels are the likely "
-                "cause (uv pip install --python .venv flash-linear-attention[cuda])."
+                "unverified; if real evaluations time out, lower --decision-questions."
             )
             return
 
         if elapsed > budget_seconds:
             self._step(
                 f"Kev: SLOW -- one evaluation ({question_count} questions) took "
-                f"{elapsed:.0f}s (budget {budget_seconds:.0f}s). If every song pays "
-                "this, the run will take hours. Consider --kev-timeout, or run "
-                "without --kev."
+                f"{elapsed:.0f}s (budget {budget_seconds:.0f}s). If every song pays this, "
+                "the run will take hours. Lower --decision-questions, or raise "
+                "--kev-timeout if the server is healthy but slow."
             )
         else:
             self._step(
-                f"Kev: evaluation latency {elapsed:.1f}s for {question_count} "
-                "questions -- within budget"
+                f"Kev: evaluation latency {elapsed:.1f}s for {question_count} questions "
+                "-- within budget"
             )
 
+    # -- lifecycle ------------------------------------------------------------
+
     def _environment(self) -> dict[str, str]:
+        """Environment for the Kev server and its installer.
+
+        ``KEV_CUDA_GRAPHS`` is deliberately **not** set. It is tri-state in
+        ``kev.checkpoint.LoadOptions.from_env`` -- unset means "let kev.serve
+        decide" -- and kev.serve's CUDA default is True, because a serving pass is
+        ~2,000 kernel launches and replaying graphs cuts warm latency
+        several-fold. Measured on the reference machine, enabling it took a
+        31-question evaluation from 3338 ms to 2470 ms. Setting it to "0", as
+        this code used to, threw that away.
+
+        ``KEV_FUSED`` **is** set, to the measured answer rather than a constant.
+        Leaving it unset asks kev.serve to use ``fused_available()``, which is
+        only an import check -- on hardware where the kernels do not run that
+        check passes and the server then hangs on its first real request.
+        :meth:`_probe_fused_latency` runs an actual evaluation under a hard
+        timeout, so "usable" here means "answered", not "imported".
+
+        Both used to be pinned to "0" together, which silently disabled the CUDA
+        graphs win and -- because kev.serve only prints its "fused kernels off"
+        notice when the flag was *unset* -- disabled the warning too.
+        """
         env = os.environ.copy()
         env["UV_TORCH_BACKEND"] = "cu128"
         env["CUDA_VISIBLE_DEVICES"] = "0"
         env["KEV_BACKEND"] = "torch"
         env["KEV_DTYPE"] = "bf16"
-        env["KEV_CUDA_GRAPHS"] = "0"
-        env["KEV_FUSED"] = "0"
+        if self._fusable is False:
+            env["KEV_FUSED"] = "0"
+        else:
+            # Undecided, or the probe said yes. Leaving it unset keeps kev.serve's
+            # own notice visible if the kernels turn out to be missing anyway.
+            env.pop("KEV_FUSED", None)
         return env
 
     def _install_termination_handler(self) -> None:

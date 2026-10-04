@@ -130,7 +130,7 @@ class TestInitialization:
             )
 
     def test_strict_fingerprint_requires_fpcalc(self):
-        with patch("ytdl_core.core.shutil.which", return_value=None):
+        with patch("ytdl_core.core.configure_fpcalc", return_value=None):
             with pytest.raises(RuntimeError, match="requires fpcalc"):
                 MusicDownloader(acoustid_key="KEY", require_fingerprint=True)
 

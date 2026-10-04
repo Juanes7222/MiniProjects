@@ -96,14 +96,14 @@ class TestKevTimeoutHandling:
         minutes of work before the first download.
         """
         classifier = self._classifier()
-        with patch("ytdl_core.kev.requests.post", side_effect=requests.Timeout("slow")) as post:
+        with patch("ytdl_core.kev.requests.Session.post", side_effect=requests.Timeout("slow")) as post:
             with pytest.raises(JevEvaluationError, match="kev-timeout"):
                 classifier._evaluate({}, {})
         assert post.call_count == 1
 
     def test_timeout_is_not_retried_even_with_attempts_available(self):
         classifier = self._classifier(max_attempts=3)
-        with patch("ytdl_core.kev.requests.post", side_effect=requests.Timeout("slow")) as post:
+        with patch("ytdl_core.kev.requests.Session.post", side_effect=requests.Timeout("slow")) as post:
             with pytest.raises(JevEvaluationError):
                 classifier._evaluate({}, {})
         assert post.call_count == 1
@@ -119,14 +119,14 @@ class TestKevTimeoutHandling:
                 return {"answers": {"q": {"noul": 0.9}}}
 
         for _ in range(5):
-            with patch("ytdl_core.kev.requests.post", return_value=Response()):
+            with patch("ytdl_core.kev.requests.Session.post", return_value=Response()):
                 classifier._evaluate({}, {})
         # Would hang here if the slot leaked.
         assert classifier.gate.successes == 5
 
     def test_gives_up_after_repeated_failures_then_stops_calling(self):
         classifier = self._classifier(max_attempts=1)
-        with patch("ytdl_core.kev.requests.post", side_effect=TimeoutError("slow")) as post:
+        with patch("ytdl_core.kev.requests.Session.post", side_effect=TimeoutError("slow")) as post:
             for _ in range(4):
                 with pytest.raises(JevEvaluationError):
                     classifier._evaluate({}, {})
@@ -137,7 +137,7 @@ class TestKevTimeoutHandling:
         import requests
 
         classifier = self._classifier(max_attempts=3)
-        with patch("ytdl_core.kev.requests.post", side_effect=requests.ConnectionError("down")):
+        with patch("ytdl_core.kev.requests.Session.post", side_effect=requests.ConnectionError("down")):
             with pytest.raises(JevEvaluationError, match="unavailable"):
                 classifier._evaluate({}, {})
 
@@ -150,7 +150,7 @@ class TestKevTimeoutHandling:
             def json(self):
                 return {"answers": {"q": {"noul": 0.9}}}
 
-        with patch("ytdl_core.kev.requests.post", return_value=Response()):
+        with patch("ytdl_core.kev.requests.Session.post", return_value=Response()):
             assert classifier._evaluate({}, {}) == {"q": {"noul": 0.9}}
         assert classifier.gate.successes == 1
 
@@ -163,7 +163,7 @@ class TestKevTimeoutHandling:
             def json(self):
                 return {}
 
-        with patch("ytdl_core.kev.requests.post", return_value=Response()) as post:
+        with patch("ytdl_core.kev.requests.Session.post", return_value=Response()) as post:
             with pytest.raises(JevEvaluationError, match="authentication"):
                 classifier._evaluate({}, {})
         assert post.call_count == 1
@@ -180,7 +180,7 @@ class TestKevTimeoutHandling:
 
         slept: list[float] = []
         with (
-            patch("ytdl_core.kev.requests.post", return_value=Response()) as post,
+            patch("ytdl_core.kev.requests.Session.post", return_value=Response()) as post,
             patch("ytdl_core.kev.time.sleep", side_effect=slept.append),
         ):
             with pytest.raises(JevEvaluationError, match="temporarily failed"):
@@ -311,7 +311,7 @@ class TestCoreSurfacesGiveUpOnce:
             config=Config(), events=Recorder(), workers=1, delay=(0, 0), kev_classifier=classifier
         )
 
-        with patch("ytdl_core.kev.requests.post", side_effect=TimeoutError("slow")):
+        with patch("ytdl_core.kev.requests.Session.post", side_effect=TimeoutError("slow")):
             for _ in range(6):
                 try:
                     classifier._evaluate({}, {})

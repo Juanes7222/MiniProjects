@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -657,3 +658,112 @@ def test_evaluate_uses_utf8_for_candidate_text(monkeypatch):
     monkeypatch.setattr("ytdl_core.jev.subprocess.run", fake_run)
 
     assert classifier._evaluate({"text": "♡"}, {}) == {}
+# --- Per-dimension candidate fields -----------------------------------------
+#
+# Every question is prefilled as its own sequence (the shared state plus that
+# question), so a field shipped to a question that cannot use it is paid for once
+# per question per candidate. These lock in the trimming.
+
+
+def _one_candidate() -> dict:
+    return {
+        "title": "Artist - Song (Official Audio) [abc123]",
+        "channel": "Some Channel",
+        "artists": ["Artist"],
+        "duration": 210,
+        "view_count": 987654,
+        "upload_date": "20200101",
+        "album": "An Album",
+        "year": 2020,
+        "genre": "Cumbia",
+        "_source": "youtube",
+        "description": "d" * (dq.DESCRIPTION_LIMIT + 400),
+    }
+
+
+def _questions() -> dict:
+    _state, _states, questions = dq.build_state_and_questions(
+        "Artist",
+        "Song",
+        [_one_candidate(), dict(_one_candidate(), id="x2")],
+        None,
+        dq.TYPESAFE_DIALECT,
+    )
+    return questions
+
+
+def _candidate_in(questions: dict, dimension_key: str) -> dict:
+    return questions[dq.question_id("candidate_0", dimension_key)]["instructions"]["candidate"]
+
+
+def test_each_dimension_only_receives_the_fields_it_declares():
+    questions = _questions()
+    for dimension in dq.DIMENSIONS:
+        assert set(_candidate_in(questions, dimension.key)) == set(dimension.fields), (
+            f"{dimension.key} received {sorted(_candidate_in(questions, dimension.key))}, "
+            f"declared {sorted(dimension.fields)}"
+        )
+
+
+def test_the_key_is_never_trimmed_away():
+    """The key is how an answer is attributed back to its candidate."""
+    questions = _questions()
+    for dimension in dq.DIMENSIONS:
+        assert "key" in dimension.fields
+        assert _candidate_in(questions, dimension.key)["key"] == "candidate_0"
+
+
+def test_the_view_count_reaches_no_dimension():
+    """No criterion in the rubric refers to popularity, and it is a long field."""
+    assert all("view_count" not in dimension.fields for dimension in dq.DIMENSIONS)
+
+
+def test_only_form_reads_the_description():
+    """The description was a fifth of the request; only `form` asks what the upload is."""
+    readers = {d.key for d in dq.DIMENSIONS if "description" in d.fields}
+    assert readers == set(dq.DESCRIPTION_DIMENSIONS) == {"form"}
+
+
+def test_reference_does_not_receive_the_description():
+    """Its criteria are about album, year and genre; nothing else can turn on it."""
+    reference = next(d for d in dq.DIMENSIONS if d.key == "reference")
+    assert "description" not in reference.fields
+    assert {"album", "year", "genre"} <= set(reference.fields)
+
+
+def test_per_dimension_fields_shrink_the_request():
+    """The point of the exercise: less prefill for the same questions."""
+    candidates = [_one_candidate() for _ in range(5)]
+    _state, states, questions = dq.build_state_and_questions(
+        "Artist", "Song", candidates, None, dq.TYPESAFE_DIALECT
+    )
+    untrimmed = {
+        dq.question_id(s["key"], d.key): d.question(dict(s), dq.TYPESAFE_DIALECT.noul)
+        for s in states
+        for d in dq.DIMENSIONS
+    }
+    # Compared over the dimension questions only: the tie-break Choice is built
+    # from candidate labels and is identical either way.
+    trimmed_dims = {
+        key: value for key, value in questions.items() if key in untrimmed
+    }
+    assert len(trimmed_dims) == len(untrimmed) == 5 * len(dq.DIMENSIONS)
+    assert len(questions) == 5 * len(dq.DIMENSIONS) + 1  # plus the Choice
+
+    trimmed_chars = len(json.dumps(trimmed_dims))
+    untrimmed_chars = len(json.dumps(untrimmed))
+    assert trimmed_chars < untrimmed_chars * 0.85, (
+        f"{trimmed_chars} vs {untrimmed_chars}: trimming did not pay"
+    )
+
+
+def test_a_dimension_without_declared_fields_still_gets_everything():
+    """A future dimension must be correct by default, not silently starved."""
+    everything = {"key": "k", "title": "t", "mystery": 1}
+    assert dq._project(everything, ()) == everything
+    assert dq._project(everything, ("key",)) == {"key": "k"}
+
+
+def test_description_cap_is_short_enough_to_matter():
+    """It used to be 1200, all of it shipped on one dimension, per candidate."""
+    assert dq.DESCRIPTION_LIMIT <= 500

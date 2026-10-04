@@ -12,7 +12,6 @@ import os
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-import shutil
 import threading
 import time
 from datetime import datetime, timezone
@@ -30,6 +29,7 @@ from .fingerprint import (
     AcoustIDCircuitBreaker,
     FingerprintCache,
     FingerprintVerdict,
+    configure_fpcalc,
     release_fingerprint_slot,
     verify_fingerprint,
 )
@@ -45,7 +45,8 @@ from .state import load_state, merge_state_detail, save_state, state_detail
 from .statewriter import CoalescingStateWriter
 from .utils import (
     apply_delay,
-    compute_md5,
+    compute_file_hash,
+    file_matches_hash,
     migrate_legacy_audio_path,
     normalize_title,
     sanitize_filename,
@@ -141,9 +142,13 @@ class MusicDownloader:
             raise ValueError("Strict fingerprint verification requires an AcoustID key")
         if require_fingerprint and skip_fingerprint:
             raise ValueError("Strict fingerprint verification cannot be skipped")
-        fpcalc_available = shutil.which("fpcalc") is not None
+        fpcalc_path = configure_fpcalc()
+        fpcalc_available = fpcalc_path is not None
         if require_fingerprint and not fpcalc_available:
-            raise RuntimeError("Strict fingerprint verification requires fpcalc on PATH")
+            raise RuntimeError(
+                "Strict fingerprint verification requires fpcalc (Chromaprint). "
+                "Install libchromaprint-tools, or point fpcalc onto PATH."
+            )
         if use_jev and use_kev:
             raise ValueError("Jev and Kev cannot be enabled at the same time")
 
@@ -241,9 +246,13 @@ class MusicDownloader:
         # own pool. None keeps the single-song path pool-free.
         self._search_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._alternate_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        # Fire-and-forget album warm-up; see _prime_catalogs.
+        self._catalog_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
         # Set by download_batch so persist() coalesces onto a background writer
         # instead of rewriting the whole file under the shared lock.
         self._state_writer: Optional[CoalescingStateWriter] = None
+        # Items each pipeline stage carried, reported at the end of a batch.
+        self._pipeline_stats: dict[str, int] = {}
 
     # -- shared executors ----------------------------------------------------
 
@@ -258,11 +267,60 @@ class MusicDownloader:
         return pool
 
     def _close_executors(self) -> None:
-        for attribute in ("_alternate_pool", "_search_executor"):
+        for attribute in ("_alternate_pool", "_search_executor", "_catalog_pool"):
             pool = getattr(self, attribute, None)
             if pool is not None:
                 pool.shutdown(wait=False)
                 setattr(self, attribute, None)
+        # The decision provider holds a pooled HTTP session for the run; release
+        # it with the pools so a batch does not leak connections.
+        close = getattr(self.decision_classifier, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    def _report_decision_telemetry(self, writer=None) -> None:
+        """Report what the run actually cost, per stage and per provider.
+
+        Three numbers decide whether a batch was slow: how long the stages took,
+        how many times the decision model was asked, and how long it said each
+        answer took. All three were already being computed --
+        :meth:`StagePipeline.stage_stats`, :class:`DecisionGate` and the server's
+        own ``latency_ms`` -- and none of them were read anywhere outside the
+        tests. Without them, "the run was slow" has no way to become "the search
+        stage was slow", which is the only form of the observation that suggests
+        a fix.
+        """
+        stats = getattr(self, "_pipeline_stats", None)
+        if stats:
+            self.events.on_info("Stage throughput: " + ", ".join(f"{k} {v}" for k, v in stats.items()))
+        writer = writer or self._state_writer
+        # ``write_count`` is a property, not a method: read the value.
+        write_count = getattr(writer, "write_count", None)
+        if isinstance(write_count, int):
+            self.events.on_info(f"State file written {write_count} times (coalesced)")
+        gate = getattr(self.decision_classifier, "gate", None)
+        if gate is not None and (gate.successes or gate.failures):
+            self.events.on_info(
+                f"Decision provider: {gate.successes} answered, {gate.failures} failed"
+            )
+        telemetry = getattr(self.decision_classifier, "telemetry", None)
+        if not callable(telemetry):
+            return
+        try:
+            stats = telemetry()
+        except Exception:
+            return
+        if not stats.get("requests"):
+            return
+        self.events.on_info(
+            f"Decision model: {stats['requests']} evaluations, "
+            f"{stats['tokens']:,} tokens, "
+            f"{stats['mean_latency_ms']:.0f} ms mean / {stats['max_latency_ms']:.0f} ms max, "
+            f"up to {stats['max_in_flight']} in flight"
+        )
 
     def _load_channel_trust(self, state):
         """(Re)build the learned channel trust model from the download state."""
@@ -531,6 +589,7 @@ class MusicDownloader:
                     stop_event=stop,
                 )
                 pipeline.run(jobs)
+                self._pipeline_stats = pipeline.stage_stats()
         except KeyboardInterrupt:
             stop.set()
             self.events.on_interrupted(len(all_results), len(pairs), time.monotonic() - start)
@@ -539,6 +598,7 @@ class MusicDownloader:
             # as soon as download_batch returns.
             writer.flush()
             writer.close()
+            self._report_decision_telemetry(writer)
             self._state_writer = None
             self._close_executors()
 
@@ -553,11 +613,20 @@ class MusicDownloader:
         return ordered
 
     def _prime_catalogs(self, jobs: list["_SongJob"]) -> None:
-        """Load each artist's album before its songs start searching.
+        """Start loading each artist's album without waiting for any of them.
 
         One throttled catalogue lookup per artist, overlapping with other artists'
         work, instead of one per song sitting on a single song's critical path.
         Only worth doing when the song list actually names several artists.
+
+        Deliberately not waited on. MusicBrainz allows one request per second
+        process-wide, so priming N artists costs about N seconds -- and this used
+        to be a barrier: every artist was submitted and then *all* of them joined
+        before the pipeline was allowed to start, so a ten-artist batch spent ten
+        seconds doing nothing at all before the first song moved. Firing the
+        lookups and returning immediately overlaps that wait with real work, and
+        costs nothing when it misses: ``_resolve_catalog`` already falls back to
+        the per-song lookup, and the catalogue is a pure cache in front of it.
         """
         if not self.musicbrainz:
             return
@@ -567,6 +636,8 @@ class MusicDownloader:
         if len(by_artist) < 2:
             return
 
+        workers = min(len(by_artist), max(1, self.workers))
+
         def _prime(artist: str, first_song: str) -> None:
             try:
                 self._catalog.prime(artist, first_song, fetch=fetch_musicbrainz)
@@ -575,21 +646,14 @@ class MusicDownloader:
                 # songs use the per-song lookup they always used.
                 pass
 
-        workers = min(len(by_artist), max(1, self.workers))
-        with concurrent.futures.ThreadPoolExecutor(
+        pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="ytdl-catalog"
-        ) as pool:
-            # Submit every artist first, then collect. Collecting inside a
-            # generator expression would submit-then-immediately-block on each
-            # one in turn, which serialises exactly the work being warmed up.
-            pending = [
-                pool.submit(_prime, artist, songs[0]) for artist, songs in by_artist.items()
-            ]
-            for future in pending:
-                try:
-                    future.result()
-                except Exception:
-                    pass
+        )
+        self._catalog_pool = pool
+        for artist, songs in by_artist.items():
+            pool.submit(_prime, artist, songs[0])
+        # No join. The daemon threads finish whenever they finish; the batch does
+        # not wait for a cache warm-up it can do without.
 
     def download_url(
         self,
@@ -644,6 +708,7 @@ class MusicDownloader:
             youtube_player_clients=list(self.config.YOUTUBE_PLAYER_CLIENTS),
             noplaylist=False,
             for_scan=True,
+            config=self.config,
         )
         try:
             with yt_dlp.YoutubeDL(scan_opts) as ydl:
@@ -740,6 +805,8 @@ class MusicDownloader:
                 noplaylist=True,
                 output_template=target_file.with_suffix(".%(ext)s"),
                 embed_thumbnail=True,
+                config=self.config,
+                on_step=lambda message: self.events.on_info(message),
             )
             if skip_existing and target_file.exists():
                 self.events.on_skip_existing(ia, it, target_file, True)
@@ -893,7 +960,7 @@ class MusicDownloader:
             md5s = existing.get("md5")
             if expected.exists():
                 if md5s:
-                    if compute_md5(expected) == md5s:
+                    if file_matches_hash(expected, md5s):
                         self.events.on_skip_existing(artist, song, expected, True)
                         result.status = "skipped"
                         result.file_path = expected
@@ -1812,7 +1879,7 @@ class MusicDownloader:
             )
             return result
 
-        md5 = compute_md5(downloaded_file)
+        md5 = compute_file_hash(downloaded_file)
         result.status = "downloaded"
         result.file_path = downloaded_file
         result.file_size_bytes = downloaded_file.stat().st_size

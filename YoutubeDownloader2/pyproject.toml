@@ -30,6 +30,12 @@ dependencies = [
     "rapidfuzz>=3.6",
     "pyacoustid>=1.3",
     "pydub>=0.25",
+    # Not optional. search.py imports this in a try/except, so a clean install
+    # without it does not fail -- it silently loses both the YouTube Music
+    # catalogue source and search_ytmusic_album, which is the exact-match
+    # label lookup worth CATALOG_SOURCE_BONUS. The tests mock the module, so
+    # nothing else noticed.
+    "ytmusicapi>=1.8",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +48,9 @@ dev = [
     "pytest-cov",
     "ruff",
     "mypy",
+    # Needed for type checking to see the libraries this project calls, and
+    # incidentally for running the suite at all.
+    "pytest-asyncio>=0.23",
 ]
 
 [project.scripts]
@@ -64,5 +73,7 @@ target-version = "py311"
 [tool.mypy]
 python_version = "3.11"
 strict = false
+# Was `no_site_packages = true`, which made every third-party import resolve to
+# Any -- yt_dlp, rich and mutagen included -- so the check could not report a
+# single thing about the code that actually calls them.
 ignore_missing_imports = true
-no_site_packages = true

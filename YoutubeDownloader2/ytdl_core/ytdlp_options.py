@@ -7,6 +7,7 @@ tested and reused independently of the main class.
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -47,13 +48,37 @@ def _retry_counts(for_scan: bool, config: Optional[Config] = None) -> dict[str, 
     }
 
 
+def find_aria2c() -> str | None:
+    """Locate the ``aria2c`` binary, or None. Absolute path, like ``find_fpcalc``.
+
+    yt-dlp drives it as an external downloader, and it is the one thing in this
+    pipeline that is neither Python nor an ffmpeg subprocess: a native
+    multi-connection downloader. Given the same file it will use several
+    connections where yt-dlp uses one, which is the whole difference between
+    saturating a line and not.
+    """
+    found = shutil.which("aria2c")
+    if found and os.path.isfile(found):
+        return str(Path(found).resolve())
+    package_root = Path(__file__).resolve().parent
+    for root in (package_root, package_root.parent, package_root.parent / "tools"):
+        for name in ("aria2c.exe", "aria2c"):
+            candidate = root / name
+            try:
+                if candidate.is_file():
+                    return str(candidate.resolve())
+            except OSError:
+                continue
+    return None
+
+
 def apply_request_shaping(
     ydl_opts: dict[str, Any],
     config: Optional[Config] = None,
     *,
     for_scan: bool = False,
 ) -> dict[str, Any]:
-    """Apply shared retry and politeness settings to a yt-dlp options dict.
+    """Apply shared retry, politeness and download-width settings.
 
     ``sleep_interval_requests`` lets yt-dlp pace itself between extraction
     requests, with jitter, and only when it needs to. That is strictly better
@@ -72,6 +97,13 @@ def apply_request_shaping(
         ydl_opts["sleep_interval_requests"] = cfg.SLEEP_INTERVAL_REQUESTS
     if cfg.MAX_SLEEP_INTERVAL > 0:
         ydl_opts["max_sleep_interval"] = cfg.MAX_SLEEP_INTERVAL
+    # DASH audio arrives as many small fragments. yt-dlp defaults to one at a
+    # time, so a single song used one connection no matter how much bandwidth
+    # was available; several at once is the cheapest throughput win here and it
+    # costs no extra CPU. Fragment *retries* are left at the count set above.
+    fragments = int(getattr(cfg, "FRAGMENT_CONCURRENCY", 0) or 0)
+    if fragments > 1 and not for_scan:
+        ydl_opts["concurrent_fragment_downloads"] = fragments
     return ydl_opts
 
 
@@ -95,6 +127,7 @@ def build_ytdlp_base_opts(
     output_template: str | Path | None = None,
     embed_thumbnail: bool = True,
     config: Config | None = None,
+    on_step: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """
     Build the base yt-dlp options dictionary used by both scan and download passes.
@@ -173,6 +206,24 @@ def build_ytdlp_base_opts(
                 },
                 {"key": "FFmpegMetadata"},
             ]
+            # One thread per transcode.
+            #
+            # ffmpeg defaults to one thread per core, and this runs in the stage
+            # pool alongside every other ffmpeg in the batch: N concurrent songs
+            # meant N transcodes each grabbing all six cores. That does not make
+            # any of them finish sooner -- the encode is not the bottleneck -- it
+            # just makes them all finish later, and it starves the silence checks
+            # running beside them. The pipeline already sizes that stage at about
+            # one worker per core, which only holds if each worker uses about one
+            # core.
+            #
+            # This is a *top-level* option keyed by postprocessor name, not a key
+            # inside the postprocessor dict: yt-dlp passes the dict straight to
+            # the postprocessor's constructor, so an unrecognised key there is a
+            # TypeError that fails every download.
+            ydl_opts["postprocessor_args"] = {
+                "ExtractAudio+ffmpeg": ["-threads", "1"],
+            }
         if embed_thumbnail:
             ydl_opts["postprocessors"].append(
                 {"key": "EmbedThumbnail", "already_have_thumbnail": False}
@@ -202,6 +253,19 @@ def build_ytdlp_base_opts(
                 "player_client": list(youtube_player_clients),
             }
         }
+
+    # aria2c, when it is there. Opt-in because an external downloader changes how
+    # ranges and retries behave, but it is the difference between one connection
+    # and several for the same file, and the binary already ships in the repo.
+    if getattr(config or DEFAULT_CONFIG, "USE_ARIA2C", False) and not for_scan:
+        aria2c = find_aria2c()
+        if aria2c:
+            ydl_opts["external_downloader"] = {"http_dash_manifest": aria2c, "default": aria2c}
+            ydl_opts["external_downloader_args"] = {
+                "default": ["-x", "8", "-s", "8", "-k", "1M", "--console-log-level=warn"]
+            }
+        elif callable(on_step):
+            on_step("aria2c requested but not found; falling back to yt-dlp's own downloader")
 
     node_path = shutil.which("node")
     if node_path:

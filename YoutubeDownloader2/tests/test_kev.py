@@ -29,23 +29,28 @@ def _answers(choice: dict[str, float] | None = None) -> dict:
 
 class _Response:
     status_code = 200
+    headers: dict = {}
 
     def __init__(self, answers: dict) -> None:
         self._answers = answers
 
     def json(self):
-        return {"answers": self._answers}
+        return {
+            "answers": self._answers,
+            "latency_ms": 41.5,
+            "usage": {"input_tokens": 101, "output_tokens": 161},
+        }
 
 
 def test_kev_uses_local_systemone_api(monkeypatch):
     classifier = KevClassifier(model="kev-4b", threshold=0.60)
     captured = {}
 
-    def fake_post(url, json, timeout):
+    def fake_post(_session, url, json, timeout):
         captured.update({"url": url, "json": json, "timeout": timeout})
         return _Response(_answers({"candidate_0": 0.9, "candidate_1": 0.1}))
 
-    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(requests.Session, "post", fake_post)
     selected, ranked = classifier.select(
         "Artist",
         "Song",
@@ -72,11 +77,11 @@ def test_kev_sends_the_same_question_contract_as_jev(monkeypatch):
     """Kev is transport only: the payload must come from decision_questions."""
     captured = {}
 
-    def fake_post(url, json, timeout):
+    def fake_post(_session, url, json, timeout):
         captured.update(json)
         return _Response(_answers())
 
-    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(requests.Session, "post", fake_post)
     classifier = KevClassifier(threshold=0.60)
     classifier.select(
         "Artist",
@@ -101,11 +106,11 @@ def test_kev_sends_the_same_question_contract_as_jev(monkeypatch):
 def test_kev_does_not_restate_the_prompt(monkeypatch):
     captured = {}
 
-    def fake_post(url, json, timeout):
+    def fake_post(_session, url, json, timeout):
         captured.update(json)
         return _Response(_answers())
 
-    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(requests.Session, "post", fake_post)
     KevClassifier().select(
         "Artist",
         "Song",
@@ -120,10 +125,10 @@ def test_kev_does_not_restate_the_prompt(monkeypatch):
 def test_kev_connection_error_is_actionable(monkeypatch):
     classifier = KevClassifier(url="http://127.0.0.1:9000")
 
-    def fake_post(*args, **kwargs):
+    def fake_post(_session, *args, **kwargs):
         raise requests.ConnectionError("connection refused")
 
-    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(requests.Session, "post", fake_post)
 
     with pytest.raises(JevEvaluationError, match="server is unavailable"):
         classifier.select(
@@ -148,15 +153,16 @@ def test_kev_retries_on_server_error(monkeypatch):
     class Flaky:
         def __init__(self, status: int) -> None:
             self.status_code = status
+            self.headers: dict = {}
 
         def json(self):
             return {"answers": _answers()}
 
-    def fake_post(url, json, timeout):
+    def fake_post(_session, url, json, timeout):
         calls["n"] += 1
         return Flaky(next(statuses))
 
-    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(requests.Session, "post", fake_post)
     monkeypatch.setattr("ytdl_core.kev.time.sleep", lambda *_: None)
 
     classifier = KevClassifier(threshold=0.60)

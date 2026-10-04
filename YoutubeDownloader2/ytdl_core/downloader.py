@@ -119,6 +119,11 @@ def execute_download(
         noplaylist=True,
         output_template=output_template,
         embed_thumbnail=False,
+        # Without this the builder falls back to module-level defaults, so every
+        # config override -- fragment concurrency, aria2c, retry counts -- would
+        # be silently ignored for the one call that actually downloads the file.
+        config=config,
+        on_step=lambda message: events.on_info(message),
     )
 
     downloaded_file: Optional[Path] = None

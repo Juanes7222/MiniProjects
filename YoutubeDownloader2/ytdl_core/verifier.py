@@ -14,7 +14,13 @@ from .fingerprint import AcoustIDCircuitBreaker, verify_duration, verify_fingerp
 from .metadata import fetch_musicbrainz
 from .result import DownloadResult
 from .state import VERIFY_UNKNOWN_FIELDS
-from .utils import apply_delay, compute_md5, migrate_legacy_audio_path, sanitize_filename
+from .utils import (
+    apply_delay,
+    compute_file_hash,
+    file_matches_hash,
+    migrate_legacy_audio_path,
+    sanitize_filename,
+)
 
 _MIN_FILE_SIZE = 50 * 1024
 _FINGERPRINT_ERRORS = frozenset(
@@ -181,9 +187,9 @@ def _restore_cached_result(
         stored_md5 = entry_state.get("md5")
         if not stored_md5:
             return None
-        current_md5 = compute_md5(file_path)
-        if current_md5 != stored_md5:
+        if not file_matches_hash(file_path, stored_md5):
             return None
+        current_md5 = stored_md5
     except OSError:
         return None
 
@@ -328,11 +334,13 @@ def verify_library(
                         continue
                     with state_lock:
                         existing = dict(state.get("downloads", {}).get(key, {}))
-                    current_md5 = (
-                        compute_md5(Path(result.file_path))
-                        if result.file_path and Path(result.file_path).is_file()
-                        else existing.get("md5")
-                    )
+                    # Reuse the digest when the entry was restored from the state
+                    # file: that path already proved the file hashes to it, and
+                    # hashing a full track again is one of the more expensive
+                    # things a verify pass does per song.
+                    current_md5 = existing.get("md5")
+                    if not current_md5 and result.file_path and Path(result.file_path).is_file():
+                        current_md5 = compute_file_hash(Path(result.file_path))
                     persistence_options: dict[str, Any] = {
                         "fingerprint_verified": result.fingerprint_verified,
                         "fingerprint_confidence": result.fingerprint_confidence,

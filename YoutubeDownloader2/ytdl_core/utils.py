@@ -55,13 +55,74 @@ def format_size(nbytes: int) -> str:
     return f"{nbytes:.1f} TB"
 
 
+#: Digest used to detect that a file on disk is not the file we wrote.
+#:
+#: blake2b rather than md5 because this is change detection, not security: no
+#: current x86 has MD5 hardware acceleration, while blake2b is consistently
+#: faster in software, and the whole file is re-read on the skip-existing path and
+#: twice more during a verify pass.
+HASH_ALGORITHM = "blake2b"
+
+#: Read size for hashing. The old 64 KB meant ~250 syscalls for a 16 MB track,
+#: which is call overhead rather than I/O.
+HASH_CHUNK_BYTES = 1 << 20
+
+
+def compute_file_hash(path: Path, algorithm: str = HASH_ALGORITHM) -> str:
+    """Digest *path*, tagged with the algorithm that produced it.
+
+    The tag is what makes the switch safe. Deltas recorded by older versions are
+    bare MD5 hex with nothing to distinguish them from a digest of the same
+    length, so an untagged value is read as MD5 and re-checked with MD5; a tagged
+    value is re-checked with the algorithm it names. Without that, switching the
+    algorithm would silently mark every already-downloaded file as changed and
+    re-download the whole library.
+    """
+    digest = hashlib.new(algorithm)
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(HASH_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return f"{algorithm}:{digest.hexdigest()}"
+
+
+def parse_stored_hash(stored: str | None) -> tuple[str, str]:
+    """Split a stored digest into ``(algorithm, hex)``. Untagged means MD5."""
+    if not stored:
+        return HASH_ALGORITHM, ""
+    algorithm, separator, value = stored.partition(":")
+    if separator and algorithm in hashlib.algorithms_available and value:
+        return algorithm, value
+    return "md5", stored
+
+
 def compute_md5(path: Path) -> str:
-    """Compute the MD5 hex-digest of a file."""
-    h = hashlib.md5()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    """Compute the plain MD5 hex-digest of a file. Legacy only.
+
+    Kept for re-checking digests recorded before the algorithm switch; new
+    records go through :func:`compute_file_hash`.
+    """
+    digest = hashlib.md5()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(HASH_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_matches_hash(path: Path, stored: str | None) -> bool:
+    """Whether *path* still hashes to *stored*, using the algorithm *stored* names.
+
+    Compares the hex rather than the stored string: a legacy entry is bare MD5
+    while :func:`compute_file_hash` always returns a tagged value, so comparing
+    the two whole strings would report every pre-existing library as changed.
+    """
+    algorithm, expected = parse_stored_hash(stored)
+    if not expected:
+        return False
+    try:
+        _tagged, actual = compute_file_hash(path, algorithm).split(":", 1)
+    except (OSError, ValueError):
+        return False
+    return actual == expected
 
 
 def apply_delay(min_s: float, max_s: float) -> None:

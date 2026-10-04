@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import quote_plus
 
@@ -427,7 +427,7 @@ def search_ytmusic_album(artist: str, song: str, album: str, opts: dict) -> list
 
     target = normalize_title(strip_featuring(song))
     best_entry = None
-    best_ratio = 0
+    best_ratio = 0.0
     for album_result in albums or []:
         browse_id = album_result.get("browseId")
         if not browse_id:
@@ -604,23 +604,36 @@ def search_all_sources(
         pool = owned
 
     try:
-        futures: dict[Future, str] = {}
+        futures: list[tuple[str, Future]] = []
         for src in active_sources:
             if src == "ytmusic_api":
-                futures[pool.submit(search_ytmusic_official, artist, song, opts)] = src
+                futures.append((src, pool.submit(search_ytmusic_official, artist, song, opts)))
             else:
-                futures[pool.submit(_run_variant_scrape, src)] = src
+                futures.append((src, pool.submit(_run_variant_scrape, src)))
 
         if "youtube" in active_sources and catalog_album:
-            futures[
-                pool.submit(search_ytmusic_album, artist, song, catalog_album, opts)
-            ] = "itunes"
+            futures.append(
+                (
+                    "itunes",
+                    pool.submit(search_ytmusic_album, artist, song, catalog_album, opts),
+                )
+            )
 
         if known_channels:
-            futures[pool.submit(search_channel_tabs, song, known_channels, opts)] = "channel"
+            futures.append(("channel", pool.submit(search_channel_tabs, song, known_channels, opts)))
 
-        for future in as_completed(futures):
-            source = futures[future]
+        # Collected in submission order, not completion order.
+        #
+        # Every step downstream depends on this being stable. ``_dedup_results``
+        # keeps the *first* occurrence of a duplicated id, and which source is
+        # first decides whether the entry is promoted to the catalogue fast path;
+        # ``rank_results`` then breaks score ties with a stable sort, so equal
+        # candidates are ordered by their position in this list. Handing that list
+        # over in whatever order the network happened to reply in makes the winner
+        # depend on latency -- the same song can select a different upload on two
+        # runs over identical input, which is exactly what
+        # ``search_with_variants`` goes to some trouble to prevent one level down.
+        for source, future in futures:
             try:
                 source_results = future.result()
             except Exception:

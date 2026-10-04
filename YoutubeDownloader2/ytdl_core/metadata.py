@@ -407,7 +407,7 @@ class CatalogContext:
             return None
 
         best: Optional[dict] = None
-        best_ratio = 0
+        best_ratio = 0.0
         for track in release.get("tracks") or []:
             ratio = fuzz.token_set_ratio(target, normalize_title(strip_featuring(track["title"])))
             if ratio > best_ratio:

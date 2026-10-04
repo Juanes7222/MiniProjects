@@ -177,6 +177,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--decision-in-flight",
+        metavar="INT",
+        type=int,
+        default=_CONFIG.DECISION_MAX_IN_FLIGHT,
+        help=(
+            "How many decision evaluations may be in flight at once. kev.serve "
+            "batches up to 64 queued requests into one model pass, so several at "
+            "once finish in roughly one pass instead of N; 1 makes the model "
+            "strictly serial at the cost of throughput. Bounded by VRAM as much as "
+            "by speed (default: %(default)s)."
+        ),
+    )
+    p.add_argument(
         "--no-pipeline",
         action="store_true",
         help=(
@@ -208,6 +221,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="How many 90-second partial downloads may be fingerprinted at once.",
     )
     p.add_argument("--sources", metavar="LIST", default=",".join(_CONFIG.DEFAULT_SOURCES))
+    p.add_argument(
+        "--use-aria2c",
+        action="store_true",
+        help=(
+            "Hand transfers to aria2c when the binary is available. It is a native "
+            "multi-connection downloader, so the same file arrives over several "
+            "connections instead of one."
+        ),
+    )
+    p.add_argument(
+        "--fragment-concurrency",
+        metavar="INT",
+        type=int,
+        default=_CONFIG.FRAGMENT_CONCURRENCY,
+        help=(
+            "How many DASH fragments to fetch at once per file (default: "
+            "%(default)s). yt-dlp uses 1, which leaves bandwidth idle."
+        ),
+    )
     p.add_argument(
         "--cookies-browser",
         metavar="BROWSER",
@@ -273,8 +305,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--kev-run",
         metavar="CHECKPOINT",
-        default="jaredpalmer/kev-4b",
-        help="Checkpoint to download and serve (default: %(default)s).",
+        default="jaredpalmer/kev-4b@v1.0",
+        help=(
+            "Checkpoint to download and serve. Pinned to @v1.0 so the weights are "
+            "reproducible; an unpinned name tracks the branch (default: %(default)s)."
+        ),
     )
     p.add_argument(
         "--kev-dir",
@@ -301,6 +336,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--kev-skip-update",
         action="store_true",
         help="Do not pull the latest Kev repository changes.",
+    )
+    fused = p.add_mutually_exclusive_group()
+    fused.add_argument(
+        "--kev-fused",
+        dest="kev_fused",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Insist on Kev's fused Qwen3.5 kernels without probing. They are worth "
+            "about a third of the GPU time per batch, but some Triton/platform "
+            "combinations import cleanly and then never return, so the default is to "
+            "prove they answer first."
+        ),
+    )
+    fused.add_argument(
+        "--no-kev-fused",
+        dest="kev_fused",
+        action="store_const",
+        const=False,
+        help="Decline Kev's fused Qwen3.5 kernels without probing.",
     )
     p.add_argument(
         "--kev-threshold",
@@ -488,6 +544,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error(f"--jev-runs must be between 1 and {_CONFIG.JEV_MAX_RUNS}")
     if not 1 <= args.kev_runs <= _CONFIG.JEV_MAX_RUNS:
         p.error(f"--kev-runs must be between 1 and {_CONFIG.JEV_MAX_RUNS}")
+    if args.decision_in_flight < 1:
+        p.error("--decision-in-flight must be at least 1")
     if args.jev and args.url:
         p.error("--jev cannot be used with --url")
     if args.jev and (args.verify or args.repair or args.review):

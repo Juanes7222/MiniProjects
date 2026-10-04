@@ -182,7 +182,7 @@ class TestVerifyLibrary:
         }
 
         with patch("ytdl_core.verifier.verify_duration", return_value=(True, 180)):
-            with patch("ytdl_core.verifier.compute_md5", return_value=md5):
+            with patch("ytdl_core.verifier.file_matches_hash", return_value=True):
                 results = verify_library(
                     {"Artist": ["Song"]},
                     tmp_path,
@@ -254,7 +254,7 @@ class TestVerifyLibrary:
         persist = MagicMock()
 
         with patch("ytdl_core.verifier.verify_duration", return_value=(True, 180)):
-            with patch("ytdl_core.verifier.compute_md5", return_value="abc123"):
+            with patch("ytdl_core.verifier.file_matches_hash", return_value=True):
                 results = verify_library(
                     {"Artist": ["Song"]},
                     tmp_path,

@@ -101,6 +101,43 @@ cooldown, letting exactly one probe through once it expires.
 `--delay MIN MAX` still adds an extra pause per song if you want it; it is off
 by default.
 
+## Decision model
+
+`--kev` runs a local [Kev](https://github.com/jaredpalmer/kev) server on CUDA and
+picks the candidate with it; `--jev` uses the hosted TypeSafe model instead. They
+are mutually exclusive.
+
+```bash
+ytdl --file songs.json --kev                     # auto-start a local Kev server
+ytdl --file songs.json --kev --decision-questions 20   # faster, fewer questions
+ytdl --file songs.json --kev --decision-in-flight 8    # let the server batch more
+```
+
+The server's health, CUDA graph usage, batching and prefix-cache statistics are
+reported at startup from `/v1/models`, so a silent slowdown shows up there
+rather than as a thousand identical timeouts.
+
+`--decision-questions` is the main speed dial: every question is prefilled as its
+own sequence, so the cost of an evaluation scales with the question count
+(candidates × dimensions, plus one tie-break). Lower it to go faster, raise it to
+arbitrate more candidates.
+
+`--kev-fused` / `--no-kev-fused` override the fused-kernel probe. By default the
+fused Qwen3.5 kernels are installed if missing and then *proven* by running a real
+evaluation under a timeout, because some Triton/platform combinations import
+cleanly and then never return.
+
+## Downloads
+
+```bash
+ytdl --file songs.json --use-aria2c            # hand transfers to aria2c
+ytdl --file songs.json --fragment-concurrency 8
+```
+
+DASH audio arrives as many small fragments and yt-dlp fetches one at a time by
+default; `--fragment-concurrency` opens several. `--use-aria2c` hands the transfer
+to a native multi-connection downloader when the binary is present.
+
 ## Caching
 
 Candidate lists, MusicBrainz/iTunes metadata, cover art and AcoustID verdicts are

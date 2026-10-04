@@ -34,7 +34,13 @@ QUESTION_CONTRACT_VERSION = 2
 # Short description cap. Long descriptions burn tokens and dilute the fields the
 # model actually reasons about; the head of a YouTube description carries the
 # "official audio" / "lyrics" signals we care about.
-DESCRIPTION_LIMIT = 1200
+#
+# 500 characters is roughly the first three lines, which is where those signals
+# live ("Provided to YouTube by...", "Official Audio", "Lyrics", the label's own
+# copyright line). It was 1200, which cost 1200 characters per candidate on the
+# only dimension that reads it -- about a fifth of the whole request -- to
+# describe the middle of boilerplate no criterion can turn on.
+DESCRIPTION_LIMIT = 500
 
 # How many candidates to send for evaluation. The heuristic has already
 # hard-rejected the obvious rejects by this point; the model exists to arbitrate
@@ -59,6 +65,21 @@ class Dimension:
     ``key`` is the dimension name reported in the score breakdown.
     ``gate`` dimensions veto a candidate outright; non-gate dimensions only rank.
     ``weight`` is the share of the ranking score; ignored for gates.
+    ``fields`` is the candidate state this question actually reads.
+
+    ``fields`` exists because of how the model is served. Every question is
+    prefilled as its own sequence -- the shared state plus that question -- so a
+    field repeated into six questions is paid for six times. Measured with five
+    candidates, sending the whole candidate dict to every dimension produced 31
+    questions and 31,389 characters of prefill; trimming each question to the
+    fields it can reason about roughly halves that. The state itself is ~96
+    characters, so essentially all of the GPU cost is the questions.
+
+    The rule applied when assigning fields: include a field if the question's own
+    ``criteria`` text could plausibly mention it. ``key``, ``title`` and
+    ``channel`` are in every set -- every dimension here is a judgment about what
+    a particular upload is. ``view_count`` is in none: no criterion refers to
+    popularity, and it is one of the longest fields.
     """
 
     key: str
@@ -66,6 +87,7 @@ class Dimension:
     weight: float
     instructions: dict[str, str]
     criteria: dict[str, str]
+    fields: tuple[str, ...] = ()
 
     def question(self, candidate: dict[str, Any], noul_type: str) -> dict[str, Any]:
         return {
@@ -98,8 +120,34 @@ TYPESAFE_DIALECT = Dialect(noul="noul")
 GATEWAY_DIALECT = Dialect(noul="boolean")
 
 
-def _noul(key: str, instructions: dict[str, str], criteria: dict[str, str]) -> Dimension:
-    return Dimension(key=key, gate=False, weight=0.0, instructions=instructions, criteria=criteria)
+def _noul(
+    key: str,
+    instructions: dict[str, str],
+    criteria: dict[str, str],
+    fields: tuple[str, ...],
+) -> Dimension:
+    return Dimension(
+        key=key,
+        gate=False,
+        weight=0.0,
+        instructions=instructions,
+        criteria=criteria,
+        fields=fields,
+    )
+
+
+# Candidate fields, and which questions may read them.
+#
+# ``IDENTITY_FIELDS`` is the floor every question gets: these three identify the
+# upload being judged. The rest are attached only where the question's own
+# criteria could plausibly turn on them -- so a question about whether the audio
+# is clean does not carry the view count, and a question about whether the album
+# matches the reference does not carry the description.
+IDENTITY_FIELDS = ("key", "title", "channel")
+_WHO_FIELDS = IDENTITY_FIELDS + ("artists",)
+_UPLOAD_FIELDS = IDENTITY_FIELDS + ("artists", "source")
+_RECORDING_FIELDS = IDENTITY_FIELDS + ("duration_seconds", "upload_date")
+_CATALOGUE_FIELDS = IDENTITY_FIELDS + ("album", "year", "genre", "upload_date")
 
 
 # --- Gates ------------------------------------------------------------------
@@ -124,6 +172,9 @@ GATE_IDENTITY = Dimension(
             "several songs, or audio whose artist cannot be tied to the requested one."
         ),
     },
+    # "artists ... or description identify the requested song" -- both are named in
+    # its own criteria, so both travel with it.
+    fields=_UPLOAD_FIELDS + ("duration_seconds",),
 )
 
 GATE_ORIGIN = Dimension(
@@ -150,6 +201,10 @@ GATE_ORIGIN = Dimension(
             "itself is the original recording."
         ),
     },
+    # Provenance is the whole question here: who published it, and whether the
+    # upload presents itself as official. So the description and the source travel
+    # with it; duration and view count do not.
+    fields=_UPLOAD_FIELDS,
 )
 
 # A title saying "(Instrumental)" is still the artist's own upload, so it clears
@@ -178,6 +233,10 @@ GATE_FORM = Dimension(
             "upload whose audio is missing, silent or replaced by commentary."
         ),
     },
+    # "upload whose audio is missing, silent" is a judgement about what plays, so
+    # length and upload date inform it; the description carries the vocal/instrumental
+    # signal the title may omit.
+    fields=_UPLOAD_FIELDS + ("duration_seconds", "upload_date", "description"),
 )
 
 # --- Ranking dimensions -----------------------------------------------------
@@ -196,6 +255,9 @@ DIM_STUDIO = _noul(
             "or a video whose audio comes from a live show."
         ),
     },
+    # Live-show evidence lives in the upload date and the description ("live at...",
+    # venue names, crowd noise); the catalogue fields are not consulted here.
+    _RECORDING_FIELDS + ("artists",),
 )
 
 DIM_AUDIO = _noul(
@@ -212,6 +274,9 @@ DIM_AUDIO = _noul(
             "performance does not play."
         ),
     },
+    # "runs start to finish" is about duration, and commentary is announced in the
+    # description. No album, year, genre or view count.
+    _RECORDING_FIELDS + ("artists",),
 )
 
 DIM_REFERENCE = _noul(
@@ -227,6 +292,9 @@ DIM_REFERENCE = _noul(
             "reference, which points at a different release of the same song."
         ),
     },
+    # Exactly the fields the reference is made of. Notably no description: the
+    # longest field by far, and nothing in these criteria can turn on it.
+    _CATALOGUE_FIELDS,
 )
 
 GATE_DIMENSIONS: tuple[Dimension, ...] = (GATE_IDENTITY, GATE_ORIGIN, GATE_FORM)
@@ -332,17 +400,19 @@ def build_questions(
 ) -> dict[str, dict[str, Any]]:
     """Every dimension for every candidate, plus one tie-break Choice.
 
+    Each question carries only the candidate fields its own ``fields`` tuple
+    declares, so nothing is serialised once per dimension for the sake of a
+    question that cannot use it. The state is shared and prefilled once; the
+    questions are not, and their size is what the GPU actually pays for.
+
     Adding questions barely changes the response time -- they are evaluated in
-    parallel -- so the whole rubric ships in a single request.
+    parallel -- so the whole rubric still ships in a single request.
     """
     questions: dict[str, dict[str, Any]] = {}
     for state in candidate_states:
         for dimension in DIMENSIONS:
-            payload = dict(state)
-            if dimension.key not in DESCRIPTION_DIMENSIONS:
-                payload.pop("description", None)
             questions[question_id(state["key"], dimension.key)] = dimension.question(
-                payload, dialect.noul
+                _project(state, dimension.fields), dialect.noul
             )
     if len(candidate_states) > 1:
         questions[choice_id()] = {
@@ -354,6 +424,19 @@ def build_questions(
             "criteria": {state["key"]: candidate_label(state) for state in candidate_states},
         }
     return questions
+
+
+def _project(state: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    """The subset of *state* a dimension reads.
+
+    ``key`` is always kept: it is how the answer is attributed back to the
+    candidate, so dropping it would break the contract rather than just the
+    prompt. A dimension with no declared fields gets the full state, which keeps
+    any future dimension correct by default instead of silently starved.
+    """
+    if not fields:
+        return dict(state)
+    return {name: state[name] for name in fields if name in state}
 
 
 def build_state_and_questions(
@@ -404,7 +487,7 @@ def select_for_evaluation(
       extra so that near-ties at the cut are not decided by list order alone.
     """
     keep: list[int] = []
-    seen: set[tuple[str, ...]] = set()
+    seen: set[tuple[Any, ...]] = set()
     for index, candidate in enumerate(candidates):
         if int(candidate.get("_composite_score") or 0) <= HARD_REJECT_SCORE:
             continue

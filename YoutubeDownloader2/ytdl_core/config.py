@@ -164,11 +164,22 @@ class Config:
 
     # --- Decision model ------------------------------------------------------
     # A decision server is a shared single-device resource, so these bound how
-    # hard it is leaned on. One in-flight request is the safe default: it makes a
-    # slow server predictable instead of collapsing under a queue. Raise it only
-    # if the server batches concurrent requests, where several at once finish
-    # sooner in total rather than merely queueing.
-    DECISION_MAX_IN_FLIGHT: int = 1
+    # hard it is leaned on.
+    #
+    # How many evaluations may be in flight at once. This used to be 1, on the
+    # reasoning that one at a time makes a slow server predictable. That is true
+    # of a server that does not batch, and it is the wrong assumption for one
+    # that does: kev.serve drains up to MAX_BATCH=64 queued requests into a
+    # single model pass, so N requests in flight finish in roughly one pass
+    # instead of N. Holding it at 1 threw that away and capped a whole batch at
+    # one evaluation per round trip.
+    #
+    # Not free, though: each queued request holds its state in the server's cache
+    # and its rows in the batching buffers, so this is bounded by VRAM as much as
+    # by throughput. Six is a measured-middle setting for a 16 GB card running a
+    # 4B checkpoint (~14 GB resident); raise it on a bigger card, lower it to 1 to
+    # make a slow server strictly serial.
+    DECISION_MAX_IN_FLIGHT: int = 6
     DECISION_TIMEOUT_SECONDS: int = 60
     # Consecutive failures after which the provider is abandoned for the run.
     # Low on purpose: the heuristic is a complete ranker, so the model is a
@@ -200,6 +211,16 @@ class Config:
     YTDLP_DOWNLOAD_RETRIES: int = 4
     YTDLP_RETRY_SLEEP: str = "http:exp=1:8"
     SOCKET_TIMEOUT: int = 30
+    # DASH audio arrives as many small fragments and yt-dlp fetches them one at a
+    # time by default, so a single song used exactly one connection however much
+    # bandwidth was idle. Four is enough to saturate a normal connection without
+    # tripping per-host rate limits by opening a pile of sockets.
+    FRAGMENT_CONCURRENCY: int = 4
+    # Hand the transfer to aria2c when the binary is available. It is a native
+    # multi-connection downloader and the executable already ships in the repo.
+    # Opt-in, because an external downloader changes how ranges and retries
+    # behave and that is not something to change silently.
+    USE_ARIA2C: bool = False
 
     # --- State persistence ---------------------------------------------------
     # The state file was rewritten in full, with an fsync, on every persist --
@@ -215,6 +236,11 @@ class Config:
     SCORE_THRESHOLD_REJECT: int = 25
     SILENCE_THRESHOLD_DB: int = -50
     SILENCE_MIN_DURATION_MS: int = 3000
+    # Rate the silence check decimates to before running the filter. A -50 dB
+    # threshold is decided by a coarse envelope; 8 kHz mono keeps every relevant
+    # band and cuts the filter's work by roughly an order of magnitude on 44.1 kHz
+    # stereo. Raise it if quiet-but-not-silent passages start being counted.
+    SILENCE_DETECT_SAMPLE_RATE: int = 8000
     EXCESSIVE_SILENCE_RATIO: float = 0.30
     TOPIC_CHANNEL_BONUS: int = 50
     VEVO_CHANNEL_BONUS: int = 30

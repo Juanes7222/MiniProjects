@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import atexit
 import json
-import shutil
 import sys
 import threading
 from pathlib import Path
@@ -33,6 +32,7 @@ from ..config import Config
 from ..core import MusicDownloader
 from ..kev_server import KevServerError, KevServerManager
 from ..result import DownloadResult
+from ..fingerprint import configure_fpcalc
 from ..utils import check_ffmpeg
 from ..cache import caches
 
@@ -142,7 +142,10 @@ def main() -> None:
 
     check_ffmpeg(console)
 
-    if not shutil.which("fpcalc"):
+    # Resolved once, through the same helper the library uses, so the banner and
+    # the downloader cannot disagree about whether fingerprinting is available.
+    fpcalc_path = configure_fpcalc()
+    if not fpcalc_path:
         console.print(
             Panel(
                 "[yellow]fpcalc (Chromaprint) not found. "
@@ -223,8 +226,8 @@ def main() -> None:
     total = len(pairs)
 
     acoustid_status = (
-        "enabled (fpcalc found)"
-        if (args.acoustid_key and shutil.which("fpcalc"))
+        f"enabled ({Path(fpcalc_path).name})"
+        if (args.acoustid_key and fpcalc_path)
         else "disabled"
         if not args.acoustid_key
         else "key provided but fpcalc not found"
@@ -277,6 +280,7 @@ def main() -> None:
             port=args.kev_port,
             startup_timeout=args.kev_startup_timeout,
             update=not args.kev_skip_update,
+            insist_fused=getattr(args, "kev_fused", None),
             on_step=events.on_info,
         )
         try:
@@ -351,6 +355,8 @@ def main() -> None:
         config.DECISION_TIMEOUT_SECONDS = max(1, int(args.kev_timeout))
     if getattr(args, "decision_questions", None):
         config.DECISION_MAX_QUESTIONS = max(1, int(args.decision_questions))
+    if getattr(args, "decision_in_flight", None):
+        config.DECISION_MAX_IN_FLIGHT = max(1, int(args.decision_in_flight))
     stage_workers = getattr(args, "stage_workers", None) or []
     for attribute, value in zip(
         ("SEARCH_WORKERS", "VERIFY_WORKERS", "DOWNLOAD_WORKERS", "POST_WORKERS"), stage_workers
@@ -359,6 +365,10 @@ def main() -> None:
     if getattr(args, "no_cache", False):
         config.CACHE_ENABLED = False
         caches.disable()
+    if getattr(args, "use_aria2c", False):
+        config.USE_ARIA2C = True
+    if getattr(args, "fragment_concurrency", None):
+        config.FRAGMENT_CONCURRENCY = max(1, int(args.fragment_concurrency))
 
     try:
         dl = MusicDownloader(
