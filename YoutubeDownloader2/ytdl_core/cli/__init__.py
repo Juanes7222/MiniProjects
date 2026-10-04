@@ -281,6 +281,7 @@ def main() -> None:
             startup_timeout=args.kev_startup_timeout,
             update=not args.kev_skip_update,
             insist_fused=getattr(args, "kev_fused", None),
+            probe_budget_seconds=config.DECISION_PROBE_BUDGET_SECONDS,
             on_step=events.on_info,
         )
         try:
@@ -333,11 +334,13 @@ def main() -> None:
     import musicbrainzngs as _mbz
 
     if args.musicbrainz:
-        _mbz.set_useragent(
-            "YTMusicDownloader",
-            "2.0",
-            "https://github.com/example/yt-music-downloader",
-        )
+        # MusicBrainz rejects requests without a descriptive User-Agent. The name
+        # and version live in one config field; this used to be a second,
+        # slightly different hardcoded copy.
+        from ..metadata import _app_name_version
+
+        _mbz_name, _mbz_version = _app_name_version(config)
+        _mbz.set_useragent(_mbz_name, _mbz_version)
 
     require_fingerprint = args.fingerprint_mode == "strict"
     force_fingerprint = args.force_fingerprint or (

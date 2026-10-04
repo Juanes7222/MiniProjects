@@ -5,6 +5,7 @@ import pytest
 
 import os
 
+from ytdl_core.config import Config
 from ytdl_core.kev_server import KevServerError, KevServerManager
 
 
@@ -147,7 +148,9 @@ def test_local_startup_runs_lifecycle(monkeypatch, tmp_path):
     monkeypatch.setattr(manager, "_start_process", lambda: steps.append("process"))
     monkeypatch.setattr(manager, "_wait_until_ready", lambda: steps.append("ready"))
     monkeypatch.setattr(manager, "_report_capabilities", lambda: steps.append("capabilities"))
-    monkeypatch.setattr(manager, "_report_latency", lambda: steps.append("latency"))
+    monkeypatch.setattr(
+        manager, "_report_latency", lambda budget_seconds: steps.append(f"latency({budget_seconds})")
+    )
 
     assert manager.start() == "http://127.0.0.1:8009"
     assert steps == [
@@ -160,8 +163,17 @@ def test_local_startup_runs_lifecycle(monkeypatch, tmp_path):
         "process",
         "ready",
         "capabilities",
-        "latency",
+        # The budget comes from Config.DECISION_PROBE_BUDGET_SECONDS rather than
+        # a literal here, so the two cannot drift apart.
+        f"latency({manager.probe_budget_seconds})",
     ]
+
+
+def test_the_probe_budget_is_configurable(tmp_path):
+    """It used to be a literal in two places: the config field and the default."""
+    assert KevServerManager(tmp_path / "kev").probe_budget_seconds == 20.0
+    assert KevServerManager(tmp_path / "kev", probe_budget_seconds=7.5).probe_budget_seconds == 7.5
+    assert Config().DECISION_PROBE_BUDGET_SECONDS == 20.0
 
 
 def test_startup_verifies_cuda_graphs_are_actually_on(tmp_path):

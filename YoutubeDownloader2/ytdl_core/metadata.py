@@ -59,9 +59,29 @@ from .utils import normalize_title, strip_featuring
 # thread happened to be inside the critical section.
 _mb_useragent_set = False
 _mb_lock = threading.Lock()
+_MB_APP = "YTMusicDownloader"
+_MB_VERSION = "2.0"
 
 _session_lock = threading.Lock()
 _session: Optional[requests.Session] = None
+
+
+def _app_name_version(config: Optional[Config] = None) -> tuple[str, str]:
+    """Split :attr:`Config.MUSICBRAINZ_APP` into the pair the library wants.
+
+    MusicBrainz takes ``(app, version)`` while the HTTP headers take one joined
+    string, so the field is stored joined and split here rather than duplicated
+    as four hardcoded literals across two modules.
+    """
+    raw = (getattr(config, "MUSICBRAINZ_APP", None) or f"{_MB_APP}/{_MB_VERSION}").strip()
+    name, separator, version = raw.partition("/")
+    if not separator or not name.strip() or not version.strip():
+        return _MB_APP, _MB_VERSION
+    return name.strip(), version.strip()
+
+
+def _http_user_agent(config: Optional[Config] = None) -> str:
+    return "/".join(_app_name_version(config))
 
 
 def _configure_musicbrainz() -> None:
@@ -70,8 +90,9 @@ def _configure_musicbrainz() -> None:
         if _mb_useragent_set:
             return
         _mb_useragent_set = True
+    name, version = _app_name_version()
     try:
-        musicbrainzngs.set_useragent("YTMusicDownloader", "2.0")
+        musicbrainzngs.set_useragent(name, version)
     except Exception:
         pass
 
@@ -500,7 +521,7 @@ def _fetch_itunes_uncached(artist: str, song: str, timeout: float = 8.0) -> Opti
         response = _shared_session().get(
             url,
             timeout=timeout,
-            headers={"User-Agent": "YTMusicDownloader/2.0"},
+            headers={"User-Agent": _http_user_agent()},
         )
         response.raise_for_status()
         payload = response.json()
@@ -551,7 +572,7 @@ def _fetch_image(url: str) -> Optional[bytes]:
         response = _shared_session().get(
             url,
             timeout=10,
-            headers={"User-Agent": "YTMusicDownloader/2.0"},
+            headers={"User-Agent": _http_user_agent()},
         )
         response.raise_for_status()
         data = response.content

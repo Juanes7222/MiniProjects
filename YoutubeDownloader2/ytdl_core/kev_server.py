@@ -48,6 +48,7 @@ class KevServerManager:
         startup_timeout: int = 900,
         update: bool = True,
         insist_fused: bool | None = None,
+        probe_budget_seconds: float = 20.0,
         on_step: Callable[[str], None] | None = None,
     ) -> None:
         self.root = root.expanduser()
@@ -59,6 +60,9 @@ class KevServerManager:
         # True = use the fused kernels without probing, False = decline them
         # without probing, None = let the probe decide.
         self.insist_fused = insist_fused
+        # From Config.DECISION_PROBE_BUDGET_SECONDS: above this, one real
+        # evaluation is reported as too slow for a batch.
+        self.probe_budget_seconds = float(probe_budget_seconds)
         self.on_step = on_step or (lambda message: None)
         self.process: subprocess.Popen | None = None
         self.log_file: TextIO | None = None
@@ -97,7 +101,7 @@ class KevServerManager:
         # Up is not the same as usable at batch speed, and neither is the same as
         # running the fast path. Find out now, not from a thousand timeouts.
         self._report_capabilities()
-        self._report_latency()
+        self._report_latency(budget_seconds=self.probe_budget_seconds)
         return self.url
 
     def stop(self) -> None:

@@ -119,6 +119,10 @@ class Config:
         default_factory=lambda: ["android", "mweb", "web_embedded"]
     )
     SUPPORTED_FORMATS: list[str] = field(default_factory=lambda: ["mp3", "m4a", "opus", "mp4"])
+    # MusicBrainz requires a User-Agent identifying the app and its version, and
+    # it is used in two shapes: the library's own (name, version) pair and the
+    # HTTP header for the iTunes/cover-art requests. One field, both call sites --
+    # previously four hardcoded copies of the same two strings.
     MUSICBRAINZ_APP: str = "YTMusicDownloader/2.0"
     STATE_FILE: str = ".download_state.json"
     RETRY_ATTEMPTS: int = 3
@@ -146,13 +150,18 @@ class Config:
     # for. Search, download and metadata are network-bound and want more threads
     # than cores; the post-download checks decode audio and want about one
     # worker per core; the decision model is latency-bound and needs few.
+    #
+    # There is deliberately no separate decide pool. The decision model is asked
+    # inside the search stage, and what bounds it is DECISION_MAX_IN_FLIGHT (a
+    # gate on the shared single-device server), not a stage size: the model has
+    # one GPU whether eight threads call it or one. A fifth stage would add a
+    # queue and a set of workers without changing that.
     PIPELINE_ENABLED: bool = True
     PIPELINE_QUEUE_DEPTH: int = 64
     SEARCH_WORKERS: int = 0  # 0 = auto
     VERIFY_WORKERS: int = 0
     DOWNLOAD_WORKERS: int = 0
     POST_WORKERS: int = 0
-    DECIDE_WORKERS: int = 0
     # Concurrency for the 90-second partial downloads. Sized so that
     # FP_CONCURRENCY / partial_latency comfortably exceeds ACOUSTID_RATE_PER_SECOND:
     # otherwise the AcoustID budget is the ceiling and the semaphore is what
@@ -185,9 +194,6 @@ class Config:
     # Low on purpose: the heuristic is a complete ranker, so the model is a
     # second opinion, and there is no reason to keep paying for one.
     DECISION_FAILURE_THRESHOLD: int = 2
-    # Give up quickly at startup if the model cannot answer promptly, instead of
-    # discovering it one timeout per song.
-    DECISION_PROBE_BUDGET_SECONDS: float = 20.0
 
     # --- Search fan-out and cache -------------------------------------------
     SEARCH_VARIANT_FANOUT: int = 3
@@ -245,17 +251,35 @@ class Config:
     TOPIC_CHANNEL_BONUS: int = 50
     VEVO_CHANNEL_BONUS: int = 30
     OFFICIAL_AUDIO_BONUS: int = 20
-    HIGH_FUZZY_BONUS: int = 20
     DURATION_MATCH_BONUS: int = 25
     LIVE_PENALTY: int = -25
-    COVER_KARAOKE_PENALTY: int = -50
-    REACTION_REMIX_PENALTY: int = -50
+    # Three scoring weights that used to live here were removed rather than
+    # wired, and the reasons are worth keeping:
+    #
+    # * COVER_KARAOKE_PENALTY and REACTION_REMIX_PENALTY (-50 each) predate the
+    #   forbidden-term **hard reject** by about a month. "cover", "karaoke",
+    #   "reaction", "remix" and "mashup" are all in FORBIDDEN_TERMS, and a title
+    #   containing one is now discarded outright at -9999. The hard reject
+    #   replaced them with something strictly stronger, so wiring the penalties
+    #   back would have changed nothing except making the config look honest.
+    #
+    # * HIGH_FUZZY_BONUS (+20 for a near-exact fuzzy match) is a *discriminator*,
+    #   not a gate: the scorer already ranks on `song_match`, so a bonus for a
+    #   high one only separates candidates that are otherwise close. Re-adding it
+    #   would change which song gets downloaded across a whole library, and that
+    #   is a decision to make against real data rather than in passing. If it is
+    #   wanted back, add it to the generic path next to `base_score` and measure
+    #   the selections before and after.
+    #
+    # None of the three was reachable, so a field that looks like a knob and does
+    # nothing is worse than no field: someone tunes it, sees no effect, and loses
+    # trust in the rest of the config.
     IDENTITY_OVERRIDE_THRESHOLD = 40
     JEV_DEFAULT_THRESHOLD: float = 0.60
     JEV_DEFAULT_RUNS: int = 1
     JEV_MAX_RUNS: int = 20
 
-    # --- Decision model (Jev / Kev) ----------------------------------------
+    # --- Decision model ------------------------------------------------------
     # Gates veto a candidate outright when it falls under the floor; the
     # remaining dimensions are weighted into a ranking score.
     DECISION_GATE_FLOOR: float = 0.50
@@ -275,6 +299,9 @@ class Config:
     # Candidates whose per-dimension answers moved more than this across runs are
     # unstable, and are surfaced for review instead of downloaded silently.
     DECISION_REVIEW_MARGIN: float = 0.10
+    # Wall-clock budget for the startup latency probe: above this, one real
+    # evaluation is reported as too slow for a batch, with the remedy.
+    DECISION_PROBE_BUDGET_SECONDS: float = 20.0
 
     # --- Search recall -----------------------------------------------------
     # The presentation budget (max_results) and the fetch budget are decoupled:

@@ -300,15 +300,41 @@ Los últimos tres son código de interacción, no de rendimiento, pero
 `rich_ui` recibe un evento por cada progreso de descarga desde 36 hilos — ahí
 puede haber contención que no miré.
 
-### 6. Config muerta: 6 campos nunca leídos
-`MUSICBRAINZ_APP`, `DECIDE_WORKERS`, `DECISION_PROBE_BUDGET_SECONDS`,
-`HIGH_FUZZY_BONUS`, `COVER_KARAOKE_PENALTY`, `REACTION_REMIX_PENALTY`.
-Los tres últimos son pesos de scoring que el `scorer` nunca aplicó — eso
-puede ser un bug funcional, no solo basura: si el scoring debía penalizar
-covers/karaoke con `-50` y no lo hace, la lógica está más blanda de lo que se
-creía.
+### 6. Config muerta — RESUELTO ✅
 
-### 7. Sin benchmark del pipeline completo
+Seis campos declarados y nunca leídos. **No era un bug de selección.** La
+evidencia del historial:
+
+| Campo | Introducido | Por qué estaba muerto |
+|---|---|---|
+| `COVER_KARAOKE_PENALTY` (−50) | 2026-05-03 | Superado un mes después por el **hard-reject** de forbidden terms: "cover"/"karaoke" ahora se descartan a −9999 |
+| `REACTION_REMIX_PENALTY` (−50) | 2026-05-03 | Ídem, con "reaction"/"remix"/"mashup" |
+| `HIGH_FUZZY_BONUS` (+20) | 2026-05-03 | Discriminador que el scorer dejó de usar; el ranking ya usa `song_match` |
+| `DECIDE_WORKERS` | 2026-10-03 (ayer) | Etapa que no existe: la decisión corre dentro del stage de búsqueda y la limita `DECISION_MAX_IN_FLIGHT` |
+| `MUSICBRAINZ_APP` | 2026-05-03 | Cuatro copias hardcodeadas del mismo par de strings |
+| `DECISION_PROBE_BUDGET_SECONDS` | 2026-10-03 (ayer) | El valor estaba duplicado como literal en el default del método |
+
+Los hard-reject son **más estrictos** que las penalizaciones que dejaron atrás,
+así que la lógica de selección nunca estuvo más blanda de lo que se creía: está
+más fuerte. `HIGH_FUZZY_BONUS` sí sería un discriminador perdido, pero
+reintroducirlo cambiaría qué canción se descarga en toda la biblioteca, y eso no
+se decide de pasada.
+
+Resolución:
+- Los cuatro realmente muertos → **eliminados**, con el motivo escrito en
+  `config.py` para que la decisión no se pierda.
+- `MUSICBRAINZ_APP` → **cableado** en los 4 sitios (pair para la librería,
+  string unido para los headers HTTP), con un helper que tolera un valor mal
+  configurado en vez de mandar un User-Agent vacío.
+- `DECISION_PROBE_BUDGET_SECONDS` → **cableado** al probe de latencia.
+- **Guard permanente**: `tests/test_config_health.py` falla si un campo de
+  `Config` queda sin leerse, si se declara dos veces, o si una copia hardcodeada
+  del User-Agent reaparece. Verificado que **atrapa** un campo muerto inyectado
+  y pasa tras revertirlo.
+
+**Ahora: 92 campos, 0 sin uso.**
+
+### 6. Sin benchmark del pipeline completo
 Todas las cifras de red/CPU son de componentes por separado. La telemetría nueva
 —etapas, coalescing del state, batches del servidor, latencia por evaluación—
 ya existe, así que un A/B de 500 canciones es ahora posible. No es urgente:
