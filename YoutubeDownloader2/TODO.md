@@ -283,15 +283,111 @@ degrada con un aviso honesto, así que no hay riesgo, pero la ganancia existe.
 Vale la pena solo si aparece un build de Triton que los ejecute, o si el
 problema fuera de la fricción de `triton-windows`. `--kev-fused` fuerza el camino.
 
-### 3. `aria2c` y `--fragment-concurrency` nunca se ejercitaron en una descarga real
-El wiring está comprobado por tests (opta-in, se avisa si falta, un scan nunca
-lo usa), pero **ninguna descarga real se ha hecho con ellos**. Son los cambios
-con más potencial de red y los menos probados de verdad.
+### 3. `aria2c` y `--fragment-concurrency` — MEDIDOS, ninguno es una ganancia
 
-### 4. La verificación AcoustID nunca se ha ejecutado
-`--acoustid-key` no se pasó en el E2E, así que `fp=disabled`. El camino que
-rearmé (descubrimiento de `fpcalc`, `force_fpcalc`) está verificado por unit
-tests pero **no end-to-end contra AcoustID**. Merece una corrida con key real.
+Descargas reales, 4 configuraciones × 2 canciones × 3 repeticiones
+intercaladas (para que unaauce de red no caiga siempre en la misma), misma
+canción de 5,97 MB:
+
+| Configuración | mediana | vs baseline |
+|---|---|---|
+| baseline (1 fragmento) | **12,7 s** | — |
+| `aria2c`, 1 fragmento | 22,3 s | **+75%** |
+| sin aria2c, 8 fragmentos | 12,6 s | **−1%** |
+| aria2c, 8 fragmentos | 22,5 s | **+77%** |
+
+**`--use-aria2c` es una pessimización en esta red** (~450 KB/s). Repartir el
+ancho de banda de una conexión entre ocho cuesta más en arranque de proceso,
+ocho setups de conexión y un fichero `.aria2` de lo que recupera. La herramienta
+adecuada es cuando una conexión individual está limitada o el RTT es alto, no
+cuando el que limita es el enlace. Sigue siendo opt-in y apagado.
+
+**`--fragment-concurrency` es inerte con la configuración actual.** Se
+seleccionó el formato **251 (webm/opus), `protocol=https`, sin fragmentos**: con
+`YOUTUBE_PLAYER_CLIENTS = android/mweb/web_embedded` yt-dlp recibe el audio como un
+único fichero progresivo, así que no hay nada que traer en paralelo. Pasaría a
+importar si un formato llegara segmentado (otro player client, o un directo).
+
+> **Dos afirmaciones mías anteriores resultaron incorrectas**, y la medición es
+> lo que las refuta:
+> 1. *"aria2c es la jugada nativa que paga, la diferencia entre saturar la línea y no"* → en esta línea, es 75% más lento.
+> 2. *"fragmentos concurrentes: el cambio de red más barato que hay"* → no hay fragmentos que traer.
+
+### 4. AcoustID end-to-end — SE ENCONTRÓ UN BUG REAL 🔴
+
+Con key real. El pipeline corría (partial, fpcalc, sin errores, sin ficheros
+huérfanos) y devolvía **`no AcoustID match` en 4/4 canciones**. No era la
+configuración: era un bug que hacía la etapa **incapaz de verificar nada**.
+
+### La causa: se declaraba la duración del clip, no la de la canción
+
+AcoustID acota su conjunto de candidatos por la duración que le declaran.
+`acoustid.match` lee esa duración **del fichero que le pasan** — y el pipeline le
+pasa un excerpt de 90 s, así que declaraba 90 s. Pero el audio de esos 90 s no
+viene de una grabación de 90 s.
+
+Medido sobre una pista que AcoustID reconoce a 0.95 desde el fichero entero,
+usando **los mismos 90 s de audio** en todos los casos:
+
+| Duración declarada | Resultado |
+|---|---|
+| 90 s (lo que hacía el pipeline) | sin match |
+| 120 / 180 / 240 / 300 s | sin match |
+| **340 s (la real)** | **MATCH 0.951** |
+| 400 / 600 s | sin match |
+
+La ventana es **estrecha** alrededor de la cifra real: 300 y 400 fallan. Por eso
+hay que pasar la duración verdadera, no una generosa.
+
+Descartado por el camino:
+- **No es la re-codificación**: el fichero entero re-codificado a 128 kbps sigue
+  dando 0.950. Un clip de 120 s con `-c copy` tampoco da.
+- **No es la longitud mínima**: con `maxlength=120` el fingerprint saturado da
+  `fp_len` 3350 (clip) contra 3342 (fichero completo) — prácticamente el mismo
+  input, y sin embargo uno coincide y el otro no.
+- **No son los acentos**: `fpcalc` abre sin problema los 38 ficheros con
+  caracteres no-ASCII de la biblioteca.
+
+### El arreglo
+
+`_lookup()` hace el fingerprint igual que `match` pero declara la duración de la
+canción, que el pipeline ya conoce. Se hilado desde tres sitios, y en
+`_try_next_fp` **cada alterno declara la suya** porque cada uno es otra
+grabación — reutilizar la del ganador buscaría la pista equivocada.
+
+Verificado sobre el pipeline real (partial de 90 s → fpcalc → lookup → veredicto
+→ cache), con la URL que el propio state file tenía registrada:
+
+```
+RESULT : verified=True confidence=0.95 title='Dios háblame'
+label  : 'verified 95% conf.'
+cached : (True, 0.95022166, 'Dios háblame')
+```
+
+Antes de ese arrangement, esa misma canción tenía `fingerprint_label: "no
+AcoustID match"` en el state file.
+
+**Falta**: re-verificar la biblioteca con `--verify` para republicar los sellos,
+que ahora serán correctos. Antes salieron `no AcoustID match` o `disabled`.
+
+### Un aviso sobre mi propio diagnóstico
+
+Durante esta investigation reporté casi un bug que no existía: `fpcalc exited
+with status 2` sobre un fichero con apóstrofe. La causa era **mi ruta mal
+escrita** — el fichero real se llama `Dios Háb'lame.mp3` con apóstrofo
+tipográfico (U+2019) y `sanitize_filename` se lo había quitado, así que la ruta
+que construí a mano no existía. `fpcalc` estaba perfectamente bien. Un test que
+no verifica su propia premisa no vale como diagnóstico.
+
+### Corrección a B1
+
+B1 ("fpcalc + force_fpcalc") era **mucho menos de lo que parecía**. El valor real
+era solo la **ruta absoluta**: `shutil.which` en Windows devuelve un nombre
+relativo cuando el binario está en el directorio actual, así que la etapa
+dependía del cwd. El `force_fpcalc=True` es una garantía, no una optimización:
+pyacoustid solo prefiere su FFT en Python cuando la extensión C de chromaprint
+**también** está presente, y aquí no lo está — medido, ambos caminos dan tiempos
+indistinguibles. Lo que de verdad arreglaba la verificación era lo de este punto.
 
 ### 5. Módulos sin auditar
 `reports.py` (115), `retry_queue.py` (164), `json_io.py` (24), `cli_entry.py`

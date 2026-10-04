@@ -81,14 +81,23 @@ _fpcalc_command: str | None = None
 def configure_fpcalc() -> str | None:
     """Point pyacoustid at the discovered ``fpcalc``, once. Returns it or None.
 
-    Finding the binary is only half the job. pyacoustid picks its backend at
-    import time from whether the ``chromaprint`` C extension loaded -- and in this
-    environment it does not, so it falls back to ``audioread``, a pure-Python FFT
-    that is orders of magnitude slower on a 90-second clip and less accurate.
-    ``acoustid.FPCALC_COMMAND`` is the library's own seam for choosing the
-    command-line tool, and ``match(..., force_fpcalc=True)`` is the flag that
-    actually selects that path; without both, a working fpcalc on disk is still
-    never used.
+    Worth being precise about what this does and does not buy.
+
+    pyacoustid picks its backend with ``have_audioread and have_chromaprint and
+    not force_fpcalc`` -- note the conjunction. ``have_chromaprint`` reports
+    whether the ``chromaprint`` **C extension** imported, and where it did not,
+    the pure-Python ``audioread`` FFT is never preferred regardless of
+    ``force_fpcalc``; the command-line tool runs either way. Measured here with
+    the flag both ways over 16 MB files, the timings are indistinguishable
+    (0.5-0.9 s), because both calls take the same path.
+
+    So the load-bearing part of this function is not the flag, it is the
+    **absolute path**: ``acoustid.FPCALC_COMMAND`` is what the library spawns, and
+    before it was pointed at a resolved binary the whole verification stage
+    depended on the process's working directory containing it. ``force_fpcalc``
+    is kept as a guarantee rather than an optimisation -- it pins the tool even on
+    an interpreter where the C extension *is* present, where the default would be
+    the Python FFT.
     """
     global _fpcalc_command
     if _fpcalc_command is None:
@@ -255,6 +264,39 @@ def _score_matches(results, artist: str, song: str, config: Config, on_info) -> 
     return False, best_conf, best_title
 
 
+def _lookup(
+    acoustid_key: str,
+    path: Path,
+    expected_duration: Optional[int],
+    *,
+    force_fpcalc: bool = False,
+):
+    """Fingerprint *path* and look it up, declaring the **track's** duration.
+
+    ``acoustid.match`` reads the duration off the file it is given. For a
+    90-second excerpt that is 90 seconds, and AcoustID then searches for a
+    recording roughly that long, which is not the recording the audio came from.
+    So the lookup is done here instead: fingerprint exactly as ``match`` would,
+    but pass the duration the caller knows the whole track has.
+
+    Falls back to ``acoustid.match`` when no duration is known, which is the
+    honest behaviour -- a wrong duration is worse than the file's own, and the
+    caller's figure comes from the search result or the catalogue.
+
+    Mirrors ``acoustid.match(parse=True)`` so the caller keeps getting the same
+    ``(score, id, title, artist)`` tuples.
+    """
+    if not expected_duration or int(expected_duration) <= 0:
+        return acoustid.match(
+            acoustid_key, str(path), meta="recordings", force_fpcalc=force_fpcalc
+        )
+    duration, fingerprint = acoustid.fingerprint_file(str(path), force_fpcalc=force_fpcalc)
+    response = acoustid.lookup(
+        acoustid_key, fingerprint, int(expected_duration), meta="recordings"
+    )
+    return acoustid.parse_lookup_result(response)
+
+
 def verify_fingerprint(
     partial_path: Path,
     artist: str,
@@ -262,12 +304,22 @@ def verify_fingerprint(
     acoustid_key: str,
     config: Config,
     circuit_breaker: AcoustIDCircuitBreaker,
+    expected_duration: Optional[int] = None,
     on_warn: Optional[Callable[[str], None]] = None,
     on_info: Optional[Callable[[str], None]] = None,
     on_fingerprint_error: Optional[Callable[[str, str, str], None]] = None,
 ) -> tuple[bool, float, str]:
     """
     Verify an audio file's fingerprint against AcoustID.
+
+    ``expected_duration`` is the length of the **whole track**, and it is not
+    optional in practice. AcoustID narrows its candidate set by the duration it is
+    told, so a fingerprint taken from a 90-second excerpt submitted with that
+    excerpt's own 90 seconds finds nothing: measured on one track, declaring 90,
+    120, 180, 240 and 300 seconds all returned no match, while declaring the
+    track's real 340 seconds matched at 0.95 from the very same 90 seconds of
+    audio. The window is tight -- 400 and 600 were also misses -- so it has to be
+    the real figure, not a generous one.
 
     Returns
     -------
@@ -293,14 +345,12 @@ def verify_fingerprint(
             # at full speed instead of waiting behind the rate limit.
             bucket.acquire()
 
-            results = list(
-                acoustid.match(
-                    acoustid_key,
-                    str(partial_path),
-                    meta="recordings",
-                    force_fpcalc=bool(fpcalc),
-                )
-            )
+            results = list(_lookup(
+                acoustid_key,
+                partial_path,
+                expected_duration,
+                force_fpcalc=bool(fpcalc),
+            ))
             circuit_breaker.record_success()
             return _score_matches(results, artist, song, config, on_info)
 

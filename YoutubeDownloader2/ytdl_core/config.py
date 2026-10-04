@@ -217,15 +217,30 @@ class Config:
     YTDLP_DOWNLOAD_RETRIES: int = 4
     YTDLP_RETRY_SLEEP: str = "http:exp=1:8"
     SOCKET_TIMEOUT: int = 30
-    # DASH audio arrives as many small fragments and yt-dlp fetches them one at a
-    # time by default, so a single song used exactly one connection however much
-    # bandwidth was idle. Four is enough to saturate a normal connection without
-    # tripping per-host rate limits by opening a pile of sockets.
+    # Fragment concurrency for DASH audio. **Currently inert in this
+    # configuration**, which is worth knowing before anyone tunes it: with
+    # YOUTUBE_PLAYER_CLIENTS = android/mweb/web_embedded, yt-dlp is offered
+    # audio as a single progressive HTTPS file (measured: format 251, webm/opus,
+    # protocol https, no fragments), so there is nothing to fetch concurrently.
+    # It starts to matter if the format ever arrives as DASH segments or HLS --
+    # a different player client, or a live stream.
+    #
+    # Kept because it costs nothing when unused and is the first thing to reach
+    # for if fragments do appear; it is not a speed-up as configured, and a
+    # measurement that claimed otherwise would have been wrong.
     FRAGMENT_CONCURRENCY: int = 4
-    # Hand the transfer to aria2c when the binary is available. It is a native
-    # multi-connection downloader and the executable already ships in the repo.
-    # Opt-in, because an external downloader changes how ranges and retries
-    # behave and that is not something to change silently.
+    # Hand the transfer to aria2c when the binary is available.
+    #
+    # Measured on a ~450 KB/s link: aria2c took 22.3 s against yt-dlp's 12.7 s
+    # for the same file, consistently across repeats (+75%). Splitting one
+    # connection's worth of bandwidth across eight adds process start-up, eight
+    # connection setups and a .aria2 control file, and none of that buys
+    # throughput when the link itself is the constraint. It is the right tool when
+    # a single connection is throttled or the latency is high, and the wrong one
+    # on a slow pipe.
+    #
+    # So it stays opt-in and off. The binary is detected either way, and asking
+    # for it when it is missing says so rather than silently doing nothing.
     USE_ARIA2C: bool = False
 
     # --- State persistence ---------------------------------------------------

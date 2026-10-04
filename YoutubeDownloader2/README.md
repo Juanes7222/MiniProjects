@@ -130,13 +130,24 @@ cleanly and then never return.
 ## Downloads
 
 ```bash
-ytdl --file songs.json --use-aria2c            # hand transfers to aria2c
 ytdl --file songs.json --fragment-concurrency 8
+ytdl --file songs.json --use-aria2c
 ```
 
-DASH audio arrives as many small fragments and yt-dlp fetches one at a time by
-default; `--fragment-concurrency` opens several. `--use-aria2c` hands the transfer
-to a native multi-connection downloader when the binary is present.
+Both were measured on this project and **neither is a speed-up as configured**:
+
+- `--fragment-concurrency` is **inert**. With the configured YouTube player
+  clients, yt-dlp is offered audio as a single progressive HTTPS file (measured:
+  format 251, webm/opus, no fragments), so there is nothing to fetch
+  concurrently. It applies if a format ever arrives segmented.
+- `--use-aria2c` was **75% slower** on a ~450 KB/s link (22.3 s vs 12.7 s for the
+  same file, consistent across repeats). Splitting one connection's worth of
+  bandwidth across eight costs more in connection setup than it recovers. It is
+  the right tool where a single connection is throttled or latency is high, and
+  the wrong one on a slow pipe — so it is off by default.
+
+The knobs exist because they cost nothing when unused and are the first thing to
+reach for when the situation changes. Neither is presented here as a win.
 
 ## Caching
 

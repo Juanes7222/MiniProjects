@@ -1539,7 +1539,11 @@ class MusicDownloader:
             else:
                 try:
                     fp_ok, fp_conf, fp_title, fp_label = self._fingerprint_one(
-                        url, artist, song, output_dir
+                        url,
+                        artist,
+                        song,
+                        output_dir,
+                        expected_duration=int(result.duration_seconds or 0) or None,
                     )
                 finally:
                     release_fingerprint_slot(self._fingerprint_cache, url, artist, song)
@@ -1561,6 +1565,7 @@ class MusicDownloader:
         artist: str,
         song: str,
         output_dir: Path,
+        expected_duration: Optional[int] = None,
     ) -> tuple[bool, float, Optional[str], Optional[str]]:
         """Partial-download one candidate, fingerprint it, and cache the verdict.
 
@@ -1569,6 +1574,11 @@ class MusicDownloader:
         the download around it too would have wasted the budget -- but bounding
         concurrent partials is still what keeps a batch from putting dozens of
         90-second clips in flight at once.
+
+        ``expected_duration`` is the candidate's **own** length, passed on so
+        AcoustID is told how long the track really is rather than how long the
+        excerpt is. See :func:`~ytdl_core.fingerprint.verify_fingerprint` for why
+        that difference decides whether anything matches at all.
         """
         partial = None
         try:
@@ -1593,6 +1603,7 @@ class MusicDownloader:
                     self.acoustid_key,
                     self.config,
                     self._circuit_breaker,
+                    expected_duration=expected_duration,
                     on_warn=self.events.on_warn,
                     on_info=self.events.on_info,
                     on_fingerprint_error=self.events.on_fingerprint_error,
@@ -1756,7 +1767,14 @@ class MusicDownloader:
                 return entry, cached.verified, cached.confidence, cached.matched_title
             try:
                 verified, confidence, title, _label = self._fingerprint_one(
-                    url, artist, song, output_dir
+                    url,
+                    artist,
+                    song,
+                    output_dir,
+                    # Each alternate is a different recording, so each needs its
+                    # own length declared. Reusing the winner's would search for
+                    # the wrong track.
+                    expected_duration=int(entry.get("duration") or 0) or None,
                 )
             except Exception:
                 return entry, False, 0.0, None

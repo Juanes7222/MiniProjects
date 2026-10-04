@@ -225,9 +225,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--use-aria2c",
         action="store_true",
         help=(
-            "Hand transfers to aria2c when the binary is available. It is a native "
-            "multi-connection downloader, so the same file arrives over several "
-            "connections instead of one."
+            "Hand transfers to aria2c when the binary is available. Measured on a "
+            "~450 KB/s link it was 75%% SLOWER than yt-dlp's own downloader (22.3s "
+            "vs 12.7s for the same file), because splitting one connection's worth "
+            "of bandwidth costs more in connection setup than it recovers. Only "
+            "worth trying where a single connection is throttled or latency is high."
         ),
     )
     p.add_argument(
@@ -237,7 +239,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=_CONFIG.FRAGMENT_CONCURRENCY,
         help=(
             "How many DASH fragments to fetch at once per file (default: "
-            "%(default)s). yt-dlp uses 1, which leaves bandwidth idle."
+            "%(default)s). Note this is currently inert: the configured YouTube "
+            "player clients offer audio as a single progressive HTTPS file, so "
+            "there are no fragments. It applies if formats arrive segmented."
         ),
     )
     p.add_argument(
