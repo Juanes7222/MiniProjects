@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
 
 from .config import Config
+from .state import has_local_file
 from .utils import normalize_title
 
 __all__ = ["ChannelTrust", "channel_url_for", "backfill_channels"]
@@ -175,7 +176,10 @@ class ChannelTrust:
         if not isinstance(downloads, dict):
             return trust
         for key, entry in downloads.items():
-            if not isinstance(entry, dict) or entry.get("status") != "downloaded":
+            # "downloaded" or "verified": a verify pass rewrites the status, and
+            # the provenance it carries is exactly as trustworthy afterwards.
+            # Filtering on one spelling silently emptied this model.
+            if not has_local_file(entry):
                 continue
             channel = entry.get("channel")
             if not channel:

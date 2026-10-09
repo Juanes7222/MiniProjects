@@ -578,9 +578,22 @@ class KevServerManager:
         instantly, so the probe measured nothing at all and cheerfully reported a
         healthy server while every real evaluation took minutes. A benchmark that
         skips the work is worse than no benchmark.
+
+        It also has to be the same *size*. Cost is superlinear in the question
+        count on this hardware -- measured at one request in flight with CUDA
+        graphs on: 19 questions 3.1s, 25 questions 10.1s, 31 questions 29.8s.
+        A 19-question probe therefore sits on the flat part of the curve and
+        passes while the 31 questions the pipeline actually sends are already
+        past the knee; with CUDA graphs off the same probe read 1.5s against
+        124.1s for the real payload. So the candidate count is derived from the
+        question budget the pipeline will really spend, using the same arithmetic
+        as ``JevClassifier._trim_to_question_budget``.
         """
         from . import decision_questions as dq
+        from .config import Config
 
+        budget = max(1, int(Config.DECISION_MAX_QUESTIONS))
+        affordable = max(1, (budget - 1) // max(1, len(dq.DIMENSIONS)))
         candidates = [
             {
                 "id": f"probe{i}",
@@ -591,7 +604,7 @@ class KevServerManager:
                 "duration": 200 + i,
                 "_composite_score": 200 - i,
             }
-            for i in range(3)
+            for i in range(affordable)
         ]
         state, _candidate_states, questions = dq.build_state_and_questions(
             "Probe Artist", "Probe Song", candidates, None, dq.TYPESAFE_DIALECT
@@ -627,8 +640,9 @@ class KevServerManager:
             self._step(
                 "Kev: WARNING -- CUDA graphs are OFF. kev.serve enables them by default "
                 "on CUDA because a serving pass is ~2,000 kernel launches and replaying "
-                "graphs cuts warm latency several-fold (measured here: 3338 ms -> 2470 ms "
-                "per evaluation). Something is setting KEV_CUDA_GRAPHS=0."
+                "graphs is what keeps a full-budget request inside its deadline: measured "
+                "here on a 31-question payload at one request in flight, 3.0 s with graphs "
+                "against 124.1 s without. Something is setting KEV_CUDA_GRAPHS=0."
             )
 
         self._step(

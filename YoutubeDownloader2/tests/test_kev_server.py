@@ -239,10 +239,12 @@ def test_batching_report_says_whether_the_gpu_is_fed(tmp_path):
 def test_server_environment_does_not_disable_cuda_graphs_or_fused_kernels(tmp_path):
     """The regression this whole exercise exists to prevent.
 
-    ``KEV_CUDA_GRAPHS=0`` threw away a measured 26% latency win, and
-    ``KEV_FUSED=0`` did it silently: kev.serve only prints its "fused kernels
-    off" notice when the flag is *unset*, so pinning it to 0 disabled the kernels
-    *and* the warning that they were off. Neither flag may be set by default.
+    ``KEV_CUDA_GRAPHS=0`` threw away the difference between a request that
+    finishes and one that does not -- 3.0 s against 124.1 s for the same
+    31-question payload at one request in flight -- and ``KEV_FUSED=0`` did it
+    silently: kev.serve only prints its "fused kernels off" notice when the flag
+    is *unset*, so pinning it to 0 disabled the kernels *and* the warning that
+    they were off. Neither flag may be set by default.
     """
     env = KevServerManager(tmp_path / "kev")._environment()
     assert "KEV_CUDA_GRAPHS" not in env

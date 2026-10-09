@@ -175,20 +175,31 @@ class Config:
     # A decision server is a shared single-device resource, so these bound how
     # hard it is leaned on.
     #
-    # How many evaluations may be in flight at once. This used to be 1, on the
-    # reasoning that one at a time makes a slow server predictable. That is true
-    # of a server that does not batch, and it is the wrong assumption for one
-    # that does: kev.serve drains up to MAX_BATCH=64 queued requests into a
-    # single model pass, so N requests in flight finish in roughly one pass
-    # instead of N. Holding it at 1 threw that away and capped a whole batch at
-    # one evaluation per round trip.
+    # How many evaluations may be in flight at once.
     #
-    # Not free, though: each queued request holds its state in the server's cache
-    # and its rows in the batching buffers, so this is bounded by VRAM as much as
-    # by throughput. Six is a measured-middle setting for a 16 GB card running a
-    # 4B checkpoint (~14 GB resident); raise it on a bigger card, lower it to 1 to
-    # make a slow server strictly serial.
-    DECISION_MAX_IN_FLIGHT: int = 6
+    # Measured on this machine (RTX 5060 Ti 16 GB, jaredpalmer/kev-4b@v1.0,
+    # CUDA graphs on) with the payload the app actually sends -- 5 candidates
+    # after the question-budget trim, so 31 questions:
+    #
+    #     in flight 1 -> 3.0 s      in flight 4 -> 4/4 timed out past 150 s
+    #     in flight 2 -> 5.8 s both in flight 6 -> 6/6 timed out past 150 s
+    #
+    # kev.serve really does drain up to MAX_BATCH=64 queued requests into one
+    # model pass, so 2 in flight is not slower per request -- but it buys
+    # nothing either (0.34 req/s against 0.33 for serial) while holding twice
+    # the states in the server cache and the batching buffers. Past 2 it stops
+    # being a throughput knob at all: the batch grows, CUDA graph capture starts
+    # churning on new shapes, and every request queued behind it misses the
+    # client deadline. The GPU then sits at 100% finishing work nobody is
+    # waiting for, which is exactly the failure a raised limit was meant to
+    # avoid.
+    #
+    # Serial it is. Raising this needs a re-measurement on the target card, not
+    # an argument about batching.
+    DECISION_MAX_IN_FLIGHT: int = 1
+    # Generous against the measured 3 s for a full-budget request at in-flight 1,
+    # but the timeout is a backstop, not a target: a request that blows it is
+    # still running on the server, and the next one queues behind it.
     DECISION_TIMEOUT_SECONDS: int = 60
     # Consecutive failures after which the provider is abandoned for the run.
     # Low on purpose: the heuristic is a complete ranker, so the model is a

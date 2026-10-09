@@ -22,51 +22,84 @@ Todo lo de abajo se midió en esta máquina salvo indicación contraria. Las
 cifras que **no** se pudieron medir están marcadas como tales, y las
 estimaciones que resultaron equivocadas se corrigieron.
 
-## GPU / Kev — A/B real, misma carga (31 preguntas, 5 candidatos)
+## GPU / Kev — medido en esta máquina, GPU sin contention
 
-> ### ⚠️ Todas las cifras absolutas de esta sección dependen del estado de la GPU
+> ### ⚠️ La sección anterior daba números no fiables, y sus conclusiones eran falsas
 >
-> La tarjeta estaba **compartida** durante las mediciones: Wallpaper Engine
-> renderizando en segundo plano y 22 procesos con contexto GPU. El reloj SM iba a
-> **652 MHz en reposo sobre 3090 MHz de máximo**, y subía solo a ~1177 MHz bajo
-> carga — un 38% de lo que debería.
->
-> Una medición posterior de concurrencia dio **18.957 ms** por evaluación donde
-> antes daba 2.470 ms, con el mismo código. La diferencia es la GPU, no el
-> software.
->
-> **Qué sigue siendo válido:** la comparación *relativa* entre las dos filas de
-> la tabla, medida back-to-back en la misma ventana de minutos. **Qué no:** los
-> números absolutos. Re-medir con la GPU libre antes de sacar conclusiones de
-> capacidad.
+> Las mediciones de la primera pasada se hicieron con la tarjeta **compartida**
+> (Wallpaper Engine y 22 procesos con contexto GPU; reloj SM a 652 MHz de 3090).
+> Todo lo absoluto de aquella tabla está retirado. Lo que se mantiene son las
+> cifras de abajo, tomadas con la GPU libre, y las tres correcciones que
+> salieron de ellas.
 
-| Configuración | CUDA graphs | fused kernels | Latencia |
-|---|---|---|---|
-| Antes (ambas apagadas a propósito) | OFF | OFF (sin aviso) | **3338 ms** |
-| fused ON, graphs OFF | OFF | ON | **no respondió** (>90 s) |
-| fused OFF, graphs ON | ON | OFF | **2451–2492 ms** |
+### Ley de escalado: el coste es superlineal en el número de preguntas
 
-**Ganancia: −26%** (3338 → ~2470 ms). Cuadros CUDA activos: sí, y medido.
+Un request, con CUDA graphs activo, `kev-4b@v1.0` en RTX 5060 Ti 16 GB:
 
-### El hallazgo importante: `flash-linear-attention` no funciona aquí
+| candidatos | preguntas | latencia |
+|---|---|---|
+| 1 | 6 | 1,3 s |
+| 2 | 13 | 2,2 s |
+| 3 | 19 | 3,1 s |
+| 4 | 25 | 10,1 s |
+| 5 | **31** | **29,8 s** |
+| 6 | 37 | 82,4 s |
+| 12 | 73 | 221,7 s |
 
-Se instala correctamente (`fla.__version__ == 0.5.2`, exactamente lo que Kev
-exige), `triton-windows==3.4.0.post21` compila y ejecuta un kernel real en
-sm_120 sin error… y aun así **el primer evaluation real nunca termina**. El
-mismo request con fused declinado responde en 2.5 s.
+12× las preguntas → **440× el tiempo**. El codo está entre 31 y 37 preguntas. Por
+eso `DECISION_MAX_QUESTIONS = 32` es el número correcto: con 6 dimensiones deja
+5 candidatos y 31 preguntas. El recorte a presupuesto ya existía
+(`JevClassifier._trim_to_question_budget`) y sí funciona; lo que no funcionaba era
+el probe, que medía 19 preguntas y daba un veredicto optimista.
 
-Es decir: `kev.fused_available()` (un chequeo de import) dice que sí, y miente.
-Por eso la decisión ahora se toma con un **probe de latencia real bajo timeout
-duro**, no con un import. Un batch que colgaba en su primera canción, con nada
-en el log que lo explicara.
+### CUDA graphs: load-bearing, no una optimisation del 26%
 
-### `KEV_FUSED=0` resultaba ser correcto aquí — por accidente
+Mismo payload real de 31 preguntas, un request en vuelo:
 
-El código original tenía `KEV_CUDA_GRAPHS=0` **y** `KEV_FUSED=0`. El segundo era
-la decisión correcta para esta máquina, pero por el motivo equivocado: no
-buscaba "los kernels no funcionan", y además **suprimía el aviso** de kev.serve
-sobre ellos apagados. Ahora la decisión es medida, argumentada y reversible con
-`--kev-fused` / `--no-kev-fused`.
+| | graphs ON | graphs OFF |
+|---|---|---|
+| 31 preguntas | **3,0 s** | **124,1 s** |
+
+La cifra de "−26%" era de una forma de batch estrecha. La realidad es que sin
+graphs un request normal **no cabe ni de lejos** en `DECISION_TIMEOUT_SECONDS`, y
+el probe de arranque no lo detectaba porque medía 19 preguntas (la parte plana de
+la curva). El probe ahora se dimensiona con el mismo presupuesto que el pipeline.
+
+### `DECISION_MAX_IN_FLIGHT`: 6 → 1 (A4 estaba equivocado)
+
+Payload real de 31 preguntas, CUDA graphs activo:
+
+| en vuelo | resultado | throughput |
+|---|---|---|
+| 1 | 3,0 s | 0,33 req/s |
+| 2 | 5,8 s (ambos OK) | 0,34 req/s |
+| 4 | **4/4 timeout >150 s** | — |
+| 6 | **6/6 timeout >150 s** | — |
+
+Subirlo a 6 se hizo con un argumento sobre *batching* (`MAX_BATCH=64`) sin
+medir. Medido: 2 en vuelo **no dasthroughput** (0,34 contra 0,33) y duplica los
+estados residentes; a partir de 4 el batch crece, la captura de CUDA graphs
+empieza a churnar sobre formas nuevas (`captured` 0→1→2, `pending` 11→16) y
+**todas** las peticiones encoladas detrás pierden el plazo del cliente. La GPU
+luego se queda al 100% terminando trabajo que nadie espera — exactamente el fallo
+que subir el límite pretendía evitar. De vuelta a 1, con los números en el
+comentario de `Config`.
+
+### `flash-linear-attention` sí funciona aquí
+
+Dos errores de mi parte se combinaban para conclusionarlo al revés:
+
+1. `flash-linear-attention` importa como **`fla`**, no como `flash_linear_attention`.
+   Mi comprobación manual usó el nombre equivocado y "probó" la ausencia del paquete.
+2. Los avisos de transformers (`causal_conv1d_fn` / `chunk_gated_delta_rule`
+   "falling back to its reference PyTorch implementation") **no son evidencia**:
+   transformers busca el módulo `flash_linear_attention`, que ese paquete no
+   expone; kev usa `fla` directamente en su `fused_qwen35`.
+
+El probe de latencia real bajo timeout duro se queda —es buena defensa—, pero el
+veredicto actual es que **los kernels funcionan** (1,8 s para las 31 preguntas del
+payload real). El "no respondió >90 s" anterior era la GPU compartida y la
+captura de graphs, no FLA.
 
 ### Payload de decisión: −21,4%
 
@@ -125,17 +158,23 @@ intérprete del venv de Kev. Además avisaba al importar porque faltaba numpy.
 
 # FASE 1 — Kev / GPU
 
-- [x] **A1. `KEV_CUDA_GRAPHS=0` apagaba los CUDA graphs.** Medido −26%.
+- [x] **A1. `KEV_CUDA_GRAPHS=0` apagaba los CUDA graphs.** Medido: 3,0 s → 124,1 s
+      para el payload real de 31 preguntas. No era una optimisation del 26%, era
+      la condición de posibilidad de que un request acabe.
 - [x] **A2. `KEV_FUSED=0` apagaba los kernels fusionados *y su aviso*.** Ahora la
       decisión es medida por un probe de latencia con timeout duro, y es
-      reversible con `--kev-fused` / `--no-kev-fused`.
+      reversible con `--kev-fused` / `--no-kev-fused`. Veredicto actual en esta
+      máquina: **los kernels funcionan**.
 - [x] **A3. `flash-linear-attention` + Triton.** Se instalan
-      `flash-linear-attention==0.5.2` y el Triton que corresponde al torch
-      (Windows: `triton-windows~=3.4.0` para torch 2.8, mapeado por versión;
-      Linux: el que ya viene con el build cu128). Idempotente y no fatal.
-- [x] **A4. `DECISION_MAX_IN_FLIGHT` 1 → 6**, expuesto como
-      `--decision-in-flight`. Kev drena hasta `MAX_BATCH=64` requests en un
-      solo model pass; con 1 el techo del lote era `1/latencia`.
+      `flash-linear-attention==0.5.2` (importa como `fla`) y el Triton que
+      corresponde al torch (Windows: `triton-windows~=3.4.0` para torch 2.8,
+      mapeado por versión; Linux: el que ya viene con el build cu128).
+      Idempotente y no fatal.
+- [x] **A4. `DECISION_MAX_IN_FLIGHT` 6 → 1.** Se subió a 6 por un argumento sobre
+      batching, sin medir, y **fue la causa del fallo de un lote real de 1554
+      canciones**. Medido con el payload real: 1 → 3,0 s; 2 → 5,8 s sin ganancia
+      de throughput; 4 → 4/4 timeout >150 s; 6 → 6/6 timeout >150 s. Sigue
+      expuesto como `--decision-in-flight`.
 - [x] **A5. `requests.Session` con keep-alive.** Antes cada request abría conexión
       TCP+TLS nueva; se veía en el log del servidor (puerto origen distinto en
       cada línea). Ahora el pool se dimensiona al in-flight.
@@ -267,21 +306,22 @@ grep "fused Qwen3.5 kernels off" ~/.cache/ytdl/kev/ytdl-kev.log
 
 Ordenado por lo que más cambia una decisión.
 
-### 1. Re-medir con la GPU libre  ← lo más importante
-Todo lo absoluto de la sección GPU es dudoso, y `DECISION_MAX_IN_FLIGHT = 6` se
-eligió **por razonamiento, no por medición**: el throughput a 6 concurrentes
-nunca se midió en esta máquina. Con la GPU-clock correcta se puede:
-- confirmar o ajustar `--decision-in-flight` (el número correcto depende de VRAM
-  libre, y 14,3 GB residentes en 16 GB deja poco margen para batches grandes)
-- obtener la latencia real, y con ella saber si compensa bajar
-  `--decision-questions`
-- volver a intentar los kernels fusionados con la GPU sin competencia
+### 1. ~~Re-medir con la GPU libre~~ — hecho
+Rehecho con la tarjeta libre. `--decision-in-flight` medido y **vuelto a 1**; la
+latencia real es 3,0 s para 31 preguntas; y los kernels fusionados **sí
+funcionan**, así que el punto 2 de esta lista era una conclusión falsa. Lo que
+queda por debajo es el resto de la lista.
 
-### 2. Los kernels fusionados siguen sin funcionar en sm_120 / Windows
-~1/3 del tiempo de GPU no se está aprovechando. El probe ya los detecta y
-degrada con un aviso honesto, así que no hay riesgo, pero la ganancia existe.
-Vale la pena solo si aparece un build de Triton que los ejecute, o si el
-problema fuera de la fricción de `triton-windows`. `--kev-fused` fuerza el camino.
+### 2. ~~Los kernels fusionados siguen sin funcionar~~ — falso
+`flash-linear-attention==0.5.2` está instalado, importa como `fla` y responde un
+payload real de 31 preguntas en 1,8 s. El "no responde >90 s" de la primera pasada
+era la GPU compartida. El probe de latencia real se mantiene porque es buena
+defensa, pero hoy reporta éxito.
+
+Queda un residuo: los avisos de transformers sobre
+`causal_conv1d_fn` / `chunk_gated_delta_rule` son ruido en esta configuración
+(transformers busca `flash_linear_attention`, que el paquete no expone; kev usa
+`fla`). Ruido que se lee como avería y ya costó una conclusión equivocada.
 
 ### 3. `aria2c` y `--fragment-concurrency` — MEDIDOS, ninguno es una ganancia
 
@@ -367,8 +407,44 @@ cached : (True, 0.95022166, 'Dios háblame')
 Antes de ese arrangement, esa misma canción tenía `fingerprint_label: "no
 AcoustID match"` en el state file.
 
-**Falta**: re-verificar la biblioteca con `--verify` para republicar los sellos,
-que ahora serán correctos. Antes salieron `no AcoustID match` o `disabled`.
+### 4b. `--verify` vaciaba el estado que el downloader había construido 🔴
+
+Encontrado al **ejecutar** `--verify` de verdad, no leyendo. El run escribió
+`status: "verified"` en las 88 entradas… y dos sitios comparaban contra el
+literal `"downloaded"`.
+
+Medido sobre la biblioteca real, antes y después de un solo `--verify`:
+
+| | antes | después |
+|---|---|---|
+| `ChannelTrust.from_state` → canales | **10** | **0** |
+| `--skip-existing` → canciones saltadas | **88 de 91** | **0 de 91** |
+
+Es decir: el modelo de confianza de canales aprendía se borraba entero, y la
+siguiente tanda con `--skip-existing` se **re-descargaba la biblioteca completa**.
+El `channel` seguía en las 88 entradas — los datos estaban, solo dejaban de
+leerse.
+
+Arreglo: `state.has_local_file()` / `PRESENT_STATUSES = {"downloaded",
+"verified"}`, y los dos sitios pasan por ahí para que la regla no vuelva a
+separarse. Verificado: los 10 canales sobreviven.
+
+**Efecto secundario que sí queríamos**: al re-verificar, 28 descargas pasaron a
+`fingerprint_verified: True`, y el peso de "Abel Zavala" en el modelo de
+confianza subió de **41 a 95** — `TRUST_VERIFIED_MULTIPLIER=3` por fin se
+dispara, que era justo lo que B1 predijo y por fin ocurre. Eso es la
+cascada de la corrección de la duración.
+
+### Nota sobre la biblioteca real
+
+- **88/88 verificados** en 36 s (ficheros intactos).
+- **28/88 confirmados por AcoustID**; los otros 60 no están en la base. Comprobé
+  cuatro directamente, fuera del pipeline y con los ficheros completos: es una
+  ausencia real, no un fallo de fontanería. Material regional ADCColombia nord
+ tiene poca cobertura en AcoustID.
+- Los hashes **round-trip OK**: 88/88 coinciden (84 MD5 legacy + 4 blake2b). El
+  tag de compatibilidad hacia atrás funciona sobre datos reales, no solo en
+  tests.
 
 ### Un aviso sobre mi propio diagnóstico
 

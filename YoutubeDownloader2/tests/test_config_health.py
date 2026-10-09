@@ -137,7 +137,7 @@ def test_config_is_still_a_dataclass_with_defaults():
 @pytest.mark.parametrize(
     "name,expected",
     [
-        ("DECISION_MAX_IN_FLIGHT", 6),
+        ("DECISION_MAX_IN_FLIGHT", 1),
         ("DECISION_PROBE_BUDGET_SECONDS", 20.0),
         ("FRAGMENT_CONCURRENCY", 4),
         ("SILENCE_DETECT_SAMPLE_RATE", 8000),

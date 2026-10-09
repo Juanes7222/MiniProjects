@@ -12,6 +12,24 @@ if TYPE_CHECKING:
 
 _DEFAULT_STATE_FILENAME = Config().STATE_FILE
 
+#: Statuses that mean "this file is on disk and good".
+#:
+#: A verify pass rewrites ``downloaded`` to ``verified``, and code that asks
+#: "is this file present and usable?" must not care which of the two it is. Both
+#: places that used to hardcode ``status == "downloaded"`` broke after a single
+#: ``--verify`` run: the learned channel-trust model dropped from 10 channels to
+#: 0, because every entry stopped looking like a completed download, and
+#: ``--skip-existing`` went from skipping 88 of 91 songs to skipping none, so the
+#: next batch re-downloaded the whole library.
+#:
+#: Kept as one name so the rule cannot drift apart again.
+PRESENT_STATUSES: frozenset[str] = frozenset({"downloaded", "verified"})
+
+
+def has_local_file(entry: dict[str, Any]) -> bool:
+    """Whether a state entry records a file that is present and usable."""
+    return isinstance(entry, dict) and entry.get("status") in PRESENT_STATUSES
+
 
 def load_state(
     output_dir: Path,

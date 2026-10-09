@@ -263,6 +263,30 @@ class TestProbePayload:
         assert any("::" in key for key in payload["questions"])
         assert payload["state"]["target"]["artist"] == "Probe Artist"
 
+    def test_probe_is_the_size_the_pipeline_really_sends(self):
+        """A correctly shaped probe at the wrong size still reports a lie.
+
+        Latency here is superlinear in the question count: measured at one
+        request in flight, 19 questions took 3.1s, 25 took 10.1s and 31 took
+        29.8s. A 19-question probe therefore sits on the flat part of the curve
+        and passes while the 31 questions the pipeline actually spends are past
+        the knee -- with CUDA graphs off it read "1.5s, within budget" against
+        124.1s for the real payload. So the probe must be sized by the same
+        question budget the pipeline uses.
+        """
+        from ytdl_core import decision_questions as dq
+        from ytdl_core.config import Config
+        from ytdl_core.jev import JevClassifier
+        from ytdl_core.kev_server import KevServerManager
+
+        manager = KevServerManager(Path(tempfile.mkdtemp()) / "kev")
+        probe = manager._probe_payload()
+        assert len(probe["questions"]) == JevClassifier._question_count(
+            max(1, (Config.DECISION_MAX_QUESTIONS - 1) // len(dq.DIMENSIONS))
+        )
+        # And that is the full budget, not a fraction of it that would flatter it.
+        assert len(probe["questions"]) >= Config.DECISION_MAX_QUESTIONS - len(dq.DIMENSIONS)
+
     def test_probe_survives_a_contract_failure(self):
         from ytdl_core.kev_server import KevServerManager
 

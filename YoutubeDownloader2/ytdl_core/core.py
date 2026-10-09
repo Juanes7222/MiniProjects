@@ -41,7 +41,7 @@ from .post_checks import check_duration, check_silence, embed_and_verify
 from .reports import export_report, update_json_file
 from .result import DownloadResult
 from .search import search_all_sources, select_best_result
-from .state import load_state, merge_state_detail, save_state, state_detail
+from .state import has_local_file, load_state, merge_state_detail, save_state, state_detail
 from .statewriter import CoalescingStateWriter
 from .utils import (
     apply_delay,
@@ -956,7 +956,7 @@ class MusicDownloader:
         )
         with job.state_lock:
             existing = job.state.get("downloads", {}).get(job.key)
-        if job.skip_existing and existing and existing.get("status") == "downloaded":
+        if job.skip_existing and has_local_file(existing):
             md5s = existing.get("md5")
             if expected.exists():
                 if md5s:
