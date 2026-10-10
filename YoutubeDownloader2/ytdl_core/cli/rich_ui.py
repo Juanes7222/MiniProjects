@@ -34,6 +34,21 @@ from ..result import DownloadResult
 from ..utils import format_duration, format_size
 
 
+def _decision_column_width(provider: str) -> int:
+    """Width of the decision column, wide enough for the worst cell in it.
+
+    The cell reads "<provider> veto <failed gates>", and the gate names are the
+    dimension keys, so the longest one is whatever the question set defines. A
+    fixed width silently truncated as soon as a longer provider name existed,
+    which is the kind of thing nobody notices until they are reading the table
+    to find out why a candidate was discarded.
+    """
+    from .. import decision_questions as dq
+
+    gates = "/".join(dimension.key for dimension in dq.GATE_DIMENSIONS)
+    return len(f"{provider} veto {gates}") + 1
+
+
 class RichEvents(DownloaderEvents):
     """
     Full Rich implementation of DownloaderEvents.
@@ -203,9 +218,11 @@ class RichEvents(DownloaderEvents):
             else "Decision"
         )
         if has_decision:
-            # Wide enough for "Kev veto identity/origin" without truncating the
-            # reason a candidate was discarded.
-            tbl.add_column(decision_provider, width=24)
+            # Derived, because the cell holds "<provider> veto <gates>" and the
+            # longest thing it can hold is the longest gate list the question set
+            # defines. A literal 24 was exactly "Kev veto identity/origin" and
+            # truncated the moment a longer provider name arrived.
+            tbl.add_column(decision_provider, width=_decision_column_width(decision_provider))
         tbl.add_column("Heur.", width=8)
         tbl.add_column("Top signals", min_width=30, style="dim")
 
@@ -252,11 +269,25 @@ class RichEvents(DownloaderEvents):
                     )
                     if not entry.get("_decision_eligible", True):
                         failed = "/".join(entry.get("_decision_failed_gates") or [])
-                        decision_cell = (
-                            f"[red]{decision_provider} veto {failed}[/red]"
-                            if failed
-                            else f"[red]{decision_provider} vetoed[/red]"
+                        dimensions = entry.get("_decision_dimensions") or {}
+                        # The scores, not just the names. `veto origin` says which
+                        # gate fired; it does not say whether origin answered 41%
+                        # against a 50% floor (the floor is wrong) or 4% (the
+                        # candidate is wrong), and those are opposite conclusions.
+                        detail = " ".join(
+                            f"{float(dimensions[key]):.0%}"
+                            for key in (entry.get("_decision_failed_gates") or [])
+                            if key in dimensions
                         )
+                        suffix = f" {detail}" if detail else ""
+                        if entry.get("_decision_shielded"):
+                            decision_cell = f"[yellow]{decision_provider} shield{suffix}[/yellow]"
+                        elif failed:
+                            decision_cell = (
+                                f"[red]{decision_provider} veto {failed}{suffix}[/red]"
+                            )
+                        else:
+                            decision_cell = f"[red]{decision_provider} vetoed{suffix}[/red]"
                     elif not entry.get("_decision_stable", True):
                         decision_cell = f"[yellow]{decision_percent}%?[/yellow]"
                     elif probability >= self.decision_threshold:

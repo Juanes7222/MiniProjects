@@ -67,7 +67,12 @@ def test_kev_uses_local_systemone_api(monkeypatch):
 
     assert selected is not None
     assert selected["_decision_provider"] == "Kev"
-    assert selected["_composite_score"] == 95
+    # 0.95 on every dimension, plus the artist-channel provenance bonus: the
+    # channel is named after the artist, so it is a proven publisher.
+    assert selected["_decision_provenance"] == "artist_channel"
+    assert selected["_composite_score"] == round(
+        (0.95 + dq.provenance_bonus("artist_channel")) * 100
+    )
     assert captured["url"] == "http://127.0.0.1:8009/v1/systemone"
     assert captured["json"]["model"] == "kev-4b"
     assert ranked[0][0]["_decision_selected"] is True
@@ -163,7 +168,7 @@ def test_kev_retries_on_server_error(monkeypatch):
         return Flaky(next(statuses))
 
     monkeypatch.setattr(requests.Session, "post", fake_post)
-    monkeypatch.setattr("ytdl_core.kev.time.sleep", lambda *_: None)
+    monkeypatch.setattr("ytdl_core.systemone.time.sleep", lambda *_: None)
 
     classifier = KevClassifier(threshold=0.60)
     selected, _ = classifier.select(

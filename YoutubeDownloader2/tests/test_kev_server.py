@@ -14,7 +14,10 @@ def _manager(tmp_path, steps=None):
 
 
 def _fake_nvidia_smi(monkeypatch, *, returncode=0, stdout="", present=True):
-    monkeypatch.setattr("ytdl_core.kev_server.shutil_which", lambda name: "nvidia-smi" if present else None)
+    # Patched on procutil, which is where the query now lives and is shared with
+    # the Decider supervisor. Patching it here through kev_server happened to work
+    # only because `subprocess` is the same module object on both sides.
+    monkeypatch.setattr("ytdl_core.procutil.shutil_which", lambda name: "nvidia-smi" if present else None)
 
     class Completed:
         pass
@@ -27,7 +30,8 @@ def _fake_nvidia_smi(monkeypatch, *, returncode=0, stdout="", present=True):
     def fake_run(command, **kwargs):
         return completed
 
-    monkeypatch.setattr("ytdl_core.kev_server.subprocess.run", fake_run)
+    monkeypatch.setattr("ytdl_core.procutil.subprocess.run", fake_run)
+
 
 
 class TestGpuDetection:
@@ -338,7 +342,8 @@ def test_slow_server_is_reported_with_the_remedy(monkeypatch, tmp_path):
 
     manager._report_latency(budget_seconds=20.0)
     assert any("SLOW" in step for step in steps)
-    assert any("kev-timeout" in step for step in steps)
+    assert any("decision-timeout" in step for step in steps)
+
 
 
 def test_probe_timeout_is_reported_as_slow_with_the_remedy(monkeypatch, tmp_path):

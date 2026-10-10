@@ -232,7 +232,98 @@ def test_ranking_score_is_the_weighted_mean_of_ranking_dimensions(monkeypatch):
         + dq.RANK_WEIGHTS[dq.DIM_REFERENCE.key] * 0.0
     ) / sum(dq.RANK_WEIGHTS.values())
     assert selected is not None
-    assert selected["_decision_score"] == pytest.approx(expected)
+    # The mean itself, before provenance. `_decision_score` adds the publisher
+    # bonus on top; asserting the mean there would make the test fail the moment
+    # the bonus changed, without saying anything about the weighting.
+    assert selected["_decision_ranking_score"] == pytest.approx(expected)
+    assert selected["_decision_score"] == pytest.approx(
+        expected + dq.provenance_bonus(selected["_decision_provenance"])
+    )
+
+
+def test_provenance_breaks_a_tie_the_dimensions_could_not(monkeypatch):
+    """The case that put a church channel above the official Topic upload.
+
+    `studio`, `audio` and `reference` answered 18/41/93 for the church upload and
+    12/39/92 for the official one -- differences of 0.006, 0.007 and 0.0025 in the
+    composite, i.e. noise. Nothing in the ranking knew who published either of them.
+    """
+    official = _candidate("Alto precio", 255)
+    official["channel"] = "Jorge Lozano - Topic"
+    church = _candidate("IC0048-Alto Precio - Jorge Lozano", 140)
+    church["channel"] = "IglesiaCanta"
+
+    both = ["candidate_0", "candidate_1"]
+    # The church upload edges the official one on every ranking dimension.
+    answers = _answers(
+        both,
+        per_key={
+            "candidate_0": {"identity": .32, "origin": .41, "form": .33,
+                            "studio": .12, "audio": .39, "reference": .92},
+            "candidate_1": {"identity": .60, "origin": .40, "form": .60,
+                            "studio": .18, "audio": .41, "reference": .93},
+        },
+    )
+    classifier = JevClassifier(threshold=0.10)
+    monkeypatch.setattr(classifier, "_evaluate", lambda state, questions, model=None: answers)
+
+    selected, ranked = classifier.select("Jorge Lozano", "Alto Precio", [official, church])
+
+    assert selected is not None
+    assert selected["channel"] == "Jorge Lozano - Topic"
+    # And the church upload really does score higher on the dimensions alone --
+    # otherwise this test would pass for the wrong reason.
+    by_channel = {entry["channel"]: entry for entry, _, _ in ranked}
+    assert (
+        by_channel["IglesiaCanta"]["_decision_ranking_score"]
+        > by_channel["Jorge Lozano - Topic"]["_decision_ranking_score"]
+    )
+    assert by_channel["Jorge Lozano - Topic"]["_decision_provenance"] == "topic_channel"
+    assert by_channel["IglesiaCanta"]["_decision_provenance"] == "unknown"
+
+
+def test_a_lyric_video_does_not_beat_the_official_audio(monkeypatch):
+    """`Solo Una Palabra Tuya`: the fan lyric video won 39% to 37%."""
+    official = _candidate("Solo Una Palabra Tuya", 255)
+    official["channel"] = "Jorge Lozano - Topic"
+    lyric = _candidate("Solo una palabra tuya - JORGE LOZANO -  LYRIC VIDEO", 120)
+    lyric["channel"] = "elevador"
+
+    both = ["candidate_0", "candidate_1"]
+    answers = _answers(
+        both,
+        per_key={
+            "candidate_0": {"identity": .33, "origin": .33, "form": .30,
+                            "studio": .06, "audio": .32, "reference": .93},
+            "candidate_1": {"identity": .73, "origin": .30, "form": .47,
+                            "studio": .15, "audio": .29, "reference": .90},
+        },
+    )
+    classifier = JevClassifier(threshold=0.10)
+    monkeypatch.setattr(classifier, "_evaluate", lambda state, questions, model=None: answers)
+
+    selected, _ranked = classifier.select("Jorge Lozano", "Solo Una Palabra Tuya", [official, lyric])
+
+    assert selected is not None
+    assert selected["channel"] == "Jorge Lozano - Topic"
+
+
+def test_provenance_cannot_rescue_a_vetoed_candidate(monkeypatch):
+    """The bonus ranks among candidates that cleared the gates, and no further.
+
+    A cover on the artist's own Topic channel is still a cover.
+    """
+    cover = _candidate("Song (Cover)", 200)
+    cover["channel"] = "Artist - Topic"
+    answers = _answers(["candidate_0"], identity=0.9, origin=0.05, form=0.9)
+    classifier = JevClassifier(threshold=0.10)
+    monkeypatch.setattr(classifier, "_evaluate", lambda state, questions, model=None: answers)
+
+    selected, ranked = classifier.select("Artist", "Song", [cover])
+
+    assert selected is None
+    assert ranked[0][0]["_decision_provenance"] == "topic_channel"
+    assert ranked[0][0]["_decision_provenance_bonus"] == 0.0
 
 
 def test_gates_do_not_double_count_into_the_ranking_score(monkeypatch):
@@ -246,7 +337,7 @@ def test_gates_do_not_double_count_into_the_ranking_score(monkeypatch):
     assert selected is not None
     assert selected["_decision_eligible"] is True
     assert selected["_decision_dimensions"][dq.GATE_IDENTITY.key] == pytest.approx(0.95)
-    assert selected["_decision_score"] == pytest.approx(0.2)
+    assert selected["_decision_ranking_score"] == pytest.approx(0.2)
 
 
 def test_selects_candidate_with_highest_score(monkeypatch):
@@ -482,7 +573,7 @@ def test_question_budget_caps_the_request(monkeypatch):
 
     At 12 candidates plus 4 of headroom this reached 97 questions for a single
     song -- minutes of generation before any download begins, multiplied again
-    by --kev-runs. The budget is what actually keeps latency predictable.
+    by --decision-runs. The budget is what actually keeps latency predictable.
     """
     seen: list[dict] = []
     budget = 32

@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 
 from ..config import Config
 from ..core import MusicDownloader
+from ..decider_server import DeciderServerError, DeciderServerManager
 from ..kev_server import KevServerError, KevServerManager
 from ..result import DownloadResult
 from ..fingerprint import configure_fpcalc
@@ -245,11 +246,11 @@ def main() -> None:
             f"[bold]Fingerprint:[/bold] "
             f"{'strict (download blocked unless confirmed)' if args.fingerprint_mode == 'strict' else 'lenient (report unverified)'}\n"
             f"[bold]Decision provider:[/bold] "
-            f"{'Kev' if args.kev else 'Jev' if args.jev else 'heuristic'} | "
+            f"{'Kev' if args.kev else 'Jev' if args.jev else 'Decider' if args.decider else 'heuristic'} | "
             f"[bold]Threshold:[/bold] "
-            f"{(args.kev_threshold if args.kev else args.jev_threshold):.2f} | "
+            f"{args.decision_threshold:.2f} | "
             f"[bold]Runs:[/bold] "
-            f"{(args.kev_runs if args.kev else args.jev_runs)}\n"
+            f"{args.decision_runs}\n"
             f"[bold]Silence check:[/bold] "
             f"{'disabled' if args.no_silence_check else 'enabled'} | "
             f"[bold]Score threshold:[/bold] {args.score_threshold}",
@@ -268,7 +269,7 @@ def main() -> None:
         console,
         args.score_threshold,
         config,
-        decision_threshold=args.kev_threshold if args.kev else args.jev_threshold,
+        decision_threshold=args.decision_threshold,
     )
 
     kev_manager = None
@@ -299,6 +300,40 @@ def main() -> None:
                 log_fh.close()
             sys.exit(1)
         atexit.register(kev_manager.stop)
+
+    decider_manager = None
+    if args.decider:
+        decider_manager = DeciderServerManager(
+            root=args.decider_dir,
+            run=args.decider_run,
+            url=args.decider_url,
+            port=args.decider_port,
+            startup_timeout=args.decider_startup_timeout,
+            package=args.decider_package,
+            install=not args.decider_skip_install,
+            device=args.decider_device,
+            graph_t_buckets=args.decider_graphs_t,
+            graph_b_buckets=args.decider_graphs_b,
+            insist_kernels=getattr(args, "decider_kernels", None),
+            probe_budget_seconds=config.DECISION_PROBE_BUDGET_SECONDS,
+            max_questions=config.DECISION_MAX_QUESTIONS,
+            on_step=events.on_info,
+        )
+        try:
+            decider_manager.start()
+        except DeciderServerError as exc:
+            decider_manager.stop()
+            console.print(
+                Panel(
+                    f"[red]{exc}[/red]",
+                    title="[bold red] Decider Setup Failed[/bold red]",
+                    border_style="red",
+                )
+            )
+            if log_fh:
+                log_fh.close()
+            sys.exit(1)
+        atexit.register(decider_manager.stop)
 
     if args.interactive:
         stop_event = threading.Event()
@@ -354,12 +389,14 @@ def main() -> None:
         config.PIPELINE_ENABLED = False
     if getattr(args, "fingerprint_concurrency", None):
         config.FP_CONCURRENCY = max(1, int(args.fingerprint_concurrency))
-    if getattr(args, "kev_timeout", None):
-        config.DECISION_TIMEOUT_SECONDS = max(1, int(args.kev_timeout))
+    if getattr(args, "decision_timeout", None):
+        config.DECISION_TIMEOUT_SECONDS = max(1, int(args.decision_timeout))
     if getattr(args, "decision_questions", None):
         config.DECISION_MAX_QUESTIONS = max(1, int(args.decision_questions))
     if getattr(args, "decision_in_flight", None):
         config.DECISION_MAX_IN_FLIGHT = max(1, int(args.decision_in_flight))
+    if getattr(args, "decision_calibration_log", None):
+        config.DECISION_CALIBRATION_LOG = str(args.decision_calibration_log)
     stage_workers = getattr(args, "stage_workers", None) or []
     for attribute, value in zip(
         ("SEARCH_WORKERS", "VERIFY_WORKERS", "DOWNLOAD_WORKERS", "POST_WORKERS"), stage_workers
@@ -396,12 +433,13 @@ def main() -> None:
             proxy=args.proxy,
             use_jev=args.jev,
             use_kev=args.kev,
-            jev_threshold=args.jev_threshold,
-            jev_runs=args.jev_runs,
-            kev_threshold=args.kev_threshold,
-            kev_runs=args.kev_runs,
+            use_decider=args.decider,
+            decision_threshold=args.decision_threshold,
+            decision_runs=args.decision_runs,
             kev_url=args.kev_url,
             kev_model=args.kev_model,
+            decider_url=args.decider_url,
+            decider_model=args.decider_model,
             channel_search=not args.no_channel_search,
         )
     except (RuntimeError, ValueError) as error:

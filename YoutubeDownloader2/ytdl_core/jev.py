@@ -214,7 +214,8 @@ class JevClassifier:
         node_command: str = "node",
         threshold: float = 0.60,
         timeout_seconds: int = 60,
-        gate_floor: float = dq.GATE_FLOOR,
+        gate_floor: float | None = None,
+        gate_floors: dict[str, float] | None = None,
         stable_spread: float = dq.STABLE_SPREAD,
         max_candidates: int = dq.MAX_EVALUATED_CANDIDATES,
         eval_headroom: int = dq.EVALUATION_HEADROOM,
@@ -231,7 +232,8 @@ class JevClassifier:
         self.node_command = node_command
         self.threshold = threshold
         self.timeout_seconds = timeout_seconds
-        self.gate_floor = gate_floor
+        self.gate_floor = dq.GATE_FLOOR if gate_floor is None else float(gate_floor)
+        self.gate_floors = dict(gate_floors) if gate_floors else dict(dq.GATE_FLOORS)
         self.stable_spread = stable_spread
         self.max_candidates = max_candidates
         self.eval_headroom = eval_headroom
@@ -352,12 +354,32 @@ class JevClassifier:
             failed_gates = [
                 dimension.key
                 for dimension in dq.GATE_DIMENSIONS
-                if dimension_scores[dimension.key] < self.gate_floor
+                if dimension_scores[dimension.key]
+                < dq.gate_floor_for(dimension.key, self.gate_floors, self.gate_floor)
             ]
+            # A gate may not veto a fact it cannot check. When the title matches the
+            # request exactly on the artist's own Topic channel, the answer is not in
+            # doubt and a miscalibrated probability has nothing to add -- so it is
+            # recorded and stepped over rather than allowed to discard the one upload
+            # that was certainly right.
+            shielded = dq.deterministic_shield(candidate, artist, song)
+            if shielded:
+                failed_gates = []
             eligible = not failed_gates
 
+            # The real weighted mean, kept whatever the verdict. `score` is 0.0 for a
+            # vetoed candidate, which is what made "best score 0% is below threshold"
+            # the only thing the report could say about it -- the number that would
+            # have explained the veto was computed and then thrown away.
+            #
+            # The provenance bonus is added *after* the veto, so it can rank among
+            # candidates that cleared the gates but can never rescue one that did
+            # not. A cover stays a cover whatever channel published it.
+            ranking_score = self._ranking_score(dimension_scores)
+            provenance = dq.provenance_signal(candidate, artist)
+            bonus = dq.provenance_bonus(provenance) if eligible else 0.0
             if eligible:
-                score = self._ranking_score(dimension_scores)
+                score = ranking_score + bonus
             else:
                 # A vetoed candidate keeps its ranking score visible for debugging
                 # but is pushed below the threshold so it can never be selected.
@@ -376,8 +398,12 @@ class JevClassifier:
             entry["_decision_evaluated"] = True
             entry["_decision_score"] = score
             entry["_decision_probability"] = score
+            entry["_decision_ranking_score"] = ranking_score
+            entry["_decision_provenance"] = provenance
+            entry["_decision_provenance_bonus"] = bonus
             entry["_decision_eligible"] = eligible
             entry["_decision_failed_gates"] = failed_gates
+            entry["_decision_shielded"] = shielded
             entry["_decision_dimensions"] = dimension_scores
             entry["_decision_dimension_spread"] = dimension_spread
             entry["_decision_spread"] = spread

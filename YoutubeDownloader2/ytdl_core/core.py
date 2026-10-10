@@ -8,6 +8,7 @@ to the DownloaderEvents instance supplied at construction time.
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import re
 from collections import Counter
@@ -23,6 +24,11 @@ from rapidfuzz import fuzz
 
 from .channels import ChannelTrust, channel_url_for
 from .config import Config
+from .decision_questions import (
+    HARD_REJECT_SCORE,
+    QUESTION_CONTRACT_VERSION,
+    provenance_signal,
+)
 from .downloader import download_partial, execute_download
 from .events import DownloaderEvents
 from .fingerprint import (
@@ -33,6 +39,7 @@ from .fingerprint import (
     release_fingerprint_slot,
     verify_fingerprint,
 )
+from .decider import DeciderClassifier
 from .jev import JevClassifier, JevEvaluationError
 from .kev import KevClassifier
 from .metadata import CatalogContext, fetch_itunes_reference, fetch_musicbrainz
@@ -59,6 +66,63 @@ from .ytdlp_options import build_ytdlp_base_opts, make_progress_hook, resolve_do
 def _resolve_stage_workers(configured: int, fallback: int) -> int:
     """Auto-size a pipeline stage when the config leaves it at 0."""
     return max(1, int(configured) if configured else fallback)
+
+
+def _build_decision_classifier(
+    *,
+    provider: str,
+    threshold: float,
+    gate_floor: float | None,
+    gate_floors: dict[str, float],
+    stable_spread: float,
+    max_candidates: int,
+    timeout_seconds: int,
+    max_in_flight: int,
+    failure_threshold: int,
+    max_questions: int,
+    eval_headroom: int,
+    kev_url: str,
+    kev_model: str,
+    decider_url: str,
+    decider_model: str | None,
+    provided: dict[str, object],
+) -> object | None:
+    """The classifier for the selected provider, or None for the heuristic.
+
+    A table rather than a chain of nested conditionals. This used to be one
+    expression with a provider's "or" nested inside another's branch, which made
+    it possible to read ``kev_classifier or (... if use_kev else jev ...)`` as
+    "the kev classifier, else the jev one" when the ``use_kev`` guard was really
+    deciding whether the kev branch existed at all. Adding a third provider to
+    that shape would have made it worse, not better.
+
+    Every provider gets the same budget, timeout and question cap. Jev used to be
+    constructed without several of them and silently fell back to its own
+    defaults, so ``--decision-questions`` and ``--decision-in-flight`` did not
+    apply to it while appearing to.
+    """
+    supplied = provided.get(provider)
+    if supplied is not None:
+        return supplied
+    shared = {
+        "threshold": threshold,
+        "gate_floor": gate_floor,
+        "gate_floors": gate_floors,
+        "stable_spread": stable_spread,
+        "max_candidates": max_candidates,
+        "timeout_seconds": timeout_seconds,
+        "max_in_flight": max_in_flight,
+        "failure_threshold": failure_threshold,
+        "max_questions": max_questions,
+        "eval_headroom": eval_headroom,
+    }
+    if provider == "kev":
+        return KevClassifier(url=kev_url, model=kev_model, **shared)
+    if provider == "decider":
+        return DeciderClassifier(url=decider_url, model=decider_model, **shared)
+    if provider == "jev":
+        return JevClassifier(**shared)
+    return None
 
 
 @dataclass
@@ -128,14 +192,16 @@ class MusicDownloader:
         proxy=None,
         use_jev=False,
         use_kev=False,
-        jev_threshold=None,
-        jev_runs=None,
+        use_decider=False,
+        decision_threshold=None,
+        decision_runs=None,
         jev_classifier=None,
-        kev_threshold=None,
-        kev_runs=None,
+        kev_classifier=None,
+        decider_classifier=None,
         kev_url="http://127.0.0.1:8009",
         kev_model="kev-latest",
-        kev_classifier=None,
+        decider_url="http://127.0.0.1:8010",
+        decider_model=None,
         channel_search=True,
     ):
         if require_fingerprint and not acoustid_key:
@@ -149,8 +215,33 @@ class MusicDownloader:
                 "Strict fingerprint verification requires fpcalc (Chromaprint). "
                 "Install libchromaprint-tools, or point fpcalc onto PATH."
             )
-        if use_jev and use_kev:
-            raise ValueError("Jev and Kev cannot be enabled at the same time")
+        # Argparse already makes these mutually exclusive; this is the guard for
+        # a caller constructing the downloader directly.
+        if sum((bool(use_jev), bool(use_kev), bool(use_decider))) > 1:
+            raise ValueError("Jev, Kev and Decider cannot be enabled at the same time")
+
+        injected = {
+            name: classifier
+            for name, classifier in (
+                ("jev", jev_classifier),
+                ("kev", kev_classifier),
+                ("decider", decider_classifier),
+            )
+            if classifier is not None
+        }
+        # An injected classifier *is* the provider selection. A caller that builds
+        # its own -- a test, or anything embedding the downloader -- should not also
+        # have to pass the matching boolean, because the alternative is a report
+        # and a persisted state row that both say "heuristic" while a decision model
+        # was in fact choosing every candidate.
+        if len(injected) > 1:
+            raise ValueError(
+                "Only one decision classifier can be provided, got: "
+                + ", ".join(sorted(injected))
+            )
+        if not (use_jev or use_kev or use_decider) and injected:
+            only = next(iter(injected))
+            use_jev, use_kev, use_decider = only == "jev", only == "kev", only == "decider"
 
         self.config = config or Config()
         self.events = events or DownloaderEvents()
@@ -181,46 +272,46 @@ class MusicDownloader:
         self.proxy = proxy
         self.use_jev = use_jev
         self.use_kev = use_kev
-        self.decision_provider = "kev" if use_kev else "jev" if use_jev else "heuristic"
-        self.jev_threshold = (
-            jev_threshold if jev_threshold is not None else self.config.JEV_DEFAULT_THRESHOLD
+        self.use_decider = use_decider
+        self.decision_provider = (
+            "kev" if use_kev else "jev" if use_jev else "decider" if use_decider else "heuristic"
         )
-        self.kev_threshold = (
-            kev_threshold if kev_threshold is not None else self.config.JEV_DEFAULT_THRESHOLD
+        # One threshold and one run count for whichever model is in use. These
+        # used to be a pair per provider (jev_threshold/kev_threshold,
+        # jev_runs/kev_runs) that only ever differed by which flag the operator
+        # happened to type. Every provider is scored by the same questions
+        # against the same gate floor, so a per-provider copy of these two
+        # numbers was a second thing to keep in sync and bought nothing.
+        self.decision_threshold = (
+            decision_threshold
+            if decision_threshold is not None
+            else self.config.DECISION_DEFAULT_THRESHOLD
         )
-        self.jev_runs = jev_runs if jev_runs is not None else self.config.JEV_DEFAULT_RUNS
-        self.kev_runs = kev_runs if kev_runs is not None else self.config.JEV_DEFAULT_RUNS
-        self.decision_threshold = self.kev_threshold if use_kev else self.jev_threshold
-        self.decision_runs = self.kev_runs if use_kev else self.jev_runs
-        gate_floor = float(self.config.DECISION_GATE_FLOOR)
+        self.decision_runs = (
+            decision_runs if decision_runs is not None else self.config.DECISION_DEFAULT_RUNS
+        )
         stable_spread = float(self.config.DECISION_STABLE_SPREAD)
         max_candidates = int(self.config.DECISION_MAX_CANDIDATES)
-        self.decision_classifier = kev_classifier or (
-            KevClassifier(
-                url=kev_url,
-                model=kev_model,
-                threshold=self.decision_threshold,
-                gate_floor=gate_floor,
-                stable_spread=stable_spread,
-                max_candidates=max_candidates,
-                timeout_seconds=self.config.DECISION_TIMEOUT_SECONDS,
-                max_in_flight=self.config.DECISION_MAX_IN_FLIGHT,
-                failure_threshold=self.config.DECISION_FAILURE_THRESHOLD,
-                max_questions=self.config.DECISION_MAX_QUESTIONS,
-                eval_headroom=self.config.DECISION_HEADROOM,
-            )
-            if use_kev
-            else jev_classifier
-            or (
-                JevClassifier(
-                    threshold=self.decision_threshold,
-                    gate_floor=gate_floor,
-                    stable_spread=stable_spread,
-                    max_candidates=max_candidates,
-                )
-                if use_jev
-                else None
-            )
+        self.decision_classifier = _build_decision_classifier(
+            provider=self.decision_provider,
+            threshold=self.decision_threshold,
+            gate_floor=None,
+            gate_floors={
+                key: float(value)
+                for key, value in (self.config.DECISION_GATE_FLOORS or {}).items()
+            },
+            stable_spread=stable_spread,
+            max_candidates=max_candidates,
+            timeout_seconds=self.config.DECISION_TIMEOUT_SECONDS,
+            max_in_flight=self.config.DECISION_MAX_IN_FLIGHT,
+            failure_threshold=self.config.DECISION_FAILURE_THRESHOLD,
+            max_questions=self.config.DECISION_MAX_QUESTIONS,
+            eval_headroom=self.config.DECISION_HEADROOM,
+            kev_url=kev_url,
+            kev_model=kev_model,
+            decider_url=decider_url,
+            decider_model=decider_model,
+            provided=injected,
         )
         self.fpcalc_available = fpcalc_available
         self.channel_search = channel_search
@@ -236,6 +327,9 @@ class MusicDownloader:
         )
         self._circuit_breaker = AcoustIDCircuitBreaker(cooldown_seconds=60.0)
         self._selection_lock = threading.Lock()
+        # One JSONL append per song for DECISION_CALIBRATION_LOG, from every worker.
+        self._calibration_lock = threading.Lock()
+        self._calibration_warned = False
         # Remembers AcoustID verdicts across runs and coalesces concurrent
         # duplicate checks within one.
         self._fingerprint_cache = FingerprintCache(self.config)
@@ -1356,6 +1450,7 @@ class MusicDownloader:
                 if decision_ranked:
                     ranked = decision_ranked
                 result.selection_method = self.decision_provider
+                self._log_decision_calibration(artist, song, ranked, decision_best)
                 self.events.on_candidates_scored(artist, song, ranked)
 
                 if decision_best is None:
@@ -1368,14 +1463,44 @@ class MusicDownloader:
                             value = entry.get("_composite_score")
                         return int(value or 0)
 
-                    # Prefer a candidate the model did not veto; only consider a
-                    # vetoed one when nothing else exists.
-                    fallback_pool = [
-                        item[0] for item in ranked if item[0].get("_decision_eligible", True)
-                    ] or [item[0] for item in ranked]
-                    fallback_entry = (
-                        max(fallback_pool, key=heuristic_score) if fallback_pool else None
-                    )
+                    def is_hard_reject(entry: dict) -> bool:
+                        return heuristic_score(entry) <= HARD_REJECT_SCORE
+
+                    # Two rules, in this order, and both of them used to be wrong.
+                    #
+                    # A hard reject is the heuristic's deterministic word match on the
+                    # title -- "cover", "instrumental", "lyrics". It is never a
+                    # fallback, however bad the decision model gets: it is exactly the
+                    # candidate the veto exists to keep out, and offering it back is
+                    # how a run ends up saving a karaoke track under the artist's name.
+                    #
+                    # Past that, a candidate the model never evaluated is weaker
+                    # evidence than one it evaluated and vetoed. The model has seen
+                    # the second and formed a verdict; the first is merely whatever
+                    # `select_for_evaluation` trimmed, which is not a judgment. So the
+                    # pool prefers evaluated-and-eligible, then evaluated-and-vetoed,
+                    # then never-evaluated -- and only among candidates the heuristic
+                    # did not already reject.
+                    #
+                    # This was previously the inverse: `_decision_eligible` was
+                    # preferred, and the vetoed official upload at 255 was dropped in
+                    # favour of a never-evaluated row at 120. On a real run that put
+                    # "PAGASTE UN ALTO PRECIO POR MI" in place of "Alto precio", and
+                    # when the leftovers were all hard rejects it reported "no valid
+                    # heuristic candidate remains" about a song whose correct upload
+                    # was sitting at the top of the table.
+                    def fallback_rank(entry: dict) -> tuple[int, int]:
+                        evaluated = entry.get("_decision_evaluated")
+                        if evaluated is False:
+                            tier = 0
+                        elif entry.get("_decision_eligible", True):
+                            tier = 2
+                        else:
+                            tier = 1
+                        return tier, heuristic_score(entry)
+
+                    pool = [item[0] for item in ranked if not is_hard_reject(item[0])]
+                    fallback_entry = max(pool, key=fallback_rank) if pool else None
                     fallback_score = heuristic_score(fallback_entry) if fallback_entry else 0
                     fallback_threshold = max(
                         self.score_threshold,
@@ -1663,15 +1788,109 @@ class MusicDownloader:
         result.decision_choice_probability = entry.get("_decision_choice_probability")
         result.decision_confidence = entry.get("_decision_confidence")
 
+    def _log_decision_calibration(
+        self, artist: str, song: str, ranked: list, decision_best: Optional[dict]
+    ) -> None:
+        """Append one JSONL record per song with every gate score.
+
+        The gate floors are the load-bearing numbers in the whole decision path and
+        they were set by reading a five-song run by hand. This writes the data that
+        replaces that reading: for every candidate, its six dimension scores, whether
+        it cleared each floor, its heuristic score and whether it was selected. Once
+        there are a few hundred lines the floors can be placed where the correct and
+        incorrect distributions actually separate, instead of where one screenful
+        suggested.
+
+        No label is written because the run does not have one -- which candidate was
+        *correct* is only knowable by listening. So the file is the model's opinion
+        plus the deterministic signals, and labelling it is a manual pass over the
+        same rows. That is still strictly more than the run log showed, which printed
+        `veto identity/origin/form` and hid every number behind it.
+
+        Best-effort throughout: a calibration aid that can fail a download would be
+        the wrong trade in both directions.
+        """
+        path = (self.config.DECISION_CALIBRATION_LOG or "").strip()
+        if not path or not ranked:
+            return
+
+        def heuristic(entry: dict) -> int:
+            value = entry.get("_heuristic_score")
+            if value is None:
+                value = entry.get("_composite_score")
+            return int(value or 0)
+
+        selected_title = (decision_best or {}).get("title")
+        candidates = []
+        for entry, _score, _breakdown in ranked[:12]:
+            dimensions = entry.get("_decision_dimensions") or {}
+            candidates.append(
+                {
+                    "title": entry.get("title"),
+                    "channel": entry.get("channel") or entry.get("uploader"),
+                    "duration": entry.get("duration"),
+                    "heuristic": heuristic(entry),
+                    "provenance": provenance_signal(entry, artist),
+                    "evaluated": bool(entry.get("_decision_evaluated")),
+                    "eligible": entry.get("_decision_eligible"),
+                    "shielded": bool(entry.get("_decision_shielded")),
+                    "failed_gates": list(entry.get("_decision_failed_gates") or []),
+                    "dimensions": {
+                        key: round(float(value), 4) for key, value in dimensions.items()
+                    },
+                    "ranking_score": (
+                        round(float(entry["_decision_ranking_score"]), 4)
+                        if entry.get("_decision_ranking_score") is not None
+                        else None
+                    ),
+                    "selected": entry.get("title") == selected_title
+                    if selected_title
+                    else False,
+                }
+            )
+
+        record = {
+            "artist": artist,
+            "song": song,
+            "contract": QUESTION_CONTRACT_VERSION,
+            "gate_floors": dict(self.config.DECISION_GATE_FLOORS or {}),
+            "threshold": self.decision_threshold,
+            "candidates": candidates,
+        }
+        line = json.dumps(record, ensure_ascii=False)
+        with self._calibration_lock:
+            try:
+                with open(path, "a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+            except OSError:
+                # A full disk or a read-only path must not fail the song.
+                self._calibration_warned = True
+
     @staticmethod
     def _decision_rejection_reason(entry: dict) -> str:
-        """Explain a rejection with the dimension that caused it."""
+        """Explain a rejection with the dimension that caused it.
+
+        The gate scores travel with the reason. "Rejected on origin" names the
+        dimension but not the number, and the number is the thing that says whether
+        the floor is wrong or the candidate is -- which is the difference between
+        retuning a constant and investigating a search.
+        """
         failed = list(entry.get("_decision_failed_gates") or [])
         if failed:
-            return f"rejected on {'/'.join(failed)}"
+            dimensions = entry.get("_decision_dimensions") or {}
+            detail = ", ".join(
+                f"{key} {float(dimensions[key]):.0%}" for key in failed if key in dimensions
+            )
+            return f"rejected on {'/'.join(failed)}" + (f" ({detail})" if detail else "")
         if not entry.get("_decision_stable", True):
             return f"unstable across runs (spread {float(entry.get('_decision_spread') or 0):.0%})"
-        return f"best score {float(entry.get('_decision_probability') or 0):.0%} is below threshold"
+        # Prefer the real ranking score: `_decision_probability` is forced to 0 for a
+        # vetoed candidate, so quoting it here printed "best score 0%" and explained
+        # nothing. This is the number that was actually computed.
+        score = entry.get("_decision_ranking_score")
+        if score is None:
+            score = entry.get("_decision_probability") or 0
+        return f"best score {float(score):.0%} is below threshold"
 
     def _apply_decision(self, result: "DownloadResult", entry: dict) -> None:
         """Copy a decision model's verdict, then judge whether it needs a human.

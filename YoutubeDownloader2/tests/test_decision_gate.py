@@ -14,6 +14,7 @@ from unittest.mock import patch
 import pytest
 
 from ytdl_core.config import Config
+from ytdl_core.decider import DeciderClassifier
 from ytdl_core.jev import DecisionGate, JevEvaluationError
 from ytdl_core.kev import KevClassifier
 
@@ -96,14 +97,14 @@ class TestKevTimeoutHandling:
         minutes of work before the first download.
         """
         classifier = self._classifier()
-        with patch("ytdl_core.kev.requests.Session.post", side_effect=requests.Timeout("slow")) as post:
-            with pytest.raises(JevEvaluationError, match="kev-timeout"):
+        with patch("ytdl_core.systemone.requests.Session.post", side_effect=requests.Timeout("slow")) as post:
+            with pytest.raises(JevEvaluationError, match="decision-timeout"):
                 classifier._evaluate({}, {})
         assert post.call_count == 1
 
     def test_timeout_is_not_retried_even_with_attempts_available(self):
         classifier = self._classifier(max_attempts=3)
-        with patch("ytdl_core.kev.requests.Session.post", side_effect=requests.Timeout("slow")) as post:
+        with patch("ytdl_core.systemone.requests.Session.post", side_effect=requests.Timeout("slow")) as post:
             with pytest.raises(JevEvaluationError):
                 classifier._evaluate({}, {})
         assert post.call_count == 1
@@ -119,14 +120,14 @@ class TestKevTimeoutHandling:
                 return {"answers": {"q": {"noul": 0.9}}}
 
         for _ in range(5):
-            with patch("ytdl_core.kev.requests.Session.post", return_value=Response()):
+            with patch("ytdl_core.systemone.requests.Session.post", return_value=Response()):
                 classifier._evaluate({}, {})
         # Would hang here if the slot leaked.
         assert classifier.gate.successes == 5
 
     def test_gives_up_after_repeated_failures_then_stops_calling(self):
         classifier = self._classifier(max_attempts=1)
-        with patch("ytdl_core.kev.requests.Session.post", side_effect=TimeoutError("slow")) as post:
+        with patch("ytdl_core.systemone.requests.Session.post", side_effect=TimeoutError("slow")) as post:
             for _ in range(4):
                 with pytest.raises(JevEvaluationError):
                     classifier._evaluate({}, {})
@@ -137,7 +138,7 @@ class TestKevTimeoutHandling:
         import requests
 
         classifier = self._classifier(max_attempts=3)
-        with patch("ytdl_core.kev.requests.Session.post", side_effect=requests.ConnectionError("down")):
+        with patch("ytdl_core.systemone.requests.Session.post", side_effect=requests.ConnectionError("down")):
             with pytest.raises(JevEvaluationError, match="unavailable"):
                 classifier._evaluate({}, {})
 
@@ -150,7 +151,7 @@ class TestKevTimeoutHandling:
             def json(self):
                 return {"answers": {"q": {"noul": 0.9}}}
 
-        with patch("ytdl_core.kev.requests.Session.post", return_value=Response()):
+        with patch("ytdl_core.systemone.requests.Session.post", return_value=Response()):
             assert classifier._evaluate({}, {}) == {"q": {"noul": 0.9}}
         assert classifier.gate.successes == 1
 
@@ -163,7 +164,7 @@ class TestKevTimeoutHandling:
             def json(self):
                 return {}
 
-        with patch("ytdl_core.kev.requests.Session.post", return_value=Response()) as post:
+        with patch("ytdl_core.systemone.requests.Session.post", return_value=Response()) as post:
             with pytest.raises(JevEvaluationError, match="authentication"):
                 classifier._evaluate({}, {})
         assert post.call_count == 1
@@ -180,8 +181,8 @@ class TestKevTimeoutHandling:
 
         slept: list[float] = []
         with (
-            patch("ytdl_core.kev.requests.Session.post", return_value=Response()) as post,
-            patch("ytdl_core.kev.time.sleep", side_effect=slept.append),
+            patch("ytdl_core.systemone.requests.Session.post", return_value=Response()) as post,
+            patch("ytdl_core.systemone.time.sleep", side_effect=slept.append),
         ):
             with pytest.raises(JevEvaluationError, match="temporarily failed"):
                 classifier._evaluate({}, {})
@@ -232,6 +233,31 @@ class TestProviderWiring:
         assert classifier.max_questions == 19
         assert classifier.eval_headroom == 2
 
+    def test_jev_receives_the_same_limits_as_the_local_servers(self):
+        # Jev used to be built without these and fell back to its own defaults, so
+        # --decision-questions and --decision-in-flight appeared to apply to it and
+        # did not. Every provider is scored by the same questions, so every provider
+        # gets the same budget.
+        from ytdl_core.core import MusicDownloader
+        from ytdl_core.events import DownloaderEvents
+
+        config = Config()
+        config.DECISION_TIMEOUT_SECONDS = 123
+        config.DECISION_MAX_IN_FLIGHT = 3
+        config.DECISION_FAILURE_THRESHOLD = 7
+        config.DECISION_MAX_QUESTIONS = 19
+        config.DECISION_HEADROOM = 2
+
+        downloader = MusicDownloader(
+            config=config, events=DownloaderEvents(), workers=1, delay=(0, 0), use_jev=True
+        )
+        classifier = downloader.decision_classifier
+        assert classifier.timeout_seconds == 123
+        assert classifier.gate.max_in_flight == 3
+        assert classifier.gate.failure_threshold == 7
+        assert classifier.max_questions == 19
+        assert classifier.eval_headroom == 2
+
     def test_injected_provider_is_used_verbatim(self, config):
         from ytdl_core.core import MusicDownloader
         from ytdl_core.events import DownloaderEvents
@@ -245,6 +271,36 @@ class TestProviderWiring:
             kev_classifier=provided,
         )
         assert downloader.decision_classifier is provided
+
+    def test_an_injected_provider_selects_itself(self, config):
+        # Without this the report and the persisted state row would both say
+        # "heuristic" while a decision model was choosing every candidate.
+        from ytdl_core.core import MusicDownloader
+        from ytdl_core.events import DownloaderEvents
+
+        downloader = MusicDownloader(
+            config=config,
+            events=DownloaderEvents(),
+            workers=1,
+            delay=(0, 0),
+            decider_classifier=DeciderClassifier(),
+        )
+        assert downloader.decision_provider == "decider"
+        assert downloader.use_decider is True
+
+    def test_two_injected_providers_are_refused(self, config):
+        from ytdl_core.core import MusicDownloader
+        from ytdl_core.events import DownloaderEvents
+
+        with pytest.raises(ValueError, match="Only one decision classifier"):
+            MusicDownloader(
+                config=config,
+                events=DownloaderEvents(),
+                workers=1,
+                delay=(0, 0),
+                kev_classifier=KevClassifier(),
+                decider_classifier=DeciderClassifier(),
+            )
 
 
 class TestProbePayload:
@@ -335,7 +391,7 @@ class TestCoreSurfacesGiveUpOnce:
             config=Config(), events=Recorder(), workers=1, delay=(0, 0), kev_classifier=classifier
         )
 
-        with patch("ytdl_core.kev.requests.Session.post", side_effect=TimeoutError("slow")):
+        with patch("ytdl_core.systemone.requests.Session.post", side_effect=TimeoutError("slow")):
             for _ in range(6):
                 try:
                     classifier._evaluate({}, {})

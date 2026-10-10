@@ -481,7 +481,7 @@ class TestDownload:
             no_silence_check=True,
             skip_fingerprint=True,
             use_jev=True,
-            jev_runs=3,
+            decision_runs=3,
             jev_classifier=classifier,
         )
         result = DownloadResult(artist="Artist", song="Song")

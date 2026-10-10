@@ -103,29 +103,55 @@ by default.
 
 ## Decision model
 
-`--kev` runs a local [Kev](https://github.com/jaredpalmer/kev) server on CUDA and
-picks the candidate with it; `--jev` uses the hosted TypeSafe model instead. They
-are mutually exclusive.
+Three decision models, one at a time. They are mutually exclusive, and they are
+interchangeable: all three answer the same questions through the same scoring, so
+swapping one for another changes which model answers, not what it is asked.
+
+| flag | model | where it runs |
+| --- | --- | --- |
+| `--kev` | [Kev](https://github.com/jaredpalmer/kev) (`jaredpalmer/kev-4b`) | local server, CUDA |
+| `--decider` | [Decider](https://github.com/Mapika/decider) (`Mapika/decider-4b`) | local server, CUDA / Apple Silicon / CPU |
+| `--jev` | Jev / TypeSafe | hosted, through Vercel AI Gateway |
 
 ```bash
 ytdl --file songs.json --kev                     # auto-start a local Kev server
+ytdl --file songs.json --decider                 # auto-start a local Decider server
 ytdl --file songs.json --kev --decision-questions 20   # faster, fewer questions
 ytdl --file songs.json --kev --decision-in-flight 8    # let the server batch more
 ```
 
-The server's health, CUDA graph usage, batching and prefix-cache statistics are
-reported at startup from `/v1/models`, so a silent slowdown shows up there
-rather than as a thousand identical timeouts.
+Kev and Decider speak the same endpoint (`POST /v1/systemone`), so switching is a
+flag and nothing else. Decider also runs without an NVIDIA card, which Kev does
+not; that is the case to reach for it on.
+
+Which one to pick is a measurement, not a fact. On its own model cards Decider is
+behind Jev on knowledge and multi-hop questions and ahead on calibration, and our
+workload — is this upload the right song by the right artist — is closer to the
+second than the first. Neither number was measured on these questions, so the
+honest answer is that `--kev` is the default and the other two are there to be
+compared on your data.
+
+The local server's health, batching and prefix-cache statistics are reported at
+startup, so a silent slowdown shows up there rather than as a thousand identical
+timeouts. Decider's supervisor reports the device it actually loaded on, which
+matters because a CPU server answers correctly and is orders of magnitude slower.
 
 `--decision-questions` is the main speed dial: every question is prefilled as its
 own sequence, so the cost of an evaluation scales with the question count
 (candidates × dimensions, plus one tie-break). Lower it to go faster, raise it to
 arbitrate more candidates.
 
-`--kev-fused` / `--no-kev-fused` override the fused-kernel probe. By default the
+`--decision-threshold` and `--decision-runs` apply to whichever model is in use.
+
+`--kev-fused` / `--no-kev-fused` override Kev's fused-kernel probe. By default the
 fused Qwen3.5 kernels are installed if missing and then *proven* by running a real
 evaluation under a timeout, because some Triton/platform combinations import
 cleanly and then never return.
+
+`--jev-runs`, `--kev-runs`, `--jev-threshold`, `--kev-threshold` and `--kev-timeout`
+are the former per-provider names. They still work and now say
+`--decision-runs`, `--decision-threshold` and `--decision-timeout`; the old ones
+warn once and will go away.
 
 ## Downloads
 

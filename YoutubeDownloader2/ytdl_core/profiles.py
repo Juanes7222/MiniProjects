@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import difflib
+import sys
 import tomllib
 from pathlib import Path
 from typing import Any
 
-_PATH_FIELDS = {"file", "output", "cookies", "kev_dir", "log_file"}
+_PATH_FIELDS = {
+    "file",
+    "output",
+    "cookies",
+    "kev_dir",
+    "decider_dir",
+    "log_file",
+    "decision_calibration_log",
+}
 _BOOLEAN_FIELDS = {
     "musicbrainz",
     "skip_fingerprint",
@@ -20,7 +29,10 @@ _BOOLEAN_FIELDS = {
     "video_preview",
     "jev",
     "kev",
+    "decider",
     "kev_skip_update",
+    "decider_skip_install",
+    "decider_kernels",
     "retry",
     "review",
     "review_only_suspects",
@@ -37,12 +49,20 @@ _INTEGER_FIELDS = {
     "score_threshold",
     "kev_port",
     "kev_startup_timeout",
+    "decider_port",
+    "decider_startup_timeout",
+    "decision_runs",
+    "decision_timeout",
+    # Former per-provider names. Still accepted, mapped onto decision_runs /
+    # decision_threshold / decision_timeout, so an existing profiles.toml keeps
+    # working; see _DEPRECATED_KEYS.
     "kev_runs",
     "jev_runs",
+    "kev_timeout",
     "preview_seconds",
     "review_clip_seconds",
 }
-_FLOAT_FIELDS = {"kev_threshold", "jev_threshold"}
+_FLOAT_FIELDS = {"decision_threshold", "kev_threshold", "jev_threshold"}
 _STRING_FIELDS = {
     "data",
     "url",
@@ -54,8 +74,26 @@ _STRING_FIELDS = {
     "kev_url",
     "kev_model",
     "kev_run",
+    "decider_url",
+    "decider_model",
+    "decider_run",
+    "decider_package",
+    "decider_device",
+    "decider_graphs_t",
+    "decider_graphs_b",
     "match_title",
     "reject_title",
+}
+
+# Old profile key -> the one it means now. Kept as an explicit table rather than
+# accepted silently, because a profile that quietly keeps working is a profile
+# nobody goes back and updates.
+_DEPRECATED_KEYS: dict[str, str] = {
+    "jev_runs": "decision_runs",
+    "kev_runs": "decision_runs",
+    "jev_threshold": "decision_threshold",
+    "kev_threshold": "decision_threshold",
+    "kev_timeout": "decision_timeout",
 }
 
 
@@ -106,6 +144,20 @@ def load_profile(
     settings: dict[str, Any] = {}
     for raw_key, value in raw_profile.items():
         key = str(raw_key).replace("-", "_")
+        replacement = _DEPRECATED_KEYS.get(key)
+        if replacement is not None:
+            _warn_deprecated(f"profile option '{raw_key}'", replacement)
+            key = replacement
+        if key in settings:
+            # TOML already forbids the same literal key twice, so the only way to
+            # land here is an old name and its replacement both being present, or
+            # one key written two ways ("kev-runs" and "kev_runs"). Letting the
+            # last one win would make the profile's behaviour depend on the order
+            # the file happens to be written in rather than on what it says.
+            raise ProfileError(
+                f"Profile '{name}' sets '{key}' more than once, through a deprecated "
+                f"option; keep only '{key}'"
+            )
         if key not in allowed_keys:
             suggestion = difflib.get_close_matches(key, sorted(allowed_keys), n=1)
             hint = f". Did you mean '{suggestion[0]}'?" if suggestion else ""
@@ -113,6 +165,13 @@ def load_profile(
         settings[key] = _normalize_value(key, value, name)
 
     return profiles_path, settings
+
+
+def _warn_deprecated(old: str, new: str) -> None:
+    print(
+        f"warning: {old} is deprecated; use {new}",
+        file=sys.stderr,
+    )
 
 
 def _normalize_value(key: str, value: Any, profile_name: str) -> Any:

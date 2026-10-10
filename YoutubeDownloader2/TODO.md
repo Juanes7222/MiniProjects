@@ -186,10 +186,67 @@ intérprete del venv de Kev. Además avisaba al importar porque faltaba numpy.
 - [x] **A8. Verificación post-arranque** de lo que el servidor *hace*, no de lo
       que el entorno pide: `cuda_graphs` de `/v1/models`, el banner de fused en el
       log del servidor, y las estadísticas de batching y de state cache.
-- [x] **A9. `--kev-runs > 1` documentado como trabajo duplicado** para un modelo
-      determinista (prefill-only; la temperatura nunca cambia qué gana).
+- [x] **A9. `runs > 1` documentado como trabajo duplicado** para un modelo
+      determinista (prefill-only; la temperatura nunca cambia qué gana). Los flags
+      `--jev-runs` y `--kev-runs` se fundieron en **`--decision-runs`** (A11).
 - [x] **A10. Modelo pineado** a `jaredpalmer/kev-4b@v1.0`. El nombre sin pin
       seguía `main`, que ya había resuelto a otro snapshot.
+- [x] **A11. Los tres flags con prefijo de proveedor son uno.** `--jev-runs`,
+      `--kev-runs`, `--jev-threshold`, `--kev-threshold` y `--kev-timeout`
+      vivían en pares que sólo se diferenciaban en qué flag se escribiera, y
+      leían el mismo `Config.JEV_*`. Ahora son `--decision-runs`,
+      `--decision-threshold` y `--decision-timeout`. Los nombres viejos se
+      aceptan como alias sobre el mismo `dest` y avisan una vez por stderr; un
+      perfil `profiles.toml` que los use se mapea y avisa, y poner las dos
+      together es un error en vez de un "gana el último" que dependía del orden
+      del fichero.
+- [x] **A12. `--jev` recibía la mitad del presupuesto.** Se construía el
+      `JevClassifier` sin `timeout_seconds`, `max_in_flight`,
+      `failure_threshold`, `max_questions` ni `eval_headroom`, así que
+      `--decision-questions` y `--decision-in-flight` no le aplicaban mientras
+      parecían aplicarle. Todos los providers se puntúan con las mismas
+      preguntas, así que todos reciben los mismos límites.
+
+# FASE 1b — Decider
+
+- [x] **D1. `decider.serve` habla el mismo endpoint que `kev.serve`.**
+      `POST /v1/systemone`, dialecto TypeSafe, tipo `noul`. Por eso el
+      transporte (pool, gate, reintentos, telemetría) se extrajo a
+      `ytdl_core/systemone.py` y `DeciderClassifier` es una subclase fina igual
+      que `KevClassifier`. No es un provider de otro tipo: es otra URL.
+- [x] **D2. `decider` como provider "sin GPU".** `decider.serve` resuelve
+      CUDA → MPS → CPU por su cuenta, y publica pesos GGUF para llama.cpp. Es el
+      caso que Kev no cubre: su supervisor se detiene en "no NVIDIA device was
+      found". Su supervisor reporta el device que realmente cargó, porque un
+      servidor en CPU responde bien y es ordinales de magnitud más lento.
+- [x] **D3. El nombre del checkpoint lo pregunta el servidor.**
+      `decider.serve` nombra el checkpoint según la `version` de su propio
+      `decider_config.json` (`decider-v2.1`), así que no hay cadena estable que
+      pinear como `kev-latest`. `--decider-model` sin valor lo lee de
+      `/v1/models` una vez y lo recuerda; si el servidor no contesta, el campo se
+      omite, que es opcional en el cable. Pinear un nombre fijo habría dado 404
+      contra todo checkpoint menos uno, y el error habría parecido "falta el
+      endpoint".
+- [x] **D4. Sin repositorio que clonar.** `decider-ai` es un paquete normal: venv
+      + install pineado (`decider-ai==1.9.0`), con marcador para no reinstalar.
+      Kev pineaba los *pesos* a `@v1.0` pero seguía `main` en el *código*; aquí
+      no hay código que persiga.
+- [x] **D5. No se sobreescriben los defaults de `decider.serve`.** Ya calienta
+      sus CUDA graphs al arrancar, ya ajusta una temperatura por tipo de
+      pregunta desde la config del modelo, y ya elige device. Tocar eso desde aquí
+      sería volver a decidir, en otra máquina, preguntas que sus autores midieron
+      en la suya.
+- [ ] **D6. Falta medirlo en estas preguntas.** Los números publicados de Decider
+      y de Kev vienen de suites distintas y no son comparables entre sí: Decider
+      está por detrás de Jev en conocimiento (MMLU/GPQA/GSM8K) y por delante en
+      calibración. Nuestro trabajo no es knowledge, pero eso es una hipótesis
+      sobre *nuestras* preguntas, no un hecho. `--kev` sigue siendo el default
+      hasta que haya un A/B de 500 canciones medido con
+      `--decision-threshold` fijo.
+- [ ] **D7. El schema cache de `decider.serve` no aplica aquí.**
+      `DECIDER_SCHEMAS` cachea un prefijo que no dependa del state, pero
+      nuestras `instructions` llevan el `candidate` adentro, así que el "schema"
+      cambia en cada canción. Descartado, no implementado.
 
 # FASE 2 — Tiempo muerto y concurrencia
 

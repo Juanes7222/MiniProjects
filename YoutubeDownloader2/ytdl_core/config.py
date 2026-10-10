@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from . import decision_questions
+
 DEFAULT_LIVE_TERMS = frozenset({"live", "en vivo", "concert", "concierto", "tour"})
 
 
@@ -301,14 +303,31 @@ class Config:
     # nothing is worse than no field: someone tunes it, sees no effect, and loses
     # trust in the rest of the config.
     IDENTITY_OVERRIDE_THRESHOLD = 40
-    JEV_DEFAULT_THRESHOLD: float = 0.60
-    JEV_DEFAULT_RUNS: int = 1
-    JEV_MAX_RUNS: int = 20
+    # The ranking score is 0.40*studio + 0.35*audio + 0.25*reference. With the old
+    # 0.60 this was unreachable by construction: the best candidate in a real run
+    # scored 0.42 (studio 13%, audio 39%, reference 92%), so 0% of songs could ever
+    # pass and every one of them went to the fallback. 0.35 is under the observed
+    # best (0.42) and above the observed worst correct candidate.
+    DECISION_DEFAULT_THRESHOLD: float = 0.35
+    DECISION_DEFAULT_RUNS: int = 1
+    DECISION_MAX_RUNS: int = 20
 
     # --- Decision model ------------------------------------------------------
     # Gates veto a candidate outright when it falls under the floor; the
     # remaining dimensions are weighted into a ranking score.
-    DECISION_GATE_FLOOR: float = 0.50
+    #
+    # Per gate, because they are not equally noisy. One 0.50 for all three vetoed
+    # every correct candidate in a real run -- the official Topic upload of "Alto
+    # precio" answered 32/41/33 -- because the model's scale for a match sits at
+    # 0.30-0.45. `origin` is the loosest: it answered 52% for a *different* song on
+    # the artist's own channel, so no floor above that would be safe. These are
+    # measured on five songs and deliberately sit below the observed wrong-answer
+    # maximum rather than optimally between the distributions; retune them from
+    # DECISION_CALIBRATION_LOG, not from this comment. See
+    # decision_questions.GATE_FLOORS for the full reading.
+    DECISION_GATE_FLOORS: dict[str, float] = field(
+        default_factory=lambda: dict(decision_questions.GATE_FLOORS)
+    )
     DECISION_STABLE_SPREAD: float = 0.15
     # How many candidates go to the model per song. Search returns far more than
     # this, and every extra candidate multiplies the request size across all
@@ -317,14 +336,20 @@ class Config:
     # The real budget. Cost is the *question count*, which grows as
     # candidates x dimensions, so bounding candidates alone does not actually
     # bound anything: at 12 candidates plus 4 of headroom this reached 97
-    # questions per song, and at --kev-runs 2 that is 194 generations before a
-    # single download starts. Trimming to a question budget keeps the cost
+    # questions per song, and at --decision-runs 2 that is 194 generations before
+    # a single download starts. Trimming to a question budget keeps the cost
     # predictable no matter how the dimension list grows later.
     DECISION_MAX_QUESTIONS: int = 32
     DECISION_HEADROOM: int = 1
     # Candidates whose per-dimension answers moved more than this across runs are
     # unstable, and are surfaced for review instead of downloaded silently.
     DECISION_REVIEW_MARGIN: float = 0.10
+    # Where to append one JSONL record per song with every gate score, the
+    # heuristic score and what was selected. The gate floors above are measured on
+    # five songs; this is how they get measured properly. Empty disables it, and
+    # the append is a single line write under a lock, so leaving it on costs one
+    # small file write per song.
+    DECISION_CALIBRATION_LOG: str = ""
     # Wall-clock budget for the startup latency probe: above this, one real
     # evaluation is reported as too slow for a batch, with the remedy.
     DECISION_PROBE_BUDGET_SECONDS: float = 20.0

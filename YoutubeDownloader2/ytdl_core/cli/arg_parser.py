@@ -12,9 +12,64 @@ import sys
 from pathlib import Path
 
 from ..config import Config
+from ..decider_server import (
+    DEFAULT_GRAPH_B_BUCKETS as _DECIDER_DEFAULT_GRAPH_B_BUCKETS,
+    DEFAULT_GRAPH_T_BUCKETS as _DECIDER_DEFAULT_GRAPH_T_BUCKETS,
+)
+from ..decider_server import DEFAULT_PACKAGE as _DECIDER_DEFAULT_PACKAGE
 from ..profiles import ProfileError, load_profile
 
 _CONFIG = Config()
+
+# One flag per decision model, and the same three rules for all of them. Written
+# as a table rather than six repeated blocks because the rules are not per-model:
+# a decision model re-runs the search it is deciding between, so it cannot share
+# a run with a single URL, with the post-download verifiers, or with a dry run.
+_DECISION_PROVIDERS: tuple[tuple[str, str], ...] = (
+    ("jev", "--jev"),
+    ("kev", "--kev"),
+    ("decider", "--decider"),
+)
+
+
+def _reject_provider_conflicts(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    for attribute, flag in _DECISION_PROVIDERS:
+        if not getattr(args, attribute, False):
+            continue
+        if args.url:
+            parser.error(f"{flag} cannot be used with --url")
+        if args.verify or args.repair or args.review:
+            parser.error(f"{flag} cannot be combined with --verify, --repair, or --review")
+        if args.dry_run:
+            parser.error(f"{flag} cannot be used with --dry-run")
+
+
+# Former flag -> what to type instead. The old spellings are still accepted as
+# argparse aliases on the same dest, so an existing command line keeps working;
+# this only says so once, on stderr, rather than letting it rot unnoticed.
+_DEPRECATED_FLAGS: dict[str, str] = {
+    "--jev-runs": "--decision-runs",
+    "--kev-runs": "--decision-runs",
+    "--jev-threshold": "--decision-threshold",
+    "--kev-threshold": "--decision-threshold",
+    "--kev-timeout": "--decision-timeout",
+}
+
+
+def _warn_deprecated_flags(argv: list[str] | None) -> None:
+    tokens = list(argv) if argv is not None else sys.argv[1:]
+    used = {
+        replacement
+        for token in tokens
+        if (replacement := _DEPRECATED_FLAGS.get(token.split("=", 1)[0])) is not None
+    }
+    for replacement in sorted(used):
+        old = [flag for flag, new in _DEPRECATED_FLAGS.items() if new == replacement]
+        print(
+            f"warning: {', '.join(sorted(old))} {'are' if len(old) > 1 else 'is'} "
+            f"deprecated; use {replacement}",
+            file=sys.stderr,
+        )
 
 
 def _explicit_source_options(argv: list[str] | None) -> set[str]:
@@ -156,14 +211,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--decision-timeout",
         "--kev-timeout",
+        dest="decision_timeout",
         metavar="SECONDS",
         type=int,
         default=_CONFIG.DECISION_TIMEOUT_SECONDS,
         help=(
-            "Per-evaluation timeout for the local decision model. Raise it when the "
+            "Per-evaluation timeout for the decision model. Raise it when the "
             "server is healthy but slow. A timeout is never retried: a slow answer "
-            "needs more time, not another attempt."
+            "needs more time, not another attempt. --kev-timeout is the former name "
+            "and still works."
         ),
     )
     p.add_argument(
@@ -294,6 +352,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Use a local Kev server to choose the candidate for each song.",
     )
+    decision.add_argument(
+        "--decider",
+        action="store_true",
+        help=(
+            "Use a local Decider server to choose the candidate for each song. Speaks "
+            "the same System One API as Kev, and unlike Kev it also runs on Apple "
+            "Silicon and CPU."
+        ),
+    )
     p.add_argument(
         "--kev-url",
         metavar="URL",
@@ -341,6 +408,120 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Do not pull the latest Kev repository changes.",
     )
+    p.add_argument(
+        "--decider-url",
+        metavar="URL",
+        default="http://127.0.0.1:8010",
+        help="Decider server URL (default: %(default)s).",
+    )
+    p.add_argument(
+        "--decider-model",
+        metavar="MODEL",
+        default=None,
+        help=(
+            "Checkpoint name to send in the request body. Left unset, the name is read "
+            "from the running server, which is the reliable option: decider.serve names "
+            "the checkpoint after the version in its own config."
+        ),
+    )
+    p.add_argument(
+        "--decider-run",
+        metavar="CHECKPOINT",
+        default="Mapika/decider-4b@v2",
+        help=(
+            "Checkpoint to download and serve, as repo_id or repo_id@revision. Pinned "
+            "to a tag so the weights are reproducible; an unpinned name tracks the "
+            "branch. Note the tag is @v2, not @v2.1: the model card's weights version "
+            "and the Hub tag are different numbers, and only the tag resolves "
+            "(default: %(default)s). Smaller: Mapika/decider-2b. Largest and best on "
+            "a big GPU: Mapika/decider-12b."
+        ),
+    )
+    p.add_argument(
+        "--decider-dir",
+        metavar="PATH",
+        type=Path,
+        default=Path.home() / ".cache" / "ytdl" / "decider",
+        help="Decider virtual environment directory (default: %(default)s).",
+    )
+    p.add_argument(
+        "--decider-port",
+        metavar="INT",
+        type=int,
+        default=8010,
+        help="Local Decider server port (default: %(default)s).",
+    )
+    p.add_argument(
+        "--decider-startup-timeout",
+        metavar="INT",
+        type=int,
+        default=900,
+        help="Seconds to wait for Decider startup (default: %(default)s).",
+    )
+    p.add_argument(
+        "--decider-package",
+        metavar="SPEC",
+        default=_DECIDER_DEFAULT_PACKAGE,
+        help=(
+            "Python package providing decider.serve, pinned for reproducibility "
+            "(default: %(default)s)."
+        ),
+    )
+    p.add_argument(
+        "--decider-skip-install",
+        action="store_true",
+        help="Do not create or update the Decider virtual environment.",
+    )
+    p.add_argument(
+        "--decider-device",
+        metavar="DEVICE",
+        default=None,
+        help=(
+            "Device for decider.serve: cuda, cuda:1, mps, cpu. Unset lets it choose "
+            "(CUDA, else MPS, else CPU), which is what you want unless you know why "
+            "not."
+        ),
+    )
+    p.add_argument(
+        "--decider-graphs-t",
+        metavar="LIST",
+        default=_DECIDER_DEFAULT_GRAPH_T_BUCKETS,
+        help=(
+            "Length buckets for decider.serve's CUDA-graph grid (DECIDER_T_BUCKETS, "
+            "comma-separated ints, empty string leaves decider.serve's default). The "
+            "default narrows the grid from 89 captured graphs / ~25 GB VRAM on a "
+            "4B checkpoint to 5 graphs / seconds of start-up; our client is strictly "
+            "serial (one request in flight, short states), so larger batch and "
+            "length cells would only sit unused on the GPU."
+        ),
+    )
+    p.add_argument(
+        "--decider-graphs-b",
+        metavar="LIST",
+        default=_DECIDER_DEFAULT_GRAPH_B_BUCKETS,
+        help=(
+            "Batch buckets for decider.serve's CUDA-graph grid "
+            "(DECIDER_B_BUCKETS, comma-separated ints, empty string leaves decider.serve "
+            "default 1,2,4,8,16,32). Decider's default is 1 because our client is "
+            "serial; raise --decision-in-flight first, and only then touch this."
+        ),
+    )
+    fused_group = p.add_mutually_exclusive_group()
+    fused_group.add_argument(
+        "--decider-kernels",
+        dest="decider_kernels",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Insist on the GDN Triton kernels without probing.",
+    )
+    fused_group.add_argument(
+        "--no-decider-kernels",
+        dest="decider_kernels",
+        action="store_const",
+        const=False,
+        help="Decline the GDN Triton kernels; PyTorch's reference path is used instead.",
+    )
     fused = p.add_mutually_exclusive_group()
     fused.add_argument(
         "--kev-fused",
@@ -363,32 +544,49 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Decline Kev's fused Qwen3.5 kernels without probing.",
     )
     p.add_argument(
-        "--kev-threshold",
-        metavar="FLOAT",
-        type=float,
-        default=_CONFIG.JEV_DEFAULT_THRESHOLD,
-        help="Minimum average Kev probability required to download (default: %(default)s).",
-    )
-    p.add_argument(
-        "--kev-runs",
-        metavar="INT",
-        type=int,
-        default=_CONFIG.JEV_DEFAULT_RUNS,
-        help="Number of Kev evaluations per song (default: %(default)s).",
-    )
-    p.add_argument(
+        "--decision-threshold",
         "--jev-threshold",
+        "--kev-threshold",
+        dest="decision_threshold",
         metavar="FLOAT",
         type=float,
-        default=_CONFIG.JEV_DEFAULT_THRESHOLD,
-        help="Minimum average Jev probability required to download (default: %(default)s).",
+        default=_CONFIG.DECISION_DEFAULT_THRESHOLD,
+        help=(
+            "Minimum average probability required to download, for whichever decision "
+            "model is in use (default: %(default)s). --jev-threshold and --kev-threshold "
+            "are the former names and still work."
+        ),
     )
     p.add_argument(
+        "--decision-calibration-log",
+        dest="decision_calibration_log",
+        metavar="PATH",
+        type=str,
+        default=_CONFIG.DECISION_CALIBRATION_LOG,
+        help=(
+            "Append one JSONL record per song with every gate score, the heuristic "
+            "score and what was selected. Use it to retune the gate floors against "
+            "real data instead of against a sample; empty (the default) writes nothing."
+        ),
+    )
+    p.add_argument(
+        "--decision-runs",
         "--jev-runs",
+        "--kev-runs",
+        dest="decision_runs",
         metavar="INT",
         type=int,
-        default=_CONFIG.JEV_DEFAULT_RUNS,
-        help="Number of Jev evaluations per song (default: %(default)s).",
+        default=_CONFIG.DECISION_DEFAULT_RUNS,
+        help=(
+            "Evaluations per song (default: %(default)s). Above 1 this measures how "
+            "steady the model is rather than asking it again for a different answer: "
+            "these models are prefilled deterministically, so the extra passes "
+            "essentially repeat the same forward pass and the verdict does not change. "
+            "What it does buy is the spread across runs, which is what marks a "
+            "candidate unstable enough to review. Raise --decision-questions or lower "
+            "--decision-timeout before you raise this. --jev-runs and --kev-runs are "
+            "the former names and still work."
+        ),
     )
     p.add_argument("--no-silence-check", action="store_true")
 
@@ -538,30 +736,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error("--review cannot be combined with --verify or --repair")
     if not 1 <= args.kev_port <= 65535:
         p.error("--kev-port must be between 1 and 65535")
+    if not 1 <= args.decider_port <= 65535:
+        p.error("--decider-port must be between 1 and 65535")
     if args.kev_startup_timeout < 1:
         p.error("--kev-startup-timeout must be greater than 0")
-    if not 0 < args.jev_threshold <= 1:
-        p.error("--jev-threshold must be greater than 0 and at most 1")
-    if not 0 < args.kev_threshold <= 1:
-        p.error("--kev-threshold must be greater than 0 and at most 1")
-    if not 1 <= args.jev_runs <= _CONFIG.JEV_MAX_RUNS:
-        p.error(f"--jev-runs must be between 1 and {_CONFIG.JEV_MAX_RUNS}")
-    if not 1 <= args.kev_runs <= _CONFIG.JEV_MAX_RUNS:
-        p.error(f"--kev-runs must be between 1 and {_CONFIG.JEV_MAX_RUNS}")
+    if args.decider_startup_timeout < 1:
+        p.error("--decider-startup-timeout must be greater than 0")
+    if not 0 < args.decision_threshold <= 1:
+        p.error("--decision-threshold must be greater than 0 and at most 1")
+    if not 1 <= args.decision_runs <= _CONFIG.DECISION_MAX_RUNS:
+        p.error(f"--decision-runs must be between 1 and {_CONFIG.DECISION_MAX_RUNS}")
+    if args.decision_timeout < 1:
+        p.error("--decision-timeout must be greater than 0")
     if args.decision_in_flight < 1:
         p.error("--decision-in-flight must be at least 1")
-    if args.jev and args.url:
-        p.error("--jev cannot be used with --url")
-    if args.jev and (args.verify or args.repair or args.review):
-        p.error("--jev cannot be combined with --verify, --repair, or --review")
-    if args.jev and args.dry_run:
-        p.error("--jev cannot be used with --dry-run")
-    if args.kev and args.url:
-        p.error("--kev cannot be used with --url")
-    if args.kev and (args.verify or args.repair or args.review):
-        p.error("--kev cannot be combined with --verify, --repair, or --review")
-    if args.kev and args.dry_run:
-        p.error("--kev cannot be used with --dry-run")
+    _reject_provider_conflicts(p, args)
+    _warn_deprecated_flags(argv)
 
     args.workers = max(1, min(args.workers, _CONFIG.MAX_WORKERS))
     raw_sources = (

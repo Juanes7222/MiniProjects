@@ -27,9 +27,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from .utils import normalize_title, remove_matching_noise, strip_featuring
+
 # Bumped whenever the question set, the state shape or the scoring math changes,
 # so stored decisions can be invalidated instead of silently compared to old ones.
-QUESTION_CONTRACT_VERSION = 2
+#
+# 3 added the derived `provenance` field and the deterministic shield. Both change
+# what a question can see and what a gate is allowed to veto, so a score gathered
+# under v2 is not comparable to one gathered under v3.
+QUESTION_CONTRACT_VERSION = 3
 
 # Short description cap. Long descriptions burn tokens and dilute the fields the
 # model actually reasons about; the head of a YouTube description carries the
@@ -255,9 +261,13 @@ DIM_STUDIO = _noul(
             "or a video whose audio comes from a live show."
         ),
     },
-    # Live-show evidence lives in the upload date and the description ("live at...",
-    # venue names, crowd noise); the catalogue fields are not consulted here.
-    _RECORDING_FIELDS + ("artists",),
+    # `provenance` is why this dimension can answer at all. Without it the question
+    # arrived with a title, a channel and a duration and nothing that distinguishes
+    # a studio master from a live cut, so it returned its prior -- measured at 8-21%
+    # for every candidate in a real run, on the official channel and the fan upload
+    # alike. Carrying the full description to fix that cost more than the signal was
+    # worth; a token derived from the channel name costs about twenty characters.
+    _RECORDING_FIELDS + ("artists", "provenance"),
 )
 
 DIM_AUDIO = _noul(
@@ -317,8 +327,104 @@ RANK_WEIGHTS: dict[str, float] = {
     DIM_REFERENCE.key: 0.25,
 }
 
+# --- Gate floors -------------------------------------------------------------
 # A gate must clear this to be considered at all.
-GATE_FLOOR = 0.50
+#
+# One floor for all three gates was 0.50, and it vetoed every correct candidate in
+# a real 5-song run: the official `- Topic` upload of "Alto precio" answered
+# identity 32% / origin 41% / form 33%, and "Solo Una Palabra Tuya" 33/33/30. The
+# model's absolute scale is compressed into roughly 0.30-0.45 for a match and
+# 0.03-0.22 for a different song, so 0.50 sat *above* the whole correct-answer
+# distribution. A veto that fires on everything discriminates nothing; it is noise
+# wearing the shape of a rule.
+#
+# The floors are therefore per-gate, because the gates are not equally noisy:
+# `origin` answered 52% for a different song on the artist's own channel, so it
+# cannot carry the tightest floor. Measured separation, correct vs. different song:
+#
+#     identity  32-53%  vs   4-22%
+#     origin    33-43%  vs   3-52%
+#     form      30-66%  vs   6-23%
+#
+# These are five songs, not a calibration set -- the gap between a correct answer
+# at 30% and a wrong one at 23% is seven points, which is narrower than anyone
+# should trust. So the floors are set conservatively *below* the observed wrong
+# maximum rather than optimally between the distributions, and every gate can be
+# overridden by :func:`deterministic_shield` for the cases where the evidence does
+# not depend on the model at all. `core.py` writes a JSONL calibration log for the
+# same reason: retune these against real data, not against this paragraph.
+GATE_FLOORS: dict[str, float] = {
+    "identity": 0.22,
+    "origin": 0.18,
+    "form": 0.22,
+}
+
+# Kept for callers that pass one number (and for the provider default arguments).
+# It is the loosest floor, so a scalar override never becomes stricter than the
+# per-gate defaults -- which is the safe direction for a floor that guards against
+# admitting a bad candidate.
+GATE_FLOOR = min(GATE_FLOORS.values())
+
+
+def gate_floor_for(
+    dimension_key: str,
+    floors: dict[str, float] | None = None,
+    default: float | None = None,
+) -> float:
+    """The floor for one gate.
+
+    *floors* -- the configured mapping -- is consulted first, then
+    :data:`GATE_FLOORS`, then *default*, then the loosest known floor.
+
+    The configured mapping has to win, or ``Config.DECISION_GATE_FLOORS`` would be
+    a field that reads as a knob and does nothing: this function originally went
+    straight to ``GATE_FLOORS`` and treated the caller's value as a fallback, so a
+    tuned floor was silently discarded on every evaluation.
+    """
+    for mapping in (floors, GATE_FLOORS):
+        if mapping and dimension_key in mapping:
+            return float(mapping[dimension_key])
+    if default is not None:
+        return float(default)
+    return GATE_FLOOR
+
+
+def deterministic_shield(candidate: dict, artist: str, song: str) -> bool:
+    """Whether this candidate is provably the right one without asking a model.
+
+    All three must hold:
+
+    * the normalised title is **exactly** the normalised requested title, so the
+      upload is not a medley, an alternate take, a live cut or a re-title;
+    * the publisher is proven: a ``- Topic`` channel belonging to this artist, or a
+      VEVO-style official channel (:func:`provenance_signal`). An artist's own
+      channel counts too -- it is the same fact about a different spelling of it;
+    * the candidate was not hard-rejected by the heuristic, so no title word
+      ("cover", "instrumental", "lyrics") contradicts the match.
+
+    This exists because a miscalibrated probability must not be able to veto a fact.
+    A gate floor tuned on a handful of songs is a guess; "a channel this artist
+    controls, carrying the exact requested title" is not. It is deliberately narrow
+    -- no fuzzy title match, no duration tolerance, no "close enough" channel -- so
+    it cannot rescue the bad-search-result case the floors are there to catch.
+    """
+    if int(candidate.get("_composite_score") or 0) <= HARD_REJECT_SCORE:
+        return False
+
+    if provenance_signal(candidate, artist) == "unknown":
+        return False
+
+    artist_clean = normalize_title(strip_featuring(str(artist or "").lower()))
+    if not artist_clean:
+        return False
+
+    title = normalize_title(strip_featuring(str(candidate.get("title") or "").lower()))
+    if not title:
+        return False
+    # remove_matching_noise drops the "(Official Audio)" / "HD" / "Remastered"
+    # decorations that sit alongside an otherwise exact title.
+    return remove_matching_noise(title) == normalize_title(strip_featuring(str(song or "").lower()))
+
 
 # Spread across runs above this is treated as unstable rather than decisive.
 STABLE_SPREAD = 0.15
@@ -355,10 +461,95 @@ def _first_value(candidate: dict, *keys: str) -> Any:
     return None
 
 
+def provenance_signal(candidate: dict, artist: str = "") -> str:
+    """What the publisher alone already proves about where this recording came from.
+
+    Four values, because these are the four answers that matter and all four are
+    facts rather than judgments:
+
+    * ``topic_channel`` -- an auto-generated channel *belonging to this artist*.
+      YouTube creates these per release from the distributor's metadata, so the
+      audio is the label's own master. The strongest provenance there is.
+    * ``artist_channel`` -- a channel the artist controls. A live upload, an
+      official video, a lyric video: their own material, which is still theirs.
+    * ``official_audio`` -- a VEVO-style or catalogue-sourced release.
+    * ``unknown`` -- everything else, including fan re-uploads with tidy names.
+
+    The artist name has to be a whole run of words in the channel name. A plain
+    substring test is not enough: the artist "Alto" matches the channel
+    "Alto Precio" inside it, which would hand the strongest provenance to
+    whatever channel happens to contain the name as a fragment.
+
+    This is a conclusion drawn in Python on purpose. Asking a model "was this
+    published by the artist or their label?" is what ``GATE_ORIGIN`` already does,
+    and it answered 37% for the official Topic upload and 52% for a *different*
+    song by the same artist -- so it cannot be the thing that decides.
+    """
+    channel = str(candidate.get("channel") or candidate.get("uploader") or "").strip()
+    if not channel:
+        return "unknown"
+
+    channel_clean = normalize_title(channel)
+    artist_clean = normalize_title(strip_featuring(str(artist or "").lower()))
+    owned_by_artist = (
+        bool(artist_clean)
+        and f" {artist_clean} " in f" {channel_clean} "
+    )
+
+    if channel_clean.endswith(" topic"):
+        return "topic_channel" if owned_by_artist else "unknown"
+    if channel_clean.endswith("vevo"):
+        return "official_audio"
+    if owned_by_artist:
+        return "artist_channel"
+    if candidate.get("_source") in ("ytmusic_api", "itunes"):
+        return "official_audio"
+    return "unknown"
+
+
+# How much provenance is worth in the ranking score.
+#
+# This is the one signal the ranking was missing, and the omission is visible in a
+# real run: with the ranking as it stood, "IC0048-Alto Precio" on a church channel
+# beat the official `- Topic` upload 45% to 41%, and a LYRIC VIDEO on a fan channel
+# beat the official audio 39% to 37%. Not because those candidates were judged
+# better -- `studio` and `audio` had no way to tell them apart and answered 5-24%
+# and 16-81% respectively for official and fan uploads alike -- but because the
+# composite was three noisy numbers and the tie went to whichever row came first.
+#
+# So provenance is added here as what it is: a fact about the publisher, already
+# computed, carrying more weight than any of the three dimensions it outranks. It
+# is deliberately *not* a gate. The gates still decide whether this is the right
+# song, the right artist and a real performance; this only decides, between
+# recordings that already cleared those, which publisher to trust.
+#
+# Sized against the measured composites: the official uploads scored 0.37-0.43
+# and the ones that wrongly beat them 0.39-0.45, so any bonus above ~0.06 decides
+# those cases. 0.15 is comfortably clear of that line without being decisive over
+# everything else: because `studio` carries weight 0.40, it takes a 0.375 swing in
+# that dimension -- a live take against a studio one -- to overturn the publisher,
+# which is the order of difference a real live/studio contrast produces.
+PROVENANCE_RANK_BONUS: dict[str, float] = {
+    "topic_channel": 0.15,
+    "artist_channel": 0.13,
+    "official_audio": 0.10,
+    "unknown": 0.0,
+}
+
+# Any unknown key scores as no bonus rather than raising, so a future provenance
+# value cannot silently outrank the official one by omission.
+DEFAULT_PROVENANCE_BONUS: float = 0.0
+
+
+def provenance_bonus(provenance: str) -> float:
+    return PROVENANCE_RANK_BONUS.get(provenance, DEFAULT_PROVENANCE_BONUS)
+
+
 def candidate_state(
     candidate: dict,
     index: int,
     with_description: bool = False,
+    artist: str = "",
 ) -> dict[str, Any]:
     """The candidate fields the model reasons about.
 
@@ -368,6 +559,10 @@ def candidate_state(
     ``with_description`` is opt-in because a candidate is serialized once per
     dimension. Only ``form`` asks what the upload is rather than what the
     recording is, so only ``form`` pays for the description.
+
+    ``artist`` is needed by :func:`provenance_signal` to tell the artist's own
+    ``- Topic`` channel from someone else's. Without it every candidate reads as
+    ``unknown``, which is the safe direction but a wasted field.
     """
     state: dict[str, Any] = {
         "key": f"candidate_{index}",
@@ -376,6 +571,7 @@ def candidate_state(
         "artists": candidate.get("artists") or [],
         "duration_seconds": candidate.get("duration"),
         "source": str(candidate.get("_source") or "unknown"),
+        "provenance": provenance_signal(candidate, artist),
         "upload_date": _first_value(candidate, "upload_date", "release_date"),
         "album": candidate.get("album"),
         "year": _first_value(candidate, "year", "release_year"),
@@ -456,7 +652,12 @@ def build_state_and_questions(
         # The description is kept here and stripped per dimension in
         # build_questions, so one candidate is read once instead of once per
         # dimension.
-        candidate_state(candidate, index, with_description=bool(keep_description))
+        candidate_state(
+            candidate,
+            index,
+            with_description=bool(keep_description),
+            artist=artist,
+        )
         for index, candidate in enumerate(candidates)
     ]
     return (

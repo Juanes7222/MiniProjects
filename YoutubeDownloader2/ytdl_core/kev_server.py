@@ -20,6 +20,17 @@ from urllib.parse import urlparse
 
 import requests
 
+from .procutil import (
+    close_handle,
+    create_kill_on_close_job,
+    nvidia_gpu_name,
+    run_command,
+    shutil_which as _shutil_which,
+    terminate_job,
+    terminate_process_tree,
+    venv_python,
+)
+
 # The fused kernels are pinned by kev itself and this must match it exactly:
 # kev.fused_qwen35 refuses any other release rather than tolerating it.
 FLA_VERSION = "0.5.2"
@@ -105,38 +116,8 @@ class KevServerManager:
         return self.url
 
     def stop(self) -> None:
-        if self.process is not None and self.process.poll() is None:
-            if self._job_handle is not None:
-                self._terminate_job(self._job_handle)
-            if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/PID", str(self.process.pid), "/T", "/F"],
-                    capture_output=True,
-                    timeout=15,
-                    check=False,
-                )
-            else:
-                killpg = getattr(os, "killpg", None)
-                getpgid = getattr(os, "getpgid", None)
-                if killpg is not None and getpgid is not None:
-                    try:
-                        killpg(getpgid(self.process.pid), signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                if os.name != "nt":
-                    killpg = getattr(os, "killpg", None)
-                    getpgid = getattr(os, "getpgid", None)
-                    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    if killpg is not None and getpgid is not None:
-                        try:
-                            killpg(getpgid(self.process.pid), sigkill)
-                        except ProcessLookupError:
-                            pass
-                self.process.kill()
-                self.process.wait(timeout=10)
+        if self.process is not None:
+            terminate_process_tree(self.process, self._job_handle)
         if self._job_handle is not None:
             self._close_handle(self._job_handle)
             self._job_handle = None
@@ -176,37 +157,16 @@ class KevServerManager:
     # -- environment ----------------------------------------------------------
 
     def _venv_python(self) -> Path:
-        return self.root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        return venv_python(self.root)
 
     def _nvidia_gpu_name(self) -> str | None:
-        """Name of the first NVIDIA GPU, or None. Does not require torch.
+        """Name of the first NVIDIA GPU, or None.
 
-        Detecting the hardware by importing torch is circular here: the sync
-        deliberately excludes torch (it is a multi-gigabyte download installed
-        separately with a CUDA-specific backend), so the one thing we need torch
-        for is the one thing torch is not there to answer. ``nvidia-smi`` is part
-        of the NVIDIA driver, is always present when a CUDA device is, and tells
-        us what we need before anything is installed.
+        Shared with the Decider supervisor: asking the driver is the only way to
+        find out before the environment exists, and two copies of this would be
+        two chances to disagree about whether there is a GPU.
         """
-        executable = shutil_which("nvidia-smi")
-        if executable is None:
-            return None
-        try:
-            completed = subprocess.run(
-                [executable, "--query-gpu=name", "--format=csv,noheader"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if completed.returncode != 0:
-            return None
-        names = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
-        return names[0] if names else None
+        return nvidia_gpu_name()
 
     def _sync_environment(self) -> None:
         if shutil_which("uv") is None:
@@ -737,7 +697,7 @@ class KevServerManager:
             self._step(
                 f"Kev: TOO SLOW -- one evaluation ({question_count} questions) did not "
                 f"finish within {elapsed:.0f}s. The cost is the question count, so lower "
-                "--decision-questions first; --kev-timeout raises the ceiling if the "
+                "--decision-questions first; --decision-timeout raises the ceiling if the "
                 "server is healthy but slow."
             )
             if self._fusable is False:
@@ -768,7 +728,7 @@ class KevServerManager:
                 f"Kev: SLOW -- one evaluation ({question_count} questions) took "
                 f"{elapsed:.0f}s (budget {budget_seconds:.0f}s). If every song pays this, "
                 "the run will take hours. Lower --decision-questions, or raise "
-                "--kev-timeout if the server is healthy but slow."
+                "--decision-timeout if the server is healthy but slow."
             )
         else:
             self._step(
@@ -868,88 +828,15 @@ class KevServerManager:
         self._job_handle = self._create_kill_on_close_job()
 
     def _create_kill_on_close_job(self) -> int | None:
-        if os.name != "nt" or self.process is None:
-            return None
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            class JobObjectBasicLimitInformation(ctypes.Structure):
-                _fields_ = [
-                    ("PerProcessUserTimeLimit", ctypes.c_longlong),
-                    ("PerJobUserTimeLimit", ctypes.c_longlong),
-                    ("LimitFlags", wintypes.DWORD),
-                    ("MinimumWorkingSetSize", ctypes.c_size_t),
-                    ("MaximumWorkingSetSize", ctypes.c_size_t),
-                    ("ActiveProcessLimit", wintypes.DWORD),
-                    ("Affinity", ctypes.c_size_t),
-                    ("PriorityClass", wintypes.DWORD),
-                    ("SchedulingClass", wintypes.DWORD),
-                ]
-
-            class IoCounters(ctypes.Structure):
-                _fields_ = [
-                    ("ReadOperationCount", ctypes.c_ulonglong),
-                    ("WriteOperationCount", ctypes.c_ulonglong),
-                    ("OtherOperationCount", ctypes.c_ulonglong),
-                    ("ReadTransferCount", ctypes.c_ulonglong),
-                    ("WriteTransferCount", ctypes.c_ulonglong),
-                    ("OtherTransferCount", ctypes.c_ulonglong),
-                ]
-
-            class ExtendedLimitInformation(ctypes.Structure):
-                _fields_ = [
-                    ("BasicLimitInformation", JobObjectBasicLimitInformation),
-                    ("IoInfo", IoCounters),
-                    ("ProcessMemoryLimit", ctypes.c_size_t),
-                    ("JobMemoryLimit", ctypes.c_size_t),
-                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                    ("PeakJobMemoryUsed", ctypes.c_size_t),
-                ]
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            job = kernel32.CreateJobObjectW(None, None)
-            if not job:
-                return None
-            info = ExtendedLimitInformation()
-            info.BasicLimitInformation.LimitFlags = 0x00002000
-            configured = kernel32.SetInformationJobObject(
-                job, 9, ctypes.byref(info), ctypes.sizeof(info)
-            )
-            process_handle = getattr(self.process, "_handle", None)
-            assigned = (
-                configured
-                and process_handle is not None
-                and kernel32.AssignProcessToJobObject(job, process_handle)
-            )
-            if not assigned:
-                kernel32.CloseHandle(job)
-                return None
-            return int(job)
-        except (AttributeError, OSError):
-            return None
+        return create_kill_on_close_job(self.process)
 
     @staticmethod
     def _terminate_job(handle: int) -> None:
-        if os.name != "nt":
-            return
-        try:
-            import ctypes
-
-            ctypes.WinDLL("kernel32", use_last_error=True).TerminateJobObject(handle, 1)
-        except (AttributeError, OSError):
-            return
+        terminate_job(handle)
 
     @staticmethod
     def _close_handle(handle: int) -> None:
-        if os.name != "nt":
-            return
-        try:
-            import ctypes
-
-            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
-        except (AttributeError, OSError):
-            return
+        close_handle(handle)
 
     def _wait_until_ready(self) -> None:
         deadline = time.monotonic() + self.startup_timeout
@@ -1012,33 +899,13 @@ class KevServerManager:
 
     @staticmethod
     def _run(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> str:
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=1800,
-                check=False,
-                env=env,
-            )
-        except FileNotFoundError as exc:
-            raise KevServerError(f"Required command not found: {command[0]}") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise KevServerError(f"Command timed out: {command[0]}") from exc
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout).strip().splitlines()
-            message = detail[-1] if detail else "no details"
-            raise KevServerError(f"{command[0]} failed: {message[:180]}")
-        return completed.stdout
+        # Shared with the other decision servers so that a setup failure reads
+        # the same whatever launched it; only the exception type is Kev's.
+        return run_command(command, cwd, env, error=KevServerError)
 
     def _step(self, message: str) -> None:
         self.on_step(message)
 
 
 def shutil_which(command: str) -> str | None:
-    import shutil
-
-    return shutil.which(command)
+    return _shutil_which(command)
