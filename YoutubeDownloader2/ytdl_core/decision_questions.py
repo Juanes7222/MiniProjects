@@ -150,6 +150,16 @@ def _noul(
 # is clean does not carry the view count, and a question about whether the album
 # matches the reference does not carry the description.
 IDENTITY_FIELDS = ("key", "title", "channel")
+# What `song` gets instead. `key` is not optional -- it is how an answer is
+# attributed back to its candidate -- and the rest is the title, the credited
+# artists and the length.
+#
+# No `channel`, deliberately. The channel is where the *artist* lives: an upload on
+# "Marcos Witt Oficial" is strong evidence of who is playing and none at all of
+# which song. Shipping it to the song question is how the old compound `identity`
+# gate ended up answering 56% for a different song -- the artist half was visibly
+# true and it propped the song half up.
+_SONG_FIELDS = ("key", "title", "artists", "duration_seconds")
 _WHO_FIELDS = IDENTITY_FIELDS + ("artists",)
 _UPLOAD_FIELDS = IDENTITY_FIELDS + ("artists", "source")
 _RECORDING_FIELDS = IDENTITY_FIELDS + ("duration_seconds", "upload_date")
@@ -160,26 +170,69 @@ _CATALOGUE_FIELDS = IDENTITY_FIELDS + ("album", "year", "genre", "upload_date")
 # These answer "is this even the right recording?". Below GATE_FLOOR the
 # candidate is discarded no matter how good the other dimensions look.
 
-GATE_IDENTITY = Dimension(
-    key="identity",
+# These answer "is this even the right recording?". Below the gate floor the
+# candidate is discarded no matter how good the other dimensions look.
+#
+# One Noul answers exactly one proposition. `song` and `artist` used to be a single
+# `identity` gate asking whether this is "the requested song performed by the
+# requested artist", and that compound question was the weakest link in the rubric:
+# asked about "Marcos Witt | Al Estar Aqui feat. @TAYAGaukrodger" for the song
+# "Heme Aqui" it answered 56%, against 62-64% for the correct upload. The artist
+# half was plainly true -- Marcos Witt, on Marcos Witt's own channel -- and it
+# carried a compound answer for a song that is not the one requested.
+#
+# Two questions cannot do that. `song` cannot see the artist at all, and a shared
+# word in the title ("Aqui" in both "Heme Aqui" and "Al Estar Aqui") is a fact about
+# the string, not about the song. This is the decomposition the module's own design
+# note calls for; it is late, and it is here because a measurement demanded it.
+GATE_SONG = Dimension(
+    key="song",
     gate=True,
     weight=0.0,
     instructions={
-        "question": ("Is `candidate` the requested song performed by the requested artist?"),
+        "question": (
+            "Is `candidate` a recording of the song requested in `target`?"
+        ),
     },
     criteria={
         "true": (
-            "The title, artists, channel or description identify the requested song "
-            "and the requested artist or their official channel. A featured-artist "
-            "credit or a differently spelled title still counts."
+            "The song performed is the one `target` names. A different spelling, "
+            "punctuation or capitalisation, a featured-artist credit on the same "
+            "song, or a title that adds the artist around it still counts."
         ),
         "false": (
-            "A different song, a different artist performing the song, a mashup of "
-            "several songs, or audio whose artist cannot be tied to the requested one."
+            "A different song, even by the same artist on the same channel and even "
+            "when the titles share words. A medley, a compilation of several songs, "
+            "an instrumental setting of another piece, or a version whose title names "
+            "a different song."
         ),
     },
-    # "artists ... or description identify the requested song" -- both are named in
-    # its own criteria, so both travel with it.
+    # Only what identifies *which song* this is. Notably not `channel`: it names the
+    # performer, and letting it into this question is how the artist half of the
+    # old compound question kept dragging the song half up with it.
+    fields=_SONG_FIELDS,
+)
+
+GATE_ARTIST = Dimension(
+    key="artist",
+    gate=True,
+    weight=0.0,
+    instructions={
+        "question": "Is `candidate` a recording performed by the artist requested in `target`?"},
+    criteria={
+        "true": (
+            "The performing artist is the one `target` names, established by the "
+            "title, the artists or the channel. A differently spelled name, or a "
+            "channel belonging to the artist or to their label, still counts."
+        ),
+        "false": (
+            "A different performer: another artist who happens to have recorded a "
+            "song with the same name, an orchestra or a choir in place of the "
+            "artist, or audio whose performer cannot be tied to the requested one."
+        ),
+    },
+    # "artists ... or the channel" is named in its own criteria, so both travel
+    # with it; so does duration, which catches a medley listed under one title.
     fields=_UPLOAD_FIELDS + ("duration_seconds",),
 )
 
@@ -307,7 +360,12 @@ DIM_REFERENCE = _noul(
     _CATALOGUE_FIELDS,
 )
 
-GATE_DIMENSIONS: tuple[Dimension, ...] = (GATE_IDENTITY, GATE_ORIGIN, GATE_FORM)
+GATE_DIMENSIONS: tuple[Dimension, ...] = (
+    GATE_SONG,
+    GATE_ARTIST,
+    GATE_ORIGIN,
+    GATE_FORM,
+)
 RANK_DIMENSIONS: tuple[Dimension, ...] = (DIM_STUDIO, DIM_AUDIO, DIM_REFERENCE)
 DIMENSIONS: tuple[Dimension, ...] = GATE_DIMENSIONS + RANK_DIMENSIONS
 
@@ -318,14 +376,40 @@ DIMENSIONS: tuple[Dimension, ...] = GATE_DIMENSIONS + RANK_DIMENSIONS
 # request. Dimensions that need it declare it here.
 DESCRIPTION_DIMENSIONS: frozenset[str] = frozenset({GATE_FORM.key})
 
-# Ranking weights. Identity and origin already vetoed, so these only decide
-# between recordings of the right song: quality of the master first, reference
-# agreement last, because it is the weakest signal (most uploads omit it).
+# Ranking weights. Identity and origin already veto, so these only decide
+# between recordings of the right song.
+#
+# The order is the reverse of what it was, and the reason is measured rather than
+# argued. It used to be studio 0.40 / audio 0.35 / reference 0.25, on the reasoning
+# that reference "is the weakest signal (most uploads omit it)". Reference is in
+# fact the strongest discriminator in the rubric:
+#
+#     right song          reference 81-96%
+#     wrong song          reference 20-30%
+#
+# while `studio` ranged 5-72% and was the noisiest of the three -- and its 72% was
+# an outlier on "Marcos Witt | Al Estar Aqui feat. @TAYAGaukrodger", a music video
+# where the model appears to have answered "is this a professionally produced
+# video" rather than "was this audio recorded in a studio". At weight 0.40 that
+# one bad answer was worth +18.4 points, enough to carry a *different song* past
+# the right one (66% to 63%) even after the publisher signal was added.
+#
+# So reference leads, because it is what actually tells the two apart, and studio
+# and audio share the rest. `studio` keeps a real share: live against studio is a
+# difference worth making, and it is made on the evidence rather than on the
+# publisher, which cannot tell two uploads from one channel apart at all.
+#
+# Replayed over ten songs from two real runs, this ordering picks the right upload
+# on all ten; the old one picks the wrong one on one of them.
 RANK_WEIGHTS: dict[str, float] = {
-    DIM_STUDIO.key: 0.40,
-    DIM_AUDIO.key: 0.35,
-    DIM_REFERENCE.key: 0.25,
+    DIM_STUDIO.key: 0.30,
+    DIM_AUDIO.key: 0.30,
+    DIM_REFERENCE.key: 0.40,
 }
+
+# The dimension names the ranking is defined over, so a weight table that named
+# something else would be a typo rather than a silent no-op.
+RANK_DIMENSIONS_KEYS: tuple[str, ...] = tuple(RANK_WEIGHTS)
 
 # --- Gate floors -------------------------------------------------------------
 # A gate must clear this to be considered at all.
@@ -346,6 +430,12 @@ RANK_WEIGHTS: dict[str, float] = {
 #     origin    33-43%  vs   3-52%
 #     form      30-66%  vs   6-23%
 #
+# `song` and `artist` have no measured distribution at all -- the model has never
+# been asked them separately, which is the whole point of asking. So they start at
+# the floor `identity` was measured at rather than at a number invented for them,
+# and the calibration log is how they get real ones. Guessing a tighter floor for
+# an unmeasured gate is how the 0.50 got there in the first place.
+#
 # These are five songs, not a calibration set -- the gap between a correct answer
 # at 30% and a wrong one at 23% is seven points, which is narrower than anyone
 # should trust. So the floors are set conservatively *below* the observed wrong
@@ -354,7 +444,8 @@ RANK_WEIGHTS: dict[str, float] = {
 # not depend on the model at all. `core.py` writes a JSONL calibration log for the
 # same reason: retune these against real data, not against this paragraph.
 GATE_FLOORS: dict[str, float] = {
-    "identity": 0.22,
+    "song": 0.22,
+    "artist": 0.22,
     "origin": 0.18,
     "form": 0.22,
 }

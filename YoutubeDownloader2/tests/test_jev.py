@@ -21,7 +21,8 @@ def _candidate(title: str, score: int) -> dict:
 
 
 DEFAULTS = {
-    dq.GATE_IDENTITY.key: 0.95,
+    dq.GATE_SONG.key: 0.95,
+    dq.GATE_ARTIST.key: 0.94,
     dq.GATE_ORIGIN.key: 0.90,
     dq.GATE_FORM.key: 0.92,
     dq.DIM_STUDIO.key: 0.80,
@@ -33,7 +34,8 @@ DEFAULTS = {
 def _answers(
     keys: list[str],
     *,
-    identity: float | None = None,
+    song: float | None = None,
+    artist: float | None = None,
     origin: float | None = None,
     form: float | None = None,
     studio: float | None = None,
@@ -44,7 +46,8 @@ def _answers(
 ) -> dict:
     """Build a typed answer set: every dimension, every candidate, same values."""
     overrides = {
-        dq.GATE_IDENTITY.key: identity,
+        dq.GATE_SONG.key: song,
+        dq.GATE_ARTIST.key: artist,
         dq.GATE_ORIGIN.key: origin,
         dq.GATE_FORM.key: form,
         dq.DIM_STUDIO.key: studio,
@@ -120,7 +123,7 @@ def test_each_provider_declares_its_own_dialect():
     states = [dq.candidate_state(_candidate("Artist - Song", 120), 0)]
     native = dq.build_questions(states, dq.TYPESAFE_DIALECT)
     gateway = dq.build_questions(states, dq.GATEWAY_DIALECT)
-    qid = dq.question_id("candidate_0", dq.GATE_IDENTITY.key)
+    qid = dq.question_id("candidate_0", dq.GATE_SONG.key)
     assert native[qid]["criteria"] == gateway[qid]["criteria"]
     assert native[qid]["instructions"] == gateway[qid]["instructions"]
     assert {native[qid]["type"], gateway[qid]["type"]} == {"noul", "boolean"}
@@ -258,9 +261,9 @@ def test_provenance_breaks_a_tie_the_dimensions_could_not(monkeypatch):
     answers = _answers(
         both,
         per_key={
-            "candidate_0": {"identity": .32, "origin": .41, "form": .33,
+            "candidate_0": {"song": .32, "artist": .34, "origin": .41, "form": .33,
                             "studio": .12, "audio": .39, "reference": .92},
-            "candidate_1": {"identity": .60, "origin": .40, "form": .60,
+            "candidate_1": {"song": .60, "artist": .62, "origin": .40, "form": .60,
                             "studio": .18, "audio": .41, "reference": .93},
         },
     )
@@ -293,9 +296,9 @@ def test_a_lyric_video_does_not_beat_the_official_audio(monkeypatch):
     answers = _answers(
         both,
         per_key={
-            "candidate_0": {"identity": .33, "origin": .33, "form": .30,
+            "candidate_0": {"song": .33, "artist": .35, "origin": .33, "form": .30,
                             "studio": .06, "audio": .32, "reference": .93},
-            "candidate_1": {"identity": .73, "origin": .30, "form": .47,
+            "candidate_1": {"song": .73, "artist": .75, "origin": .30, "form": .47,
                             "studio": .15, "audio": .29, "reference": .90},
         },
     )
@@ -315,7 +318,7 @@ def test_provenance_cannot_rescue_a_vetoed_candidate(monkeypatch):
     """
     cover = _candidate("Song (Cover)", 200)
     cover["channel"] = "Artist - Topic"
-    answers = _answers(["candidate_0"], identity=0.9, origin=0.05, form=0.9)
+    answers = _answers(["candidate_0"], song=0.9, artist=0.9, origin=0.05, form=0.9)
     classifier = JevClassifier(threshold=0.10)
     monkeypatch.setattr(classifier, "_evaluate", lambda state, questions, model=None: answers)
 
@@ -336,7 +339,7 @@ def test_gates_do_not_double_count_into_the_ranking_score(monkeypatch):
 
     assert selected is not None
     assert selected["_decision_eligible"] is True
-    assert selected["_decision_dimensions"][dq.GATE_IDENTITY.key] == pytest.approx(0.95)
+    assert selected["_decision_dimensions"][dq.GATE_SONG.key] == pytest.approx(0.95)
     assert selected["_decision_ranking_score"] == pytest.approx(0.2)
 
 
@@ -448,16 +451,21 @@ def test_rejects_invalid_run_count():
         classifier.select("Artist", "Song", [_candidate("Artist - Song", 120)], runs=0)
 
 
-def test_three_gates_not_two():
-    """identity / origin / form. The third one is what catches an instrumental."""
-    assert [d.key for d in dq.GATE_DIMENSIONS] == ["identity", "origin", "form"]
+def test_the_gate_list_and_why_each_one_is_there():
+    """song / artist / origin / form.
+
+    `form` is what catches an instrumental. `song` and `artist` are the split of
+    the old compound `identity` gate -- see the comment on GATE_SONG for the
+    measurement that forced it.
+    """
+    assert [d.key for d in dq.GATE_DIMENSIONS] == ["song", "artist", "origin", "form"]
 
 
 def test_form_gate_vetoes_an_instrumental_that_clears_origin(monkeypatch):
     """An instrumental *by the artist* is officially published, so `origin`
     approves it. Only `form` can tell it is not the song we asked for."""
     classifier = JevClassifier(threshold=0.50)
-    answers = _answers(["candidate_0"], identity=0.97, origin=0.90, form=0.04)
+    answers = _answers(["candidate_0"], song=0.97, artist=0.97, origin=0.90, form=0.04)
     monkeypatch.setattr(classifier, "_evaluate", lambda state, questions, model=None: answers)
 
     selected, ranked = classifier.select(
@@ -493,8 +501,8 @@ def test_description_still_reaches_the_form_gate_through_the_full_build():
     form = questions[dq.question_id("candidate_0", dq.GATE_FORM.key)]
     assert form["instructions"]["candidate"]["description"].startswith("Official lyric")
 
-    identity = questions[dq.question_id("candidate_0", dq.GATE_IDENTITY.key)]
-    assert "description" not in identity["instructions"]["candidate"]
+    song = questions[dq.question_id("candidate_0", dq.GATE_SONG.key)]
+    assert "description" not in song["instructions"]["candidate"]
 
 
 def test_hard_rejected_candidates_never_reach_the_model(monkeypatch):
@@ -701,7 +709,7 @@ def test_rejects_when_score_is_below_threshold(monkeypatch):
 def test_rejects_invalid_probability(monkeypatch):
     classifier = JevClassifier()
     answers = _answers(["candidate_0"])
-    answers[dq.question_id("candidate_0", dq.GATE_IDENTITY.key)] = {"type": "noul", "noul": 1.5}
+    answers[dq.question_id("candidate_0", dq.GATE_SONG.key)] = {"type": "noul", "noul": 1.5}
     monkeypatch.setattr(classifier, "_evaluate", lambda state, questions, model=None: answers)
 
     with pytest.raises(JevEvaluationError, match="invalid probability"):

@@ -320,11 +320,12 @@ class Config:
     # every correct candidate in a real run -- the official Topic upload of "Alto
     # precio" answered 32/41/33 -- because the model's scale for a match sits at
     # 0.30-0.45. `origin` is the loosest: it answered 52% for a *different* song on
-    # the artist's own channel, so no floor above that would be safe. These are
-    # measured on five songs and deliberately sit below the observed wrong-answer
-    # maximum rather than optimally between the distributions; retune them from
-    # DECISION_CALIBRATION_LOG, not from this comment. See
-    # decision_questions.GATE_FLOORS for the full reading.
+    # the artist's own channel, so no floor above that would be safe.
+    #
+    # `song` and `artist` are the former `identity` gate, split in two so neither
+    # can prop the other up. They carry `identity`'s measured floor because the
+    # model has never answered them separately and a number invented for an
+    # unmeasured gate is how 0.50 got here. See decision_questions.GATE_FLOORS.
     DECISION_GATE_FLOORS: dict[str, float] = field(
         default_factory=lambda: dict(decision_questions.GATE_FLOORS)
     )

@@ -92,7 +92,7 @@ class TestRequest:
         classifier.select("Artist", "Song", [_candidate(), _candidate("Artist - Song (Live)")])
 
         assert captured["url"] == "http://127.0.0.1:8010/v1/systemone"
-        question = captured["json"]["questions"][dq.question_id("candidate_0", "identity")]
+        question = captured["json"]["questions"][dq.question_id("candidate_0", "song")]
         assert question["type"] == "noul"
         assert set(question["criteria"]) == {"true", "false"}
 
